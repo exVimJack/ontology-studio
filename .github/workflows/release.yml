@@ -5,22 +5,33 @@ name: Build & Release to GitCode
 # 产物回传到 GitCode Release，国内用户在 gitcode.com 下载。
 #
 # 与 tauri 官方模板的关键差异：
-#   1. tauri-action 不传 tagName/releaseName → 只产出 artifact，
-#      不在 GitHub 建 Release（Release 建在 GitCode）
-#   2. 纯 curl 调 GitCode API（零第三方 action 依赖），根治：
+#   1. tauri-action 不传 tagName/releaseName → 只产出 artifact，不在 tauri-action 内建 Release
+#      （Release 由后面的 gh release create / GitCode API 步骤独立建）
+#   2. 双 Release 发布：GitHub Release（公开仓免费不限速，备份源）+ GitCode Release（国内镜像）
+#   3. 纯 curl 调 GitCode API（零第三方 action 依赖），根治：
 #      - secrets 块必须与 with 同级（不是嵌套）
 #      - bash globstar 问题（自己用 find 递归）
 #      - 失败时能看到完整响应体
-#   3. 保留 onto-studio 特有的 PDFium 动态库拉取步骤
+#   4. PDFium 动态库已入库，CI 无需下载步骤
 # ─────────────────────────────────────────────────────────────
 
 on:
   workflow_dispatch: # 手动触发（测试流水线用）
   push:
-    tags: ["v*"] # 打 tag 触发正式发版
+    # 打 tag 触发正式发版（含 GitCode Release 同步）
+    tags: ["v*"]
+    # push 到 main 只做 build + 缓存预热，不发版
+    # 关键：让 main 分支保存 Rust cache，后续 tag 触发的 run 能命中
+    # （GitHub Actions cache 按 ref 隔离，tag run 能读 main 的 cache，
+    # 但不同 tag 之间互相读不到；必须有 main 的 cache 供 tag 复用）
+    branches: [main]
+    paths-ignore: # 这些路径变更不影响构建，跳过省 CI 时间
+      - "docs/**"
+      - "*.md"
+      - "scripts/init-standalone-repo.sh"
 
 permissions:
-  contents: read # 只读 GitHub 仓内容即可（不在 GitHub 建 Release）
+  contents: write # 需写权限：在 GitHub 建 Release（原来只读因不发版）
 
 env:
   # GitCode 仓库路径（owner/repo）
@@ -30,7 +41,7 @@ env:
 
 jobs:
   # ═══════════════════════════════════════════════════════════
-  # Job 1: 三平台并行编译，产物上传为 GitHub Artifact
+  # Job 1: 两平台并行编译，产物上传为 GitHub Artifact
   # ═══════════════════════════════════════════════════════════
   build:
     name: Build (${{ matrix.label }})
@@ -45,44 +56,41 @@ jobs:
           - os: macos-14 # Apple Silicon runner
             target: aarch64-apple-darwin
             label: macos-arm64
-          - os: macos-15-intel # Intel runner（macos-13 已下线）
-            target: x86_64-apple-darwin
-            label: macos-x64
+          # macos-x64 (Intel) 已移除：GitHub macos-15-intel runner 硬件性能约为
+          # M1 的 50-60%，Rust 编译耗时翻倍（46m vs 20m）。Intel mac 用户可
+          # 通过 Rosetta 运行 arm64 包，或后续按需重新启用。
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      # Rust 编译缓存（swatinem/rust-cache）
+      # 关键：根 .cargo/config.toml 设 target-dir="target"，所有 cargo invocation
+      # （根 workspace 5 个 crate + src-tauri Tauri crate）产物都落在仓库根 target/。
+      # 必须缓存根 target/ + ~/.cargo/registry，否则下次仍全量编译（593 个 crate）。
+      # 不用 workspaces 参数（它默认找 src-tauri/target，是空目录）。
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: "src-tauri -> target"
+          # 缓存根 target 目录（.cargo/config.toml 指定的 target-dir）
+          workspaces: ". -> target"
           key: ${{ matrix.target }}
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 20
+          cache: npm # 加速 npm ci，缓存 ~/.npm
 
       - name: Install npm deps
         run: npm ci
 
-      # 拉取当前平台的 PDFium 动态库（决策 5：版本与 pdfium-render pdfium_7881 feature 锁定）
-      # 缺这步构建出的包无法解析 PDF
-      - name: Fetch PDFium (Unix)
-        if: runner.os != 'Windows'
-        env:
-          GH_PROXY: ${{ vars.GH_PROXY }}
-        run: bash scripts/fetch-pdfium.sh
-
-      - name: Fetch PDFium (Windows)
-        if: runner.os == 'Windows'
-        env:
-          GH_PROXY: ${{ vars.GH_PROXY }}
-        run: scripts\\fetch-pdfium.bat
+      # PDFium 动态库已入库（src-tauri/resources/pdfium/{win-x64,mac-arm64}/），
+      # 无需 CI 下载。版本固定 chromium/7881，升级时手动替换 + 改 scripts/fetch-pdfium.sh。
+      # 详见 docs/RELEASE-GUIDE.md「PDFium 版本管理」。
 
       # tauri-action 纯构建模式：不传 tagName/releaseName/releaseDraft，
       # 只 build + 输出本地产物，不碰 GitHub Release
@@ -94,36 +102,87 @@ jobs:
           args: --target ${{ matrix.target }}
 
       # 把构建出的安装包上传为 artifact（命名按平台区分，便于聚合下载）
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+      # 产物路径：根 .cargo/config.toml 设 target-dir="target"，产物落在仓库根
+      # target/<target>/release/bundle/（日志佐证）。src-tauri/target/ 作兜底 glob。
+      - name: Upload build artifacts (Windows)
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.label }}
-          # Tauri v2 产物路径：
-          #   Windows: nsis/*.exe (可能还有 msi/*.msi)
-          #   macOS:   dmg/*.dmg (macos/*.app 是目录不入 artifact)
           if-no-files-found: error # 产物缺失直接失败，避免空 Release
           path: |
+            target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            target/${{ matrix.target }}/release/bundle/msi/*.msi
             src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
             src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
+
+      - name: Upload build artifacts (macOS)
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-${{ matrix.label }}
+          if-no-files-found: error
+          path: |
+            target/${{ matrix.target }}/release/bundle/dmg/*.dmg
             src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
 
   # ═══════════════════════════════════════════════════════════
-  # Job 2: 三平台都成功后，聚合 artifact → 创建 GitCode Release → 上传附件
+  # Job 2: 两平台都成功后，聚合 artifact → 创建 GitCode Release → 上传附件
   # ═══════════════════════════════════════════════════════════
   sync_gitcode_release:
     name: Sync Release to GitCode
     needs: build
+    # 只在 tag 触发时同步 GitCode Release；main 分支 push 只做 build 预热 cache，不发版
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: artifacts-*
           path: ./assets
-          merge-multiple: true # 合并到同一目录（三平台产物名不同，无覆盖）
+          merge-multiple: true # 合并到同一目录（两平台产物名不同，无覆盖）
 
       - name: List downloaded files
         run: find ./assets -type f | sort
+
+      # ── 发布 GitHub Release（作为 GitCode 的备份源 + 代理用户直连下载）──
+      # 公开仓库 GitHub Release 存储免费、不限速。用内置 GITHUB_TOKEN，零配置。
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }} # owner/repo，传给 --repo 避免 gh 依赖本地 git
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # 收集所有安装包
+          mapfile -t ASSETS < <(find ./assets -type f \( \
+            -name '*.exe' -o -name '*.msi' -o -name '*.dmg' \
+            -o -name '*.AppImage' -o -name '*.deb' \) | sort)
+          echo "上传到 GitHub Release: ${#ASSETS[@]} 个文件"
+          # --repo 显式指定仓库（sync job 没 checkout，没有本地 .git，gh 会调 git 报错）
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，追加资产"
+          else
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "$TAG" \
+              --notes "Ontology Studio $TAG
+
+          ## 下载
+          - **macOS (Apple Silicon)**: \`.dmg\`
+          - **Windows x64**: \`.exe\` (NSIS) 或 \`.msi\`
+          - 国内用户如下载慢，请到 [GitCode Release](https://gitcode.com/JasonSmiths/ontology-studio/releases) 镜像下载
+
+          ## macOS 安装提示
+          DMG 未签名，首次打开请右键 → 打开。"
+          fi
+          # 上传所有资产到 GitHub Release
+          for f in "${ASSETS[@]}"; do
+            echo "上传 $(basename "$f")..."
+            gh release upload "$TAG" "$f" --repo "$REPO" --clobber
+          done
+          echo "✅ GitHub Release $TAG 发布完成"
 
       # ── 创建/更新 GitCode Release ──
       - name: Create or Update GitCode Release
@@ -154,7 +213,7 @@ jobs:
             exit 1
           fi
 
-          BODY="自动构建发布 $TAG，包含 Windows (x64) / macOS (arm64+x64) 安装包。由 GitHub Actions 构建。"
+          BODY="自动构建发布 $TAG，包含 Windows (x64) / macOS (arm64) 安装包。由 GitHub Actions 构建。"
           HTTP=$(curl -L -sS -o /tmp/rel.json -w "%{http_code}" \
             -X "$METHOD" \
             -H "PRIVATE-TOKEN: $TOKEN" \
@@ -190,40 +249,69 @@ jobs:
           fi
           echo "待上传文件数: ${#FILES[@]}"
 
-          for f in "${FILES[@]}"; do
-            fname="$(basename "$f")"
-            echo "── 上传 $fname ──"
+          upload_one() {
+            local f="$1" idx="$2" total="$3"
+            local fname="$(basename "$f")"
+            echo "[$idx/$total] ── 上传 $fname ($(du -m "$f" | cut -f1)MB) ──"
             # 步骤1: GET upload_url 拿预签名地址 + headers
-            INFO=$(curl -sS \
+            # 用 --get --data-urlencode 让 curl 自动 URL-encode 文件名（含空格，
+            # 如 "Ontology Studio_0.1.0_aarch64.dmg"），根治 Malformed URL 错误。
+            local INFO UPLOAD_URL
+            INFO=$(curl -sS --get \
+              --data-urlencode "file_name=$fname" \
               -H "PRIVATE-TOKEN: $TOKEN" \
               -H "Accept: application/json" \
-              "$API/repos/$REPO/releases/$TAG/upload_url?file_name=$fname")
+              "$API/repos/$REPO/releases/$TAG/upload_url")
             UPLOAD_URL=$(echo "$INFO" | jq -r '.url')
             if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
-              echo "❌ 拿不到 upload_url:"
+              echo "❌ [$idx/$total] $fname 拿不到 upload_url："
               echo "$INFO"
-              exit 1
+              return 1
             fi
             # 构造 headers 数组（GitCode 返回 {headers:{k:v,...}}）
-            HDR_ARGS=()
+            local -a HDR_ARGS=()
             while IFS= read -r line; do
               [ -n "$line" ] && HDR_ARGS+=(-H "$line")
             done < <(echo "$INFO" | jq -r '.headers // {} | to_entries[] | "\(.key): \(.value)"')
 
             # 步骤2: PUT 二进制到预签名地址
-            HTTP=$(curl -X PUT -sS -o /tmp/up.json -w "%{http_code}" \
+            local HTTP
+            HTTP=$(curl -X PUT -sS -o /tmp/up_$idx.json -w "%{http_code}" \
               --retry 3 --retry-delay 5 \
               "${HDR_ARGS[@]}" \
               -T "$f" \
               "$UPLOAD_URL")
             if [ "$HTTP" = "200" ]; then
-              echo "  ✅ $fname 上传成功"
+              echo "  ✅ [$idx/$total] $fname 上传成功"
             else
-              echo "  ❌ $fname 上传失败 HTTP=$HTTP"
-              cat /tmp/up.json
-              exit 1
+              echo "  ❌ [$idx/$total] $fname 上传失败 HTTP=$HTTP"
+              cat /tmp/up_$idx.json
+              return 1
             fi
+          }
+          export -f upload_one
+          export TOKEN REPO API TAG
+
+          # 并行上传（所有文件同时 PUT，跨境带宽是瓶颈，并行能显著加速）
+          total=${#FILES[@]}
+          pids=()
+          i=0
+          for f in "${FILES[@]}"; do
+            i=$((i+1))
+            upload_one "$f" "$i" "$total" &
+            pids+=($!)
           done
+
+          # 等待所有上传，任一失败则整体失败
+          fail=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || fail=1
+          done
+          if [ "$fail" = "1" ]; then
+            echo "❌ 有文件上传失败"
+            exit 1
+          fi
+          echo "🎉 全部上传完成"
           echo "🎉 全部上传完成"
 
       - name: Summary

@@ -4824,7 +4824,6 @@ dependencies = [
  "pulldown-cmark",
  "rayon",
  "rbook",
- "rust_xlsxwriter",
  "serde",
  "serde_json",
  "tar",
@@ -6866,11 +6865,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "onto-studio"
+name = "ontology-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "specta",
+ "specta-typescript",
+ "thiserror 2.0.19",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ontology-studio"
 version = "0.1.0"
 dependencies = [
  "agent-core",
- "anyhow",
  "dirs",
  "federation",
  "futures-util",
@@ -6894,22 +6908,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "ontology-store"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "specta",
- "specta-typescript",
- "thiserror 2.0.19",
- "tracing",
  "uuid",
 ]
 
@@ -8454,15 +8452,6 @@ checksum = "e46a2036019fdb888131db7a4c847a1063a7493f971ed94ea82c67eada63ca54"
 dependencies = [
  "serde",
  "serde_derive",
-]
-
-[[package]]
-name = "rust_xlsxwriter"
-version = "0.96.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd1746025420e17b5d62528b930e550e016e857038794d74e169018126ef3d14"
-dependencies = [
- "zip 7.2.0",
 ]
 
 [[package]]
@@ -12220,20 +12209,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "zip"
-version = "7.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
-dependencies = [
- "crc32fast",
- "flate2",
- "indexmap 2.14.0",
- "memchr",
- "typed-path",
- "zopfli",
 ]
 
 [[package]]

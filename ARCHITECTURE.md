@@ -91,7 +91,7 @@
 
 - DOCX 读/写、PPTX、老格式 DOC/XLS/PPT → `office_oxide = "0.1.8"`
 - XLSX 读 → `calamine`(保留,类型/公式保真更优)
-- XLSX 写 → `rust_xlsxwriter`(保留,领域标准)
+- XLSX 写 → `rust_xlsxwriter`(保留,领域标准;当前代码未实现 XLSX 写功能,暂未引入依赖,实现时加回)
 
 **理由**(基于解析质量对比,非性能):
 

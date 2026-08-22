@@ -27,11 +27,13 @@ src/routeTree.gen.ts
 # ============================================================
 # tauri-specta / tauri 生成的 schema（构建期重新生成）
 /src-tauri/gen/schemas/
-# PDFium 预编译动态库（各约 7MB，二进制产物，不入库）
-# 由 scripts/fetch-pdfium.sh / .bat 下载，CI 自动执行（见 release.yml 的 Fetch PDFium 步骤）
-/src-tauri/resources/pdfium/**/pdfium.dll
-/src-tauri/resources/pdfium/**/libpdfium.dylib
-/src-tauri/resources/pdfium/**/libpdfium.so
+# PDFium 预编译动态库：已入库（仅 win-x64 + mac-arm64，共 ~14MB）
+# 版本固定 chromium/7881，与 crates/ingest 的 pdfium-render feature 锁定。
+# 升级 PDFium 时手动替换二进制 + 同步改 scripts/fetch-pdfium.sh 的 VERSION。
+# 注意：仅保留当前 CI 构建的两平台，其他平台（mac-x64/linux-x64）
+# 仍被忽略，需时手动 bash scripts/fetch-pdfium.sh <platform> 下载。
+/src-tauri/resources/pdfium/mac-x64/
+/src-tauri/resources/pdfium/linux-x64/
 
 # ============================================================
 # 工具 / 本地状态（不入库）

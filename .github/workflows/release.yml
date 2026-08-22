@@ -94,7 +94,8 @@ jobs:
           args: --target ${{ matrix.target }}
 
       # 把构建出的安装包上传为 artifact（命名按平台区分，便于聚合下载）
-      # path 用条件化表达式：每个平台只匹配自己的产物，避免 if-no-files-found 失配报错
+      # 产物路径：根 .cargo/config.toml 设 target-dir="target"，但 tauri-action
+      # 的 projectPath 行为可能让产物落在 src-tauri/target 或根 target，两处都 glob 兜底
       - name: Upload build artifacts (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
@@ -102,6 +103,8 @@ jobs:
           name: artifacts-${{ matrix.label }}
           if-no-files-found: error # 产物缺失直接失败，避免空 Release
           path: |
+            target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            target/${{ matrix.target }}/release/bundle/msi/*.msi
             src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
             src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
 
@@ -112,6 +115,7 @@ jobs:
           name: artifacts-${{ matrix.label }}
           if-no-files-found: error
           path: |
+            target/${{ matrix.target }}/release/bundle/dmg/*.dmg
             src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
 
   # ═══════════════════════════════════════════════════════════

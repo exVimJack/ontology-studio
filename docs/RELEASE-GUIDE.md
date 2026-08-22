@@ -10,12 +10,14 @@ GitHub (exVimJack/ontology-studio)     GitCode (JasonSmiths/ontology-studio)
 │  代码主仓 + CI 编译           │ ──Pull 镜像──▶ │  代码镜像 + Release 下载页      │
 │  windows-latest → exe         │     │  (国内用户在这里下载)         │
 │  macos-14      → dmg (arm64)  │     │                              │
-│  macos-15-intel→ dmg (x64)    │     │                              │
 └──────────────────────────────┘     └──────────────────────────────┘
               │                                    ▲
               │  build 完调 GitCode API            │
               └──── 上传 exe/dmg 到 GitCode Release ┘
 ```
+
+> Intel mac (x64) 已从矩阵移除：`macos-15-intel` runner 编译耗时是 arm64 的 2.3 倍（46m vs 20m），
+> 且 Intel mac 用户可通过 Rosetta 运行 arm64 包。如需重新启用，在 release.yml matrix 加回即可。
 
 **核心原则**（来自 AGENTS.md 红线）：GitCode 只托管代码镜像 + Release 下载页；编译全靠 GitHub 公有 Runner（GitCode CI 不提供跨平台公有 runner）。
 
@@ -26,7 +28,7 @@ GitHub (exVimJack/ontology-studio)     GitCode (JasonSmiths/ontology-studio)
 | 改动 | 文件 | 说明 |
 | --- | --- | --- |
 | 仓库名元数据改名 | `Cargo.toml`、`src-tauri/Cargo.toml`、`package.json` | `onto-studio` → `ontology-studio`（仅元数据） |
-| 重写发布 workflow | `.github/workflows/release.yml` | 修正方案1所有坑 + 保留 PDFium fetch + 三平台矩阵 |
+| 重写发布 workflow | `.github/workflows/release.yml` | 修正方案1所有坑 + PDFium 入库 + 两平台矩阵 + Rust cache 修正 |
 | Git 剥离脚本 | `scripts/init-standalone-repo.sh` | `git init` + 双 remote + 首次提交 |
 
 ### 🚫 没改的东西（故意保留，避免破坏运行时）
@@ -44,7 +46,7 @@ GitHub (exVimJack/ontology-studio)     GitCode (JasonSmiths/ontology-studio)
 | bash globstar | `**/*.{exe,...}` 跨目录匹配不到 | `find ... -name '*.exe'` 递归（根治） |
 | 第三方 action 依赖 | `nvdacn/sync_to_gitcode` | 纯 curl（零外部依赖） |
 | tauri-action | `tagName: ""`（空字符串可能告警） | 不传 tagName（纯构建，官方推荐） |
-| macOS Intel runner | `macos-13`（**2025-12 已下线**） | `macos-15-intel`（GitHub 推荐，可用到 2027-08） |
+| macOS Intel runner | `macos-13`（**2025-12 已下线**） | 已移除 macos-x64 矩阵（Intel runner 慢，arm64 包可 Rosetta 运行） |
 | 失败可观测性 | 第三方 action 黑盒 | curl 输出完整响应体 |
 | artifact 缺失保护 | 无 | `if-no-files-found: error` |
 
@@ -80,9 +82,11 @@ GitHub (exVimJack/ontology-studio)     GitCode (JasonSmiths/ontology-studio)
 2. New repository secret：
    - Name: `GITCODE_TOKEN`
    - Value: 粘贴上一步的 GitCode token
-3. （可选）配置 `GH_PROXY` 变量加速 PDFium 下载：
+3. （可选）配置 `GH_PROXY` 变量（仅本地手动跑 `fetch-pdfium.sh` 时用，CI 已入库无需下载）：
    - 进入 Settings → Secrets and variables → **Variables**（不是 Secrets）
    - New variable: Name=`GH_PROXY`，Value=`https://ghfast.top/`（或你常用的 GitHub 镜像）
+
+   > 注：CI 不再需要 PDFium 下载步骤——二进制已入库（见「PDFium 版本管理」章节）。
 
 ### 步骤 5：运行剥离脚本（在本地执行）
 
@@ -120,10 +124,10 @@ git push github v0.0.1-test --tags
 
 然后：
 
-1. 看 <https://github.com/exVimJack/ontology-studio/actions> —— 三个 build job 应该都跑起来
-2. 等 build job 全绿（约 15-25 分钟，Rust 首次编译慢）
+1. 看 <https://github.com/exVimJack/ontology-studio/actions> —— 两个 build job 应该都跑起来
+2. 等 build job 全绿（首次约 20-30 分钟全量编译；二次构建命中 cache 后 3-8 分钟）
 3. 看 sync_gitcode_release job 是否成功
-4. 打开 <https://gitcode.com/JasonSmiths/ontology-studio/releases> —— 应看到 `v0.0.1-test` Release，含 exe × 1 + dmg × 2
+4. 打开 <https://gitcode.com/JasonSmiths/ontology-studio/releases> —— 应看到 `v0.0.1-test` Release，含 exe × 1 + dmg × 1
 
 如果失败，看 Actions 日志里对应 step 的 `cat /tmp/*.json` 输出（workflow 设计为失败时打印完整 GitCode API 响应体）。
 
@@ -159,7 +163,32 @@ macOS/Windows 用 identifier 定位用户数据目录：
 
 ### Q: Linux 包呢？
 
-没做。onto-studio 是桌面知识工作台，Linux 桌面用户极少。现有矩阵只 windows + macOS arm64 + macOS x64。如需 Linux，在 `release.yml` 的 matrix 加 `ubuntu-22.04` 即可。
+没做。onto-studio 是桌面知识工作台，Linux 桌面用户极少。现有矩阵只 windows + macOS arm64。如需 Linux，在 `release.yml` 的 matrix 加 `ubuntu-22.04` 即可。
+
+### Q: PDFium 版本管理（如何升级 / 加平台）？
+
+PDFium 二进制已入库（`src-tauri/resources/pdfium/{win-x64,mac-arm64}/`），约 14MB。版本固定 `chromium/7881`，与 `crates/ingest/Cargo.toml` 里 `pdfium-render` 的 `pdfium_7881` feature **严格绑定**——不一致会 `missing-symbol` 崩溃。
+
+**升级 PDFium 版本时**：
+1. 改 `crates/ingest/Cargo.toml` 的 `pdfium-render` feature（如 `pdfium_8000`）
+2. 改 `scripts/fetch-pdfium.sh` / `fetch-pdfium.bat` 的 `VERSION` 变量
+3. 本地跑 `bash scripts/fetch-pdfium.sh all` 重新下载全部平台
+4. 替换入库的二进制（`git add src-tauri/resources/pdfium/*/`）
+5. 提交 + push
+
+**加新平台时**（如 linux-x64）：
+```bash
+bash scripts/fetch-pdfium.sh all  # 下载全部（会包含 linux-x64）
+# 或手动下载后解压到 src-tauri/resources/pdfium/linux-x64/
+```
+然后取消 `.gitignore` 里 `/src-tauri/resources/pdfium/linux-x64/` 的排除规则。
+
+### Q: Rust 编译为什么这么慢？如何优化？
+
+Rust 编译本质是“编译成机器码”，比 npm 装包（拷贝文件）慢 100-1000 倍，不可类比。核心结论：
+- 已用 `swatinem/rust-cache` 缓存根 `target/`，二次构建命中后 3-8 分钟（首次 20-30 分钟）
+- profile 已优化（`lto="thin"` + `codegen-units=16`），不再激进降级以免影响运行性能
+- Intel mac runner 慢到不可接受（46m），已移除该平台
 
 ### Q: GitCode Pull 镜像会同步 Release 吗？
 

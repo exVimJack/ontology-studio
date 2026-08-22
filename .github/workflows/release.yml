@@ -30,7 +30,7 @@ env:
 
 jobs:
   # ═══════════════════════════════════════════════════════════
-  # Job 1: 三平台并行编译，产物上传为 GitHub Artifact
+  # Job 1: 两平台并行编译，产物上传为 GitHub Artifact
   # ═══════════════════════════════════════════════════════════
   build:
     name: Build (${{ matrix.label }})
@@ -45,9 +45,9 @@ jobs:
           - os: macos-14 # Apple Silicon runner
             target: aarch64-apple-darwin
             label: macos-arm64
-          - os: macos-15-intel # Intel runner（macos-13 已下线）
-            target: x86_64-apple-darwin
-            label: macos-x64
+          # macos-x64 (Intel) 已移除：GitHub macos-15-intel runner 硬件性能约为
+          # M1 的 50-60%，Rust 编译耗时翻倍（46m vs 20m）。Intel mac 用户可
+          # 通过 Rosetta 运行 arm64 包，或后续按需重新启用。
     steps:
       - uses: actions/checkout@v4
 
@@ -56,33 +56,30 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Rust 编译缓存（swatinem/rust-cache）
+      # 关键：根 .cargo/config.toml 设 target-dir="target"，所有 cargo invocation
+      # （根 workspace 5 个 crate + src-tauri Tauri crate）产物都落在仓库根 target/。
+      # 必须缓存根 target/ + ~/.cargo/registry，否则下次仍全量编译（593 个 crate）。
+      # 不用 workspaces 参数（它默认找 src-tauri/target，是空目录）。
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: "src-tauri -> target"
+          # 缓存根 target 目录（.cargo/config.toml 指定的 target-dir）
+          workspaces: ". -> target"
           key: ${{ matrix.target }}
 
       - name: Install Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm # 加速 npm ci，缓存 ~/.npm
 
       - name: Install npm deps
         run: npm ci
 
-      # 拉取当前平台的 PDFium 动态库（决策 5：版本与 pdfium-render pdfium_7881 feature 锁定）
-      # 缺这步构建出的包无法解析 PDF
-      - name: Fetch PDFium (Unix)
-        if: runner.os != 'Windows'
-        env:
-          GH_PROXY: ${{ vars.GH_PROXY }}
-        run: bash scripts/fetch-pdfium.sh
-
-      - name: Fetch PDFium (Windows)
-        if: runner.os == 'Windows'
-        env:
-          GH_PROXY: ${{ vars.GH_PROXY }}
-        run: scripts\\fetch-pdfium.bat
+      # PDFium 动态库已入库（src-tauri/resources/pdfium/{win-x64,mac-arm64}/），
+      # 无需 CI 下载。版本固定 chromium/7881，升级时手动替换 + 改 scripts/fetch-pdfium.sh。
+      # 详见 docs/RELEASE-GUIDE.md「PDFium 版本管理」。
 
       # tauri-action 纯构建模式：不传 tagName/releaseName/releaseDraft，
       # 只 build + 输出本地产物，不碰 GitHub Release
@@ -94,8 +91,8 @@ jobs:
           args: --target ${{ matrix.target }}
 
       # 把构建出的安装包上传为 artifact（命名按平台区分，便于聚合下载）
-      # 产物路径：根 .cargo/config.toml 设 target-dir="target"，但 tauri-action
-      # 的 projectPath 行为可能让产物落在 src-tauri/target 或根 target，两处都 glob 兜底
+      # 产物路径：根 .cargo/config.toml 设 target-dir="target"，产物落在仓库根
+      # target/<target>/release/bundle/（日志佐证）。src-tauri/target/ 作兜底 glob。
       - name: Upload build artifacts (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
@@ -119,7 +116,7 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
 
   # ═══════════════════════════════════════════════════════════
-  # Job 2: 三平台都成功后，聚合 artifact → 创建 GitCode Release → 上传附件
+  # Job 2: 两平台都成功后，聚合 artifact → 创建 GitCode Release → 上传附件
   # ═══════════════════════════════════════════════════════════
   sync_gitcode_release:
     name: Sync Release to GitCode
@@ -131,7 +128,7 @@ jobs:
         with:
           pattern: artifacts-*
           path: ./assets
-          merge-multiple: true # 合并到同一目录（三平台产物名不同，无覆盖）
+          merge-multiple: true # 合并到同一目录（两平台产物名不同，无覆盖）
 
       - name: List downloaded files
         run: find ./assets -type f | sort
@@ -165,7 +162,7 @@ jobs:
             exit 1
           fi
 
-          BODY="自动构建发布 $TAG，包含 Windows (x64) / macOS (arm64+x64) 安装包。由 GitHub Actions 构建。"
+          BODY="自动构建发布 $TAG，包含 Windows (x64) / macOS (arm64) 安装包。由 GitHub Actions 构建。"
           HTTP=$(curl -L -sS -o /tmp/rel.json -w "%{http_code}" \
             -X "$METHOD" \
             -H "PRIVATE-TOKEN: $TOKEN" \

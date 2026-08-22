@@ -49,7 +49,7 @@ jobs:
           # M1 的 50-60%，Rust 编译耗时翻倍（46m vs 20m）。Intel mac 用户可
           # 通过 Rosetta 运行 arm64 包，或后续按需重新启用。
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -69,7 +69,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: npm # 加速 npm ci，缓存 ~/.npm
@@ -95,7 +95,7 @@ jobs:
       # target/<target>/release/bundle/（日志佐证）。src-tauri/target/ 作兜底 glob。
       - name: Upload build artifacts (Windows)
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.label }}
           if-no-files-found: error # 产物缺失直接失败，避免空 Release
@@ -107,7 +107,7 @@ jobs:
 
       - name: Upload build artifacts (macOS)
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.label }}
           if-no-files-found: error
@@ -124,7 +124,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: artifacts-*
           path: ./assets
@@ -202,13 +202,16 @@ jobs:
             fname="$(basename "$f")"
             echo "── 上传 $fname ──"
             # 步骤1: GET upload_url 拿预签名地址 + headers
-            INFO=$(curl -sS \
+            # 用 --get --data-urlencode 让 curl 自动 URL-encode 文件名（含空格，
+            # 如 "Ontology Studio_0.1.0_aarch64.dmg"），根治 Malformed URL 错误。
+            INFO=$(curl -sS --get \
+              --data-urlencode "file_name=$fname" \
               -H "PRIVATE-TOKEN: $TOKEN" \
               -H "Accept: application/json" \
-              "$API/repos/$REPO/releases/$TAG/upload_url?file_name=$fname")
+              "$API/repos/$REPO/releases/$TAG/upload_url")
             UPLOAD_URL=$(echo "$INFO" | jq -r '.url')
             if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
-              echo "❌ 拿不到 upload_url:"
+              echo "❌ 拿不到 upload_url："
               echo "$INFO"
               exit 1
             fi

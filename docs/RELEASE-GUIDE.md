@@ -170,6 +170,7 @@ macOS/Windows 用 identifier 定位用户数据目录：
 PDFium 二进制已入库（`src-tauri/resources/pdfium/{win-x64,mac-arm64}/`），约 14MB。版本固定 `chromium/7881`，与 `crates/ingest/Cargo.toml` 里 `pdfium-render` 的 `pdfium_7881` feature **严格绑定**——不一致会 `missing-symbol` 崩溃。
 
 **升级 PDFium 版本时**：
+
 1. 改 `crates/ingest/Cargo.toml` 的 `pdfium-render` feature（如 `pdfium_8000`）
 2. 改 `scripts/fetch-pdfium.sh` / `fetch-pdfium.bat` 的 `VERSION` 变量
 3. 本地跑 `bash scripts/fetch-pdfium.sh all` 重新下载全部平台
@@ -177,15 +178,18 @@ PDFium 二进制已入库（`src-tauri/resources/pdfium/{win-x64,mac-arm64}/`）
 5. 提交 + push
 
 **加新平台时**（如 linux-x64）：
+
 ```bash
 bash scripts/fetch-pdfium.sh all  # 下载全部（会包含 linux-x64）
 # 或手动下载后解压到 src-tauri/resources/pdfium/linux-x64/
 ```
+
 然后取消 `.gitignore` 里 `/src-tauri/resources/pdfium/linux-x64/` 的排除规则。
 
 ### Q: Rust 编译为什么这么慢？如何优化？
 
 Rust 编译本质是“编译成机器码”，比 npm 装包（拷贝文件）慢 100-1000 倍，不可类比。核心结论：
+
 - 已用 `swatinem/rust-cache` 缓存根 `target/`，二次构建命中后 3-8 分钟（首次 20-30 分钟）
 - profile 已优化（`lto="thin"` + `codegen-units=16`），不再激进降级以免影响运行性能
 - Intel mac runner 慢到不可接受（46m），已移除该平台

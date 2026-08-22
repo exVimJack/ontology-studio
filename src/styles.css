@@ -1,0 +1,142 @@
+@import "tailwindcss";
+
+/* ── 移动端安全区（ARCHITECTURE.md §17.2 / 决策 F11） ───────────
+   配合 index.html 的 viewport-fit=cover，内容可延伸到刘海/底部 home indicator 下方，
+   但交互元素需用 env(safe-area-inset-*) 内缩避免被遮挡。
+   暴露为 CSS 变量供 Tailwind arbitrary value 引用，如 pb-[env(safe-area-inset-bottom)]。 */
+:root {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+}
+
+/* 移动端隐藏细滚动条（桌面审美的滚动条在移动端显冗余，原生动量滚动已足够） */
+@media (max-width: 768px) {
+  *::-webkit-scrollbar { width: 0; height: 0; }
+  * { scrollbar-width: none; }
+  /* 移动端禁止水平溢出滚动（横向滚动是移动端体验大忌） */
+  body { overscroll-behavior: none; }
+}
+
+/* ── 主题 token（一期：浅/深双主题，对齐 §20.9 外观） ─────────── */
+/* Tailwind v4: @theme inline 引用运行时 CSS 变量（:root / .dark 切换） */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-bg-elevated: var(--bg-elevated);
+  --color-bg-hover: var(--bg-hover);
+  --color-border: var(--border);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-danger: var(--danger);
+  --color-danger-fg: var(--danger-fg);
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+}
+
+/* 浅色（默认） */
+:root {
+  --bg: #ffffff;
+  --bg-elevated: #f9fafb;
+  --bg-hover: #f3f4f6;
+  --border: #e5e7eb;
+  --fg: #111827;
+  --fg-muted: #6b7280;
+  --fg-subtle: #9ca3af;
+  --accent: #2563eb;
+  --accent-fg: #ffffff;
+  --danger: #ef4444;
+  --danger-fg: #ffffff;
+}
+
+/* 深色 */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115;
+    --bg-elevated: #171a21;
+    --bg-hover: #1f242d;
+    --border: #2a2f3a;
+    --fg: #e5e7eb;
+    --fg-muted: #9ca3af;
+    --fg-subtle: #6b7280;
+    --accent: #3b82f6;
+    --accent-fg: #ffffff;
+    --danger: #f87171;
+    --danger-fg: #1f1010;
+  }
+}
+
+/* 用户显式深色（stores/ui-store 切换时给 html 加 .dark） */
+.dark {
+  --bg: #0f1115;
+  --bg-elevated: #171a21;
+  --bg-hover: #1f242d;
+  --border: #2a2f3a;
+  --fg: #e5e7eb;
+  --fg-muted: #9ca3af;
+  --fg-subtle: #6b7280;
+  --accent: #3b82f6;
+  --accent-fg: #ffffff;
+  --danger: #f87171;
+  --danger-fg: #1f1010;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+/* ── shadcn/ui 兼容 token（供 @assistant-ui/react-streamdown 等期望 shadcn 变量的库） ──
+   映射到我们的自定义 token，保持单一真实来源。
+   注意：shadcn 的 --accent 是“hover 高亮色”，与我们的主色 --accent 语义不同；
+   streamdown 主要用 --primary/--background/--foreground/--border，不依赖 --accent。 */
+:root {
+  --background: var(--bg);
+  --foreground: var(--fg);
+  --muted: var(--bg-elevated);
+  --muted-foreground: var(--fg-muted);
+  --border: var(--border);
+  --primary: var(--accent);
+  --primary-foreground: var(--accent-fg);
+  --destructive: var(--danger);
+  --card: var(--bg-elevated);
+  --card-foreground: var(--fg);
+  --accent-foreground: var(--fg);
+  --radius: 8px;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* 自定义滚动条（细，符合桌面应用审美） */
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--fg-subtle); }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* 流式光标动画 */
+@keyframes cursor-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+.streaming-cursor::after {
+  content: "▋";
+  margin-left: 1px;
+  animation: cursor-blink 1s steps(1) infinite;
+  color: var(--accent);
+}

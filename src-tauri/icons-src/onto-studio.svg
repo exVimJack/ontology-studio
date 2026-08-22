@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#5B8CFF"/>
+      <stop offset="50%" stop-color="#4453E6"/>
+      <stop offset="100%" stop-color="#7C3AED"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="22%" r="66%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="ring" x1="0" y1="260" x2="0" y2="764" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#DBE3FF"/>
+    </linearGradient>
+    <radialGradient id="bead" cx="35%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#FFF3B8"/>
+      <stop offset="45%" stop-color="#F8C453"/>
+      <stop offset="100%" stop-color="#E8951A"/>
+    </radialGradient>
+    <filter id="ringShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="12" stdDeviation="24" flood-color="#141450" flood-opacity="0.38"/>
+    </filter>
+    <filter id="beadShadow" x="-60%" y="-60%" width="220%" height="220%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#3A2A00" flood-opacity="0.35"/>
+    </filter>
+    <filter id="softBlur" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="8"/>
+    </filter>
+    <path id="squircle" d="M 285.4,100 H 738.6 A 185.4,185.4 0 0 1 924,285.4 V 738.6 A 185.4,185.4 0 0 1 738.6,924 H 285.4 A 185.4,185.4 0 0 1 100,738.6 V 285.4 A 185.4,185.4 0 0 1 285.4,100 Z"/>
+  </defs>
+
+  <use href="#squircle" fill="url(#bg)"/>
+  <use href="#squircle" fill="url(#glow)"/>
+
+  <g filter="url(#ringShadow)">
+    <circle cx="512" cy="512" r="252" fill="none" stroke="url(#ring)" stroke-width="86"/>
+  </g>
+
+  <path d="M 512.0,260.0 L 730.2,638.0 L 293.8,638.0 Z" fill="none" stroke="#FFFFFF" stroke-opacity="0.5"
+        stroke-width="26" stroke-linejoin="round" stroke-linecap="round"/>
+
+  <g filter="url(#beadShadow)">
+      <circle cx="512.0" cy="260.0" r="40" fill="url(#bead)"/><circle cx="501.0" cy="247.0" r="9" fill="#fff" opacity="0.85"/>
+      <circle cx="730.2" cy="386.0" r="40" fill="url(#bead)"/><circle cx="719.2" cy="373.0" r="9" fill="#fff" opacity="0.85"/>
+      <circle cx="730.2" cy="638.0" r="40" fill="url(#bead)"/><circle cx="719.2" cy="625.0" r="9" fill="#fff" opacity="0.85"/>
+      <circle cx="512.0" cy="764.0" r="40" fill="url(#bead)"/><circle cx="501.0" cy="751.0" r="9" fill="#fff" opacity="0.85"/>
+      <circle cx="293.8" cy="638.0" r="40" fill="url(#bead)"/><circle cx="282.8" cy="625.0" r="9" fill="#fff" opacity="0.85"/>
+      <circle cx="293.8" cy="386.0" r="40" fill="url(#bead)"/><circle cx="282.8" cy="373.0" r="9" fill="#fff" opacity="0.85"/>
+  </g>
+
+  <circle cx="806" cy="232" r="20" fill="#FFFFFF" opacity="0.30" filter="url(#softBlur)"/>
+  <path d="M 0,-1 C 0.12,-0.30 0.30,-0.12 1,0 C 0.30,0.12 0.12,0.30 0,1 C -0.12,0.30 -0.30,0.12 -1,0 C -0.30,-0.12 -0.12,-0.30 0,-1 Z" fill="#FFFFFF" opacity="0.95"
+        transform="translate(806,232) scale(40)"/>
+</svg>

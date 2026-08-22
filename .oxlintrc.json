@@ -1,0 +1,132 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["import"],
+  "env": { "browser": true, "node": true },
+  "ignorePatterns": [
+    "dist/**",
+    "node_modules/**",
+    "src-tauri/**",
+    "crates/**",
+    "target/**",
+    "src/lib/dev/**",
+    "src/routeTree.gen.ts"
+  ],
+  "rules": {
+    "no-unused-vars": "warn"
+  },
+  "overrides": [
+    {
+      "files": ["src/lib/domain/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["@/stores/*", "@/hooks/*", "@/components/*", "@/routes/*"],
+                "message": "domain 层是最底层（§12.1），不得依赖 stores/hooks/components/routes 上层。只允许依赖 node_modules、本目录，以及 type-only 引用 @/lib/ipc/bindings（specta 生成的类型源头，domain 作为类型统一出口 re-export）。"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/lib/ipc/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["@/stores/*", "@/hooks/*", "@/components/*"],
+                "message": "ipc 层不得反向引用上层（§12.1 硬约束：UI → State → IPC → Domain 单向）。ipc 只能依赖 domain。"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/stores/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["@/components/*", "@/hooks/*"],
+                "message": "stores 层不得 import components/hooks（§12.1 硬约束：stores 是 State 层，不得反向依赖 UI 层）。"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/components/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "@tauri-apps/api/core",
+                "importNames": ["invoke"],
+                "message": "components/ 不得直接 invoke（§12.1 硬约束）。请经 hooks（useChat/useConversations 等）间接调用 IPC。"
+              },
+              {
+                "name": "@/lib/ipc/commands",
+                "message": "components/ 不得直接 import ipc 命令封装（§12.1 硬约束）。请经 hooks 间接调用。"
+              },
+              {
+                "name": "@/lib/ipc/bindings",
+                "message": "components/ 不得直接 import ipc bindings（§12.1 硬约束，bindings 仅供 ipc/hooks 层用）。请经 hooks 间接调用，或从 domain 取类型。"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/hooks/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "@tauri-apps/api/core",
+                "importNames": ["invoke"],
+                "message": "hooks/ 应经 @/lib/ipc/commands 封装调 IPC，不直接 invoke（保持 invoke 集中在 ipc 层）。"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/components/chat/MarkdownText.tsx"],
+      "rules": {
+        "no-unused-vars": "off"
+      }
+    },
+    {
+      "files": ["src/routes/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "@tauri-apps/api/core",
+                "importNames": ["invoke"],
+                "message": "routes/ 应经 @/lib/ipc/commands 封装调 IPC，不直接 invoke（保持 invoke 集中在 ipc 层）。"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

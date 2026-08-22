@@ -1,0 +1,62 @@
+[package]
+name = "ontology-studio"
+version = "0.1.0"
+description = "跨端 Agent 应用 — Rig 驱动 + 多模态文件摄取"
+authors = ["ontology-studio"]
+license = "MIT OR Apache-2.0"
+edition = "2021"
+rust-version = "1.82"
+
+# 见根 Cargo.toml：src-tauri 被排除出 workspace，独立 target，避免 Tauri
+# wasm/mobile target 与业务 crate 的 feature unification 冲突。
+
+[lib]
+name = "onto_studio_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6", features = [] }
+
+[dependencies]
+# ── Tauri 核心 + 平台插件（纯 Rust，ARCHITECTURE.md §18.1） ──
+tauri = { version = "2.11", features = [] }
+tauri-plugin-dialog = "2.7"
+tauri-plugin-fs = "2.5"
+tauri-plugin-store = "2.4"
+tauri-plugin-global-shortcut = "2.3"
+tauri-plugin-clipboard-manager = "2.3"
+tauri-plugin-notification = "2.3"
+
+# ── IPC 类型安全桥（决策 F5） ──
+# ARCHITECTURE.md 写 tauri-specta = "1.0" + specta = "1.0"（警告勿拉 2.0-rc）。
+# 但 crates.io 实测 tauri-specta 已发布 2.0.0-rc.25，配套 specta 2.0.0-rc.25。
+# 即 AGENTS.md 的"specta 版本陷阱"已因 tauri-specta 升级到 2.0-rc 而过时。
+# 现采用新的 2.0-rc 组合（tauri-specta 2.0-rc 自身要求 specta 2.0-rc）。
+specta = "2.0.0-rc.25"
+specta-typescript = "0.0.12"
+tauri-specta = { version = "2.0.0-rc.25", features = ["derive", "typescript"] }
+
+# ── 业务 crate（依赖 crates/，平台无关逻辑全在这里） ──
+agent-core = { path = "../crates/agent-core" }
+ingest = { path = "../crates/ingest" }
+memory = { path = "../crates/memory" }
+federation = { path = "../crates/federation" }
+ontology-store = { path = "../crates/ontology-store" }
+
+# ── 通用 ──
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+futures-util = "0.3"
+# ── 目录解析（skill 系统决策 20：~/.onto-studio/skills/ 等） ──
+# 纯 Rust 无原生依赖，MIT/Apache-2.0。Windows 需 USERPROFILE 特殊处理，故用 dirs 而非手写。
+dirs = "6"
+
+[features]
+# 默认无自定义 feature。Tauri 的 mobile feature 由 tauri CLI 按平台注入。
+default = []

@@ -1,0 +1,28 @@
+[package]
+name = "ontology-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# ── 存储（对齐 memory crate：rusqlite bundled，静态链接，零安装） ──
+rusqlite = { version = "0.39", features = ["bundled"] }
+
+# ── 通用（workspace 统一版本） ──
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+# ── api_name pattern 校验（对齐 Gaia naming.py） ──
+regex = "1"
+
+# ── IPC 类型导出（OntologySummary 等 DTO 需 #[derive(specta::Type)] 暴给前端）──
+# 与 src-tauri 的 tauri-specta 2.0-rc 配套（specta 2.0.0-rc.25）。
+specta = { version = "2.0.0-rc.25", features = ["derive", "serde_json"] }
+# specta-typescript：仅用于 #[specta(type = Number)] 注解绕 BigInt 导出禁令（见 AGENTS.md IPC 边界 BigInt 公约）。
+specta-typescript = "0.0.12"

@@ -1,0 +1,11 @@
+# Cargo 本地配置
+#
+# 原为 Windows 环境配置（target-dir 指向 C:/Users/think/AppData/Local/...，
+# 规避 WDAC/Smart App Control）。同步到 macOS 后该 Windows 路径会导致
+# cargo join fallback library path 时把 `:` 当分隔符而报错
+# ("path segment contains separator `:`")，故改为 macOS 本地路径。
+#
+# 切回 Windows 时需恢复为：
+#   target-dir = "C:/Users/think/AppData/Local/onto-studio-target"
+[build]
+target-dir = "target"

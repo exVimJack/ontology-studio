@@ -1,0 +1,53 @@
+# ontology-studio workspace
+#
+# 架构约束（见 ARCHITECTURE.md §六 工程结构 / AGENTS.md 工程结构）：
+#   - crates/  是全 Rust 业务核心，平台无关，可独立 cargo test
+#   - src-tauri/ 是 Tauri 壳：IPC 薄层 + 平台能力，不含业务逻辑
+#   - crates/ 之间可互相依赖，但不得反向依赖 src-tauri/ 或 src/
+#
+# 默认成员只含 crates/（业务核心），src-tauri 由 Tauri 构建链按需编译。
+[workspace]
+resolver = "2"
+members = ["crates/agent-core", "crates/federation", "crates/ingest", "crates/memory", "crates/ontology-store"]
+default-members = ["crates/agent-core", "crates/federation", "crates/ingest", "crates/memory", "crates/ontology-store"]
+
+# 排除 src-tauri：它有自己的 target 目录与 Tauri 构建流程，避免与 workspace
+# 共享 target 时产生 feature unification 冲突（Tauri 的 wasm/mobile target）。
+exclude = ["src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+authors = ["ontology-studio"]
+repository = "https://github.com/exVimJack/ontology-studio"
+
+[workspace.dependencies]
+# ── 序列化 / 错误 / 异步运行时（跨 crate 共享，版本统一） ──
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# ── 业务 crate 间互相依赖 ──
+agent-core = { path = "crates/agent-core" }
+federation = { path = "crates/federation" }
+ingest = { path = "crates/ingest" }
+memory = { path = "crates/memory" }
+ontology-store = { path = "crates/ontology-store" }
+
+[profile.release]
+# 方案1：Release 增量复用（见 PROGRESS 讨论）
+# 拆分编译单元，多核并行，减少连锁重编
+codegen-units = 16
+# thin-LTO 替代全量 LTO，编译速度翻倍，缓存更易复用
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = true
+# 关键：保留增量中间文件，默认 release 会关闭
+incremental = true

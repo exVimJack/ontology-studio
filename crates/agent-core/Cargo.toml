@@ -1,0 +1,86 @@
+[package]
+name = "agent-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# ── Agent 框架（ARCHITECTURE.md 决策 1/2） ──
+# 用 `rig` facade crate（v0.41，re-export rig-core，暴露 rig:: 命名空间，与官方文档示例一致）
+# 关闭 pdf/epub feature，不用 loaders（自建 ingest 是其超集）
+# default 已含 reqwest + derive + rustls，符合原则 1（rustls，禁 OpenSSL）
+# 启用 memory feature：re-export rig-memory 的历史塑形策略（SlidingWindow/TokenWindow/CompactingMemory）
+rig = { version = "0.41", default-features = false, features = ["reqwest", "derive", "rustls", "memory", "agent"] }
+
+# ── 对话记忆策略（二期 B1/B2：自动压缩复用 rig 原生能力） ──
+# rig-memory 提供 SlidingWindowMemory / TokenWindowMemory / CompactingMemory 等
+# 命名策略，避免手写 trim_history + compact_history。与 rig 同版本锁定。
+rig-memory = { version = "0.41", default-features = false }
+
+# ── MCP 客户端（决策 1 / 二期 A3） ──
+# rmcp 版本由 rig 0.41 锁定，保持一致以统一版本。
+#   - client：客户端角色基础
+#   - transport-async-rw：通用 (AsyncRead, AsyncWrite) 传输，用于自实现 stdio 子进程 transport
+#     （不用官方 transport-child-process：其依赖 process-wrap 拉入 windows crate 重型包，
+#      在当前 toolchain 下编译失败；自实现只需 tokio::process，零额外依赖）
+#   - transport-streamable-http-client-reqwest：HTTP/SSE 传输（远程 MCP server），复用 reqwest+rustls
+# 原则 1：rustls，禁 native-tls。
+# 注：rmcp 1.x 的 macros feature 依赖 pastey，在 default-features=false 下偶发解析问题，
+# 故不开 macros（ClientInfo 手动构造）。
+rmcp = { version = "1.8", default-features = false, features = [
+    "client",
+    "transport-async-rw",
+    "transport-streamable-http-client-reqwest",
+] }
+
+# ── 网络（原则 1：rustls，禁 OpenSSL） ──
+# reqwest 0.13 重命名 feature：rustls-tls → rustls（含 rustls-native-certs 自动拉 webpki-roots provider）
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "json",
+    "stream",
+] }
+
+# ── 异步 / 序列化 / 错误（workspace 统一版本） ──
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+# ── 流式辅助 ──
+futures-util = "0.3"
+async-stream = "0.3"
+
+# ── MCP HTTP transport 辅助（HeaderMap/HeaderName/HeaderValue） ──
+http = "1"
+
+# ── 业务依赖：历史消息转换用 memory::MessageRow ──
+memory.workspace = true
+
+# ── 业务依赖：联邦查询工具（三期前置：把数据源查询能力暴露给 agent） ──
+federation.workspace = true
+ontology-store.workspace = true
+
+# ── Skill 系统（决策 20）：SKILL.md 解析+校验+目录加载 ──
+# Govcraft 0.2，MIT。遗留 L1：依赖 serde_yaml 0.9.34（deprecated，非 RUSTSEC-0068；
+# 待上游 patch 为 serde_yaml_ng）。功能聚焦解析，依赖轻（serde + serde_yaml）。
+agent-skills = "0.2"
+
+# ── Skill 导入：zip 解压 + 防 zip 炸弹复用 ingest::security ──
+ingest.workspace = true
+zip = "9.0.0-pre2"
+
+# ── IPC 类型桥（决策 F5） ──
+# specta 仅用于 #[derive(Type)]，业务逻辑不依赖其运行时。
+specta = { version = "2.0.0-rc.25", features = ["derive"] }
+# specta-typescript：仅用于 #[specta(type = Number)] 注解绕 BigInt 导出禁令（见 AGENTS.md IPC 边界 BigInt 公约）。
+specta-typescript = "0.0.12"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+futures-util = "0.3"

@@ -1,0 +1,46 @@
+[package]
+name = "memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# ── 存储（决策 3） ──
+# rusqlite bundled：cc 编译 C 源码，静态链接，运行时零安装（原则 1 可接受）
+# 会话/消息/元数据/全文索引同一 .db 文件
+#
+# ⚠️ 构建 SQLite 需 C 编译器（MSVC）。已安装 Visual Studio BuildTools 2022。
+# ⚠️ 构建须在 MSVC 开发者环境下运行（INCLUDE/LIB），见根目录 cargo-msvc.bat。
+rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }
+
+# ── FTS5 中文分词（一期收尾：文件检索） ──
+# jieba：词语分词，精准中文短语，知识库文档检索。
+# 自实现分句版 JiebaTokenizer（crates/memory/src/jieba_tokenizer.rs）：
+# 先按标点/换行分句再逐句 jieba.cut，避免对大全文 DAG O(n²) 退化
+# （1.4M 字符 600s→1s）。替代 sqlite-jieba-tokenizer 0.6（其对整段 cut 致退化）。
+# jieba-rs 内嵌词典 dict.txt + idf.txt（~11MB），已确认接受。
+jieba-rs = "0.9"
+rusqlite-ext = "0.39"
+sqlite-chinese-stopword = "0.1"
+sqlite-english-stemmer = "0.1"
+
+# ── 通用（workspace 统一版本） ──
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+# ── IPC 类型桥（决策 F5） ──
+# specta 仅用于 #[derive(Type)]，业务逻辑不依赖其运行时。
+# 与 src-tauri 的 tauri-specta 2.0-rc 配套（specta 2.0.0-rc.25）。
+specta = { version = "2.0.0-rc.25", features = ["derive"] }
+# specta-typescript：仅用于 #[specta(type = Number)] 注解绕 BigInt 导出禁令（见 AGENTS.md IPC 边界 BigInt 公约）。
+# 纯导出元数据，不引入运行时依赖，不破坏业务核心解耦。
+specta-typescript = "0.0.12"
+
+[dev-dependencies]
+rusqlite-ext = "0.39"

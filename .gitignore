@@ -1,0 +1,60 @@
+# ============================================================
+# Rust
+# ============================================================
+/target
+**/target
+# 编译产物重定向到 C 盘（见 .cargo/config.toml，避开 WDAC 策略）
+# 本地 target 目录（若存在）
+/target-d/
+# workspace 根 Cargo.lock 提交（crates 版本可复现），src-tauri/Cargo.lock 也提交。
+# 仅忽略意外产生的 Cargo.lock（如子 crate 内误生成的）。
+!/Cargo.lock
+!/src-tauri/Cargo.lock
+
+# ============================================================
+# Node / 前端
+# ============================================================
+node_modules/
+dist/
+*.tsbuildinfo
+# TanStack Router 自动生成的路由树（@tanstack/router-plugin 生成，决策 F4）
+src/routeTree.gen.ts
+# TanStack 插件临时缓存
+.tanstack/
+
+# ============================================================
+# Tauri
+# ============================================================
+# tauri-specta / tauri 生成的 schema（构建期重新生成）
+/src-tauri/gen/schemas/
+# PDFium 预编译动态库（各约 7MB，二进制产物，不入库）
+# 由 scripts/fetch-pdfium.sh / .bat 下载，CI 自动执行（见 release.yml 的 Fetch PDFium 步骤）
+/src-tauri/resources/pdfium/**/pdfium.dll
+/src-tauri/resources/pdfium/**/libpdfium.dylib
+/src-tauri/resources/pdfium/**/libpdfium.so
+
+# ============================================================
+# 工具 / 本地状态（不入库）
+# ============================================================
+# pi workflow 本地运行时状态（workflow-runtime / subagents / workflows）
+.pi/
+# 探测脚本输出（probe_out.txt 等）
+probe_out.txt
+
+# ============================================================
+# IDE
+# ============================================================
+.vscode/
+.idea/
+*.swp
+
+# ============================================================
+# OS
+# ============================================================
+.DS_Store
+Thumbs.db
+
+# ============================================================
+# 临时 / 日志
+# ============================================================
+*.log

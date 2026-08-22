@@ -1,0 +1,75 @@
+[package]
+name = "federation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# ── 联邦查询引擎（ARCHITECTURE.md 决策 9 / 三期 PHASE3-FEDERATION.md §2.2） ──
+# datafusion 54.0.0 自带 arrow 58.3 + sqlparser 0.62（docs.rs 源码实证），
+# unparser feature 默认启用（federation 生成方言 SQL 需要）。
+# 单进程内嵌，零 JVM，Apache-2.0。
+datafusion = "54"
+
+# ── 联邦下推（PHASE3-FEDERATION.md §2.4 方案 D） ──
+# 0.5.5 依赖 datafusion ^54（源码 Cargo.toml 实证），与 datafusion 54 兼容。
+# alpha 状态，三期单用户桌面可接受；兜底见 §八。
+datafusion-federation = { version = "0.5.5", features = ["sql"] }
+
+# ── SQL 连接层（决策 12：sqlx 0.9 + rustls，禁 native-tls） ──
+# MySQL/PG 用强类型 MySqlPool/PgPool 按 kind 分发（不启用 any feature）。
+sqlx = { version = "0.9", default-features = false, features = [
+    "mysql",
+    "postgres",
+    "tls-rustls-ring",
+    "runtime-tokio",
+    "json",
+    "chrono",
+    "uuid",
+] }
+
+# ── Arrow（与 datafusion 54 一致） ──
+arrow = "58"
+
+# ── 时间类型（PG timestamp/date 读取，sqlx chrono feature 重导） ──
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# ── SQLExecutor trait async ──
+async-trait = "0.1"
+
+# ── futures（stream 辅助，executor 行流→RecordBatch） ──
+futures = "0.3"
+
+# ── calamine（Excel→MemTable，复用 ingest 同款） ──
+# 直接依赖 calamine（ingest 未 re-export），与 ingest 版本一致
+calamine = "0.36"
+
+# ── rusqlite（数据源配置持久化，复用 memory 的 SQLite 连接） ──
+# memory::Memory::lock() 返回 MutexGuard<Connection>，此处直接操作 rusqlite
+rusqlite = { version = "0.39", features = ["bundled"] }
+
+# ── 复用 ingest（Excel cell 解析逻辑参考） ──
+ingest.workspace = true
+
+# ── 数据源配置持久化（决策 10：复用 memory 的 SQLite） ──
+memory.workspace = true
+
+# ── workspace 统一版本 ──
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+# ── IPC 类型桥（决策 F5） ──
+# 与 src-tauri 的 tauri-specta 2.0-rc 配套（specta 2.0.0-rc.25）。
+specta = { version = "2.0.0-rc.25", features = ["derive"] }
+# specta-typescript：仅用于 #[specta(type = Number)] 注解绕 BigInt 导出禁令（见 AGENTS.md IPC 边界 BigInt 公约）。
+specta-typescript = "0.0.12"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1,0 +1,1448 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>onto-studio 技术架构 · 全生命周期可视化本体建模工具</title>
+<style>
+  :root {
+    --font-sans: 'Inter', system-ui, sans-serif;
+    --font-mono: ui-monospace, 'Cascadia Code', 'Source Code Pro', monospace;
+    --bg: #fff;
+    --text: #1a1a1a;
+    --text-secondary: #4a5568;
+    --text-muted: #8b95a5;
+    --border: #e2e8f0;
+    --border-strong: #cbd5e0;
+    --accent: #2b6cb0;
+    --green: #2f855a;
+    --amber: #d6972a;
+    --red: #c53030;
+    --purple: #6b46c1;
+    --code-bg: #f7fafc;
+    --content-width: 810px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    font-family: var(--font-sans);
+    font-size: 18px;
+    line-height: 1.6;
+    color: var(--text);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  /* ── 阅读进度条 ── */
+  #progress-bar {
+    position: fixed;
+    top: 0; left: 0;
+    height: 3px;
+    width: 0%;
+    background: var(--accent);
+    z-index: 1000;
+    transition: width 0.1s ease-out;
+  }
+
+  /* ── TOC 抽屉 ── */
+  #toc {
+    position: fixed;
+    top: 0; left: 0;
+    width: 280px;
+    height: 100vh;
+    overflow-y: auto;
+    padding: 40px 24px 40px 32px;
+    background: #fafbfc;
+    border-right: 1px solid var(--border);
+    font-size: 14px;
+  }
+  #toc .toc-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 16px;
+  }
+  #toc ul { list-style: none; }
+  #toc li { margin: 8px 0; }
+  #toc a {
+    color: var(--text-secondary);
+    text-decoration: none;
+    display: block;
+    padding: 4px 0 4px 12px;
+    border-left: 2px solid transparent;
+    transition: all 0.15s;
+    line-height: 1.45;
+  }
+  #toc a:hover { color: var(--accent); border-left-color: var(--accent); }
+  #toc a.lvl2 { padding-left: 24px; font-size: 13px; color: var(--text-muted); }
+  #toc a.active { color: var(--accent); border-left-color: var(--accent); font-weight: 500; }
+
+  /* ── 主内容 ── */
+  .main {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: 0 32px;
+  }
+  @media (max-width: 1100px) {
+    #toc { display: none; }
+    .main { padding: 0 24px; }
+  }
+
+  /* ── Hero ── */
+  .hero {
+    padding: 96px 0 64px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 48px;
+  }
+  .hero .eyebrow {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 20px;
+  }
+  .hero h1 {
+    font-size: 44px;
+    font-weight: 600;
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    margin-bottom: 24px;
+  }
+  .hero .lede {
+    font-size: 21px;
+    line-height: 1.55;
+    color: var(--text-secondary);
+    max-width: 680px;
+  }
+  .hero .meta {
+    margin-top: 32px;
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .hero .meta span { display: inline-flex; align-items: center; gap: 6px; }
+
+  /* ── 章节标题 ── */
+  section { padding: 48px 0; border-bottom: 1px solid var(--border); }
+  section:last-child { border-bottom: none; }
+  h2 {
+    font-size: 30px;
+    font-weight: 600;
+    line-height: 1.25;
+    letter-spacing: -0.01em;
+    margin-bottom: 8px;
+    scroll-margin-top: 24px;
+  }
+  h2 .num {
+    color: var(--text-muted);
+    font-weight: 400;
+    margin-right: 12px;
+  }
+  .section-conclusion {
+    font-size: 19px;
+    color: var(--accent);
+    font-weight: 500;
+    margin-bottom: 24px;
+    line-height: 1.5;
+  }
+  h3 {
+    font-size: 21px;
+    font-weight: 600;
+    margin: 36px 0 12px;
+    scroll-margin-top: 24px;
+  }
+  h4 {
+    font-size: 17px;
+    font-weight: 600;
+    margin: 24px 0 8px;
+    color: var(--text);
+  }
+  p { margin-bottom: 16px; }
+  p, li { color: var(--text); }
+  strong { font-weight: 600; }
+  em { font-style: normal; color: var(--accent); font-weight: 500; }
+
+  ul, ol { margin: 0 0 16px 24px; }
+  li { margin-bottom: 6px; }
+  li::marker { color: var(--text-muted); }
+
+  /* ── 代码 ── */
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: var(--purple);
+  }
+  pre {
+    font-family: var(--font-mono);
+    font-size: 13.5px;
+    line-height: 1.6;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px 20px;
+    overflow-x: auto;
+    margin: 16px 0 24px;
+  }
+  pre code { background: none; padding: 0; color: var(--text); font-size: inherit; }
+  .tok-com { color: var(--text-muted); font-style: italic; }
+  .tok-kw { color: var(--purple); }
+  .tok-str { color: var(--green); }
+  .tok-num { color: var(--amber); }
+
+  /* ── 表格 ── */
+  .table-wrap { overflow-x: auto; margin: 16px 0 24px; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 14.5px;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    font-weight: 600;
+    color: var(--text-secondary);
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    background: #fafbfc;
+  }
+  td code { font-size: 0.9em; }
+  tr:last-child td { border-bottom: none; }
+
+  /* ── Callout ── */
+  .callout {
+    border-left: 3px solid var(--accent);
+    background: #f7faff;
+    padding: 16px 20px;
+    margin: 16px 0 24px;
+    border-radius: 0 6px 6px 0;
+    font-size: 15.5px;
+  }
+  .callout.warn { border-left-color: var(--amber); background: #fffdf5; }
+  .callout.danger { border-left-color: var(--red); background: #fff5f5; }
+  .callout.success { border-left-color: var(--green); background: #f0fdf4; }
+  .callout .callout-title {
+    font-weight: 600;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 6px;
+    color: var(--accent);
+  }
+  .callout.warn .callout-title { color: var(--amber); }
+  .callout.danger .callout-title { color: var(--red); }
+  .callout.success .callout-title { color: var(--green); }
+
+  /* ── 图表 figure ── */
+  figure { margin: 32px 0; }
+  .svg-diagram {
+    width: 100%;
+    height: auto;
+    display: block;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #fff;
+  }
+  figcaption {
+    font-size: 13.5px;
+    color: var(--text-muted);
+    margin-top: 10px;
+    line-height: 1.5;
+    text-align: center;
+  }
+  figcaption .fig-num {
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  /* SVG 内部样式（与 references/svg-style-classes.md 一致） */
+  .svg-node { fill: #fff; stroke: #cbd5e0; stroke-width: 1.5; }
+  .svg-node-green { fill: #f0fdfa; stroke: #2f855a; }
+  .svg-node-amber { fill: #fffbeb; stroke: #d6972a; }
+  .svg-node-accent { fill: #ebf4ff; stroke: #2b6cb0; }
+  .svg-node-purple { fill: #faf5ff; stroke: #6b46c1; }
+  .svg-node-compound { fill: #f7fafc; stroke: #a0aec0; stroke-dasharray: 4,3; }
+  .svg-label-title { font-family: var(--font-sans); font-size: 14px; font-weight: 600; fill: #1a1a1a; }
+  .svg-label { font-family: var(--font-sans); font-size: 12px; fill: #2d3748; }
+  .svg-label-mono { font-family: var(--font-mono); font-size: 11px; fill: #8b95a5; }
+  .svg-label-small { font-family: var(--font-sans); font-size: 11px; fill: #4a5568; }
+  .svg-edge { fill: none; stroke: #a0aec0; stroke-width: 1.5; }
+  .svg-edge-accent { stroke: #2b6cb0; }
+  .svg-edge-dashed { stroke-dasharray: 5,3; }
+  .svg-edge-label { font-family: var(--font-sans); font-size: 10px; fill: #718096; }
+  .svg-layer-band { fill: #f7fafc; stroke: none; }
+  .svg-layer-label { font-family: var(--font-sans); font-size: 11px; font-weight: 600; fill: #8b95a5; letter-spacing: 0.05em; }
+  .svg-arrow { fill: #a0aec0; }
+  .svg-arrow-accent { fill: #2b6cb0; }
+
+  /* ── 决策卡片 ── */
+  .decision-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin: 24px 0;
+  }
+  .decision-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px;
+    background: #fff;
+  }
+  .decision-card .dc-num {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: 0.05em;
+    margin-bottom: 6px;
+  }
+  .decision-card .dc-title {
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    line-height: 1.35;
+  }
+  .decision-card .dc-body {
+    font-size: 13.5px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+
+  /* ── footer ── */
+  footer {
+    padding: 64px 0 96px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 14px;
+  }
+  footer a { color: var(--accent); text-decoration: none; }
+
+  .pill {
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 2px 9px;
+    border-radius: 99px;
+    background: #ebf4ff;
+    color: var(--accent);
+    margin-right: 6px;
+  }
+  .pill.green { background: #f0fdfa; color: var(--green); }
+  .pill.amber { background: #fffbeb; color: var(--amber); }
+  .pill.red { background: #fff5f5; color: var(--red); }
+  .pill.gray { background: #f7fafc; color: var(--text-muted); }
+</style>
+</head>
+<body>
+
+<div id="progress-bar"></div>
+
+<!-- ========== TOC ========== -->
+<nav id="toc">
+  <div class="toc-title">目录</div>
+  <ul>
+    <li><a href="#user-capabilities">0 · 用户视角：本体建模全链路</a></li>
+    <li><a href="#overview">1 · 系统总览</a></li>
+    <li><a href="#principle-1" class="lvl2">零安装纯栈</a></li>
+    <li><a href="#principle-2" class="lvl2">轻量化与许可</a></li>
+    <li><a href="#architecture">2 · 四层架构</a></li>
+    <li><a href="#ingest" class="lvl2">多模态摄取管道</a></li>
+    <li><a href="#agent" class="lvl2">Agent 内核</a></li>
+    <li><a href="#context" class="lvl2">上下文架构</a></li>
+    <li><a href="#federation" class="lvl2">本体建模核心链路</a></li>
+    <li><a href="#decisions">3 · 关键决策清单</a></li>
+    <li><a href="#roadmap">4 · 落地路线</a></li>
+    <li><a href="#footer-anchor">附录</a></li>
+  </ul>
+</nav>
+
+<div class="main">
+
+<!-- ========== HERO ========== -->
+<header class="hero">
+  <div class="eyebrow">技术架构文档 · 2026-08</div>
+  <h1>onto-studio：全生命周期可视化本体建模工具</h1>
+  <p class="lede">
+    将客户专家知识和业务体系、客户系统与流程萃取为可计算的本体模型与知识图谱——
+    Tauri 2 单二进制承载「Agent 对话 + 多模态文件摄取 + 跨源联邦查询 + Skill 扩展」四件事，
+    以五条原则和 20 条 ADR 把"零安装"与"能力完整"这对矛盾逐个化解——PDFium 破例、agentic search 砍 RAG、
+    rig 原生 CompactingMemory、DataFusion 单进程联邦。
+  </p>
+  <div class="meta">
+    <span>📦 Tauri 2.11 + Rust 1.97</span>
+    <span>🗄️ 单文件 SQLite（bundled + FTS5）</span>
+    <span>🤖 Rig 0.41 + rmcp 1.x</span>
+    <span>📄 13 种文档格式</span>
+    <span>⚡ 13 个 LLM provider</span>
+  </div>
+</header>
+
+<!-- ========== 0 · 用户视角：系统能力全景 ========== -->
+<section id="user-capabilities">
+  <h2><span class="num">0</span>用户视角：onto-studio 能做什么</h2>
+  <p class="section-conclusion">
+    onto-studio<strong>是一款全生命周期可视化本体建模工具</strong>——将客户专家知识与业务体系、
+    客户系统与流程萃取为可计算的本体模型与知识图谱，支撑从需求分析、本体设计、数据源接入到
+    联邦查询的全链路。底层是一个能读所有文件的可对话 AI、一个可扩展的工具台、一个随装随用的本地应用。
+  </p>
+
+  <p>
+    下文将系统架构映射为用户可感知的五项系统能力。每项能力回答三个问题：<strong>用户能做什么、
+    怎么触发、能力边界在哪</strong>。这不替代后续的技术章节——技术章节解释这些能力为什么这样设计、
+    权衡是什么——而是先给读者建立"这个工具对我的本体建模工作能帮什么忙"的全局认知。
+  </p>
+
+  <h3>能力一 · 通用 AI 对话（13 个模型，任意切换）</h3>
+
+  <p>
+    onto-studio 首先是一个 AI 对话客户端。与 ChatGPT 网页版的不同在于：<strong>本地运行、
+    数据不离机、模型随意换</strong>。支持 13 种 LLM provider（DeepSeek / OpenAI / Gemini /
+    Anthropic / Groq / OpenRouter / Ollama / Moonshot / Mistral / Cohere / Perplexity /
+    xAI / 兼容端点），以及支持图片输入的 VLM 模型（Gemini / GPT-4V / Claude）。
+  </p>
+  <p>
+    对话支持流式渲染、推理过程展开（DeepSeek-R1 思维链）、工具调用可视化
+    （模型调了哪些工具、每个工具返回了什么，以卡片形式展示在对话流中）。
+    会话自动持久化到本地 SQLite，关闭再打开对话历史不丢。
+    长对话自动压缩——当 token 预算触及上限时，
+    系统用当前运行的模型生成滚动摘要，裁剪旧消息保持上下文在预算内，用户无感。
+  </p>
+
+  <div class="callout success">
+    <div class="callout-title">典型场景：本体萃取</div>
+    「客户给了一份 200 页的产品需求 PDF 和一套数据库 schema，帮我从中提取业务对象和关系，
+    构建一个初步的本体模型」→ 拖入 PDF + 注册数据源 → AI 自主检索文档和 schema →
+    按 ObjectType / LinkType / ActionType 框架输出本体清单，引用原文。
+    全程数据在本地，对话记录和文件都不上传到模型厂商服务器（除非模型 API 本身需要上传，
+    用户可以选本地的 Ollama 完全离线）。
+  </div>
+
+  <h3>能力二 · 文档摄取与全文检索（13 种格式，一个入口）</h3>
+
+  <p>
+    onto-studio 能读的文件类型覆盖了知识工作者日常接触的绝大部分：
+  </p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>类别</th>
+          <th>格式</th>
+          <th>能力说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>文本</td>
+          <td><code>.txt</code> · <code>.md</code> · <code>.json</code> · <code>.csv</code></td>
+          <td>直接读，自动检测编码</td>
+        </tr>
+        <tr>
+          <td>PDF</td>
+          <td><code>.pdf</code></td>
+          <td>中文完美（Chrome 内核渲染，无乱码）</td>
+        </tr>
+        <tr>
+          <td>Office</td>
+          <td><code>.docx</code> · <code>.pptx</code> · <code>.doc</code> · <code>.xls</code> · <code>.ppt</code></td>
+          <td>含老格式 DOC/XLS/PPT，保留标题/段落/表格结构</td>
+        </tr>
+        <tr>
+          <td>Excel</td>
+          <td><code>.xlsx</code>（读）+ <code>.xlsx</code>（写）</td>
+          <td>保留类型和公式，精细读；可程序化写出</td>
+        </tr>
+        <tr>
+          <td>电子书</td>
+          <td><code>.epub</code></td>
+          <td>按章节读，保留 spine+manifest 结构</td>
+        </tr>
+        <tr>
+          <td>图片</td>
+          <td>PNG / JPEG / GIF / WebP / BMP</td>
+          <td>直接传给 VLM 模型做视觉理解（OCR / 图表 / 照片分析）</td>
+        </tr>
+        <tr>
+          <td>压缩包</td>
+          <td><code>.zip</code> · <code>.tar</code> · <code>.tar.gz</code></td>
+          <td>递归解压内部文件，防炸弹（200MB 文件 / 500MB 总量 / 5 层深度）</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>
+    所有文件拖入后自动建全文索引（中文分词 + BM25 排序），AI 对话中能按需检索文件内容——
+    不需要用户手动告诉 AI "去查哪个文件"，AI 根据自己的判断自主决定是否调搜索工具。
+  </p>
+
+  <figure>
+    <svg class="svg-diagram" viewBox="0 0 770 340" xmlns="http://www.w3.org/2000/svg">
+      <rect class="svg-node svg-node-accent" x="20" y="20" width="200" height="62" rx="6"/>
+      <text class="svg-label-title" x="120" y="44" text-anchor="middle">用户拖入文件 / 粘贴</text>
+      <text class="svg-label" x="120" y="64" text-anchor="middle">任意格式 · 中文完美</text>
+
+      <line class="svg-edge svg-edge-accent" x1="220" y1="50" x2="260" y2="50" marker-end="url(#u0arrAcc)"/>
+
+      <rect class="svg-node svg-node-green" x="265" y="20" width="200" height="62" rx="6"/>
+      <text class="svg-label-title" x="365" y="44" text-anchor="middle">自动识别格式 &amp; 解析</text>
+      <text class="svg-label" x="365" y="64" text-anchor="middle">提取文本 · 表格 · 元数据</text>
+
+      <line class="svg-edge" x1="465" y1="50" x2="505" y2="50" marker-end="url(#u0arr)"/>
+
+      <rect class="svg-node svg-node-amber" x="510" y="20" width="240" height="62" rx="6"/>
+      <text class="svg-label-title" x="630" y="44" text-anchor="middle">全文入库 + 索引</text>
+      <text class="svg-label" x="630" y="64" text-anchor="middle">中文 jieba 分词 · BM25 排序</text>
+
+      <line class="svg-edge svg-edge-accent" x1="365" y1="82" x2="365" y2="115" marker-end="url(#u0arrAcc)"/>
+
+      <rect class="svg-node svg-node-purple" x="100" y="125" width="530" height="90" rx="6"/>
+      <text class="svg-label-title" x="365" y="149" text-anchor="middle">AI 对话中自主检索文档</text>
+      <text class="svg-label" x="365" y="167" text-anchor="middle">用户问"上次那个需求文档里关于权限的部分怎么说的？"</text>
+      <text class="svg-label" x="365" y="183" text-anchor="middle">→ AI 自动调 search_documents → 找到相关段落 → read_document → 引用原文回答</text>
+      <text class="svg-label-mono" x="365" y="199" text-anchor="middle">全程无需用户指定文件，agentic search 自主决策检索路径</text>
+
+      <line class="svg-edge" x1="365" y1="215" x2="365" y2="248" marker-end="url(#u0arr)"/>
+
+      <rect class="svg-node svg-node-compound" x="100" y="255" width="530" height="60" rx="6"/>
+      <text class="svg-label-title" x="365" y="279" text-anchor="middle">@ 文件挂载：指定对话范围</text>
+      <text class="svg-label" x="365" y="297" text-anchor="middle">输入 @文件名 指定本轮关注哪些文件 · 位置语义保留 · 不占上下文预算</text>
+
+      <defs>
+        <marker id="u0arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path class="svg-arrow" d="M0,0 L8,4 L0,8 z"/>
+        </marker>
+        <marker id="u0arrAcc" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path class="svg-arrow-accent" d="M0,0 L8,4 L0,8 z"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><span class="fig-num">图 0-1</span> · 用户视角的文件→对话链路。拖入文件自动解析索引，对话中 AI 自主检索，@ 语法指定关注范围。全文索引零配置，用户无需理解 FTS5 / jieba / BM25。</figcaption>
+  </figure>
+
+  <h3>能力三 · 可扩展工具台（MCP + Skill）</h3>
+
+  <p>
+    除了内置的文件检索工具，onto-studio 支持两种扩展方式让 AI 获得更多能力：
+  </p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:110px">扩展方式</th>
+          <th>用户做什么</th>
+          <th>AI 能多干什么</th>
+          <th style="width:120px">适合谁</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>MCP Server</strong></td>
+          <td>在设置页填 MCP server 命令（如 <code>npx @anthropic/mcp-server-filesystem</code>）或 HTTP URL</td>
+          <td>读写本地文件系统、查数据库、调 API、搜网页——任何有 MCP server 封装的能力</td>
+          <td>开发者 / 有 MCP 生态认知的用户</td>
+        </tr>
+        <tr>
+          <td><strong>Skill</strong></td>
+          <td>导入一个 SKILL.md 文件（YAML frontmatter + Markdown 正文），或从社区下载</td>
+          <td>获得领域专用的提示词模板和行为约束（如"用公司财报分析框架回答问题"），但不执行代码</td>
+          <td>所有用户 / 社区贡献者</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>
+    <strong>MCP 和 Skill 的互补关系</strong>：
+    Skill 是「教 AI 怎么想」——注入领域知识和行为框架，纯文本，零安全风险。
+    MCP 是「给 AI 一双手」——让 AI 做实际操作（读写文件、查数据库、调 API），
+    需执行能力的 Skill 走 MCP server 封装。两者统一注入 Agent 的工具系统，
+    AI 在对话中按需选择用哪个。
+  </p>
+
+  <div class="callout">
+    <div class="callout-title">用户控制粒度</div>
+    Skill 有三级开关：① 单个 Skill 的 SKILL.md frontmatter 声明关闭 →
+    ② 全局禁用列表（<code>disabled_skills</code> 表）→
+    ③ 会话级激活列表（<code>conversation_skills</code> 表）。
+    用户可以全局关闭某个 Skill，但某个会话里临时打开它——精确控制哪些 Skill 在哪些场景下生效。
+  </div>
+
+  <p>
+    内置 3 个开箱即用的 Skill:
+    <strong>pdf-reading</strong>（PDF 文档阅读与信息提取框架）、
+    <strong>spreadsheet-analysis</strong>（电子表格分析框架）、
+    <strong>mcp-user-feedback</strong>（用户反馈收集与 MCP 工具迭代）。
+  </p>
+
+  <h3>能力四 · 跨数据源联邦查询与模型验证（三期）</h3>
+
+  <p>
+    本体建模的最终验证是"这个模型能正确回答业务问题吗"。onto-studio <strong>直接连接客户结构化数据源</strong>
+    （MySQL / PostgreSQL / CSV / Excel），注册后用自然语言发起跨源查询来验证本体模型是否正确覆盖了
+    客户系统的真实数据关系。
+  </p>
+
+  <div class="callout success">
+    <div class="callout-title">典型场景：模型验证</div>
+    客户有一个 MySQL 用户库和一个 PostgreSQL 订单库。本体模型定义了 User 对象、Order 对象、
+    User-[places]-Order 链接。验证时的自然语言查询：「上个月下单超过 3 次的用户里，
+    哪些最近 7 天没登录？列出邮箱。」→ AI 理解本体语义 → 规划跨源 SQL → DataFusion 联邦执行 →
+    结果确认本体关系的基数/方向是否正确。用户不需要手写 JOIN——AI 先 browse_schema 理解表结构再生成查询。
+  </div>
+
+  <p>
+    安全护栏：所有联邦查询<strong>只读</strong>（自动拒绝 DDL/DML），自动 LIMIT 注入（默认 200 行，
+    最大 1000），30 秒超时。数据源凭证加密存储在本地 SQLite，不出设备。
+  </p>
+
+  <h3>能力五 · 零安装本地运行</h3>
+
+  <p>
+    以上所有能力在一个二进制文件里。<strong>安装体验</strong>：下载 → 双击运行 → 配置模型 API key → 开始对话。
+    不需要装 Python / Node / Docker / LibreOffice / PostgreSQL / 任何运行时或系统库。
+    数据全部存在本地 <code>~/.onto-studio/onto-studio.db</code> 一个文件里，便携备份。
+  </p>
+
+  <p>
+    桌面端（Win / Mac / Linux）完整功能，移动端（已落地）单套代码 + 自适应布局——
+    对话和文件浏览在手机上可用，复杂配置建议桌面操作。
+  </p>
+
+  <figure>
+    <svg class="svg-diagram" viewBox="0 0 770 400" xmlns="http://www.w3.org/2000/svg">
+      <text class="svg-layer-label" x="20" y="24">本体建模工作台 · 能力矩阵</text>
+      <rect class="svg-layer-band" x="10" y="30" width="750" height="360" rx="6"/>
+
+      <rect class="svg-node svg-node-accent" x="25" y="48" width="130" height="120" rx="6"/>
+      <text class="svg-label-title" x="90" y="70" text-anchor="middle">💬</text>
+      <text class="svg-label-title" x="90" y="90" text-anchor="middle">通用对话</text>
+      <text class="svg-label" x="90" y="108" text-anchor="middle">多模态对话</text>
+      <text class="svg-label" x="90" y="124" text-anchor="middle">13 provider 切换</text>
+      <text class="svg-label" x="90" y="140" text-anchor="middle">流式渲染</text>
+      <text class="svg-label" x="90" y="156" text-anchor="middle">推理链展开</text>
+
+      <rect class="svg-node svg-node-green" x="170" y="48" width="130" height="120" rx="6"/>
+      <text class="svg-label-title" x="235" y="70" text-anchor="middle">📄</text>
+      <text class="svg-label-title" x="235" y="90" text-anchor="middle">文档摄取</text>
+      <text class="svg-label" x="235" y="108" text-anchor="middle">13 种格式</text>
+      <text class="svg-label" x="235" y="124" text-anchor="middle">全文索引</text>
+      <text class="svg-label" x="235" y="140" text-anchor="middle">AI 自主检索</text>
+      <text class="svg-label" x="235" y="156" text-anchor="middle">@ 文件挂载</text>
+
+      <rect class="svg-node svg-node-purple" x="315" y="48" width="130" height="120" rx="6"/>
+      <text class="svg-label-title" x="380" y="70" text-anchor="middle">🔧</text>
+      <text class="svg-label-title" x="380" y="90" text-anchor="middle">工具扩展</text>
+      <text class="svg-label" x="380" y="108" text-anchor="middle">MCP server</text>
+      <text class="svg-label" x="380" y="124" text-anchor="middle">Skill 导入</text>
+      <text class="svg-label" x="380" y="140" text-anchor="middle">内置 3 个 Skill</text>
+      <text class="svg-label" x="380" y="156" text-anchor="middle">三级开关控制</text>
+
+      <rect class="svg-node svg-node-amber" x="460" y="48" width="130" height="120" rx="6"/>
+      <text class="svg-label-title" x="525" y="70" text-anchor="middle">🗄️</text>
+      <text class="svg-label-title" x="525" y="90" text-anchor="middle">模型验证</text>
+      <text class="svg-label" x="525" y="108" text-anchor="middle">MySQL/PG 直连</text>
+      <text class="svg-label" x="525" y="124" text-anchor="middle">CSV/Excel 上传</text>
+      <text class="svg-label" x="525" y="140" text-anchor="middle">查询验证模型</text>
+      <text class="svg-label" x="525" y="156" text-anchor="middle">自然语言查询</text>
+
+      <rect class="svg-node svg-node-compound" x="605" y="48" width="145" height="120" rx="6"/>
+      <text class="svg-label-title" x="677" y="70" text-anchor="middle">🏠</text>
+      <text class="svg-label-title" x="677" y="90" text-anchor="middle">本地运行</text>
+      <text class="svg-label" x="677" y="108" text-anchor="middle">单二进制安装</text>
+      <text class="svg-label" x="677" y="124" text-anchor="middle">零系统依赖</text>
+      <text class="svg-label" x="677" y="140" text-anchor="middle">数据不离机</text>
+      <text class="svg-label" x="677" y="156" text-anchor="middle">桌面+移动端</text>
+
+      <line class="svg-edge" x1="90" y1="168" x2="90" y2="195"/>
+      <line class="svg-edge" x1="235" y1="168" x2="235" y2="195"/>
+      <line class="svg-edge" x1="380" y1="168" x2="380" y2="195"/>
+      <line class="svg-edge" x1="525" y1="168" x2="525" y2="195"/>
+      <line class="svg-edge" x1="677" y1="168" x2="677" y2="195"/>
+      <line class="svg-edge" x1="90" y1="195" x2="677" y2="195"/>
+      <line class="svg-edge svg-edge-accent" x1="385" y1="195" x2="385" y2="215" marker-end="url(#u0arr2Acc)"/>
+
+      <rect class="svg-node svg-node-accent" x="140" y="220" width="490" height="72" rx="6"/>
+      <text class="svg-label-title" x="385" y="244" text-anchor="middle">onto-studio 本体建模工作台</text>
+      <text class="svg-label" x="385" y="262" text-anchor="middle">萃取专家知识 · 建模客户系统 · 联邦查询验证 —— 一个应用，一个数据库文件，零额外安装</text>
+      <text class="svg-label-mono" x="385" y="280" text-anchor="middle">~/.onto-studio/onto-studio.db</text>
+
+      <rect class="svg-layer-band" x="25" y="310" width="720" height="70" rx="6"/>
+      <text class="svg-layer-label" x="38" y="330">目标用户</text>
+      <text class="svg-label" x="38" y="350" text-anchor="start">本体建模师 / 数据工程师：将客户专家知识、业务体系、系统流程萃取为 ObjectType / LinkType / ActionType 本体模型</text>
+      <text class="svg-label" x="38" y="366" text-anchor="start">小团队：共享 Skill 和 MCP 配置，统一本体建模口径，联邦查询验证模型</text>
+
+      <defs>
+        <marker id="u0arr2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path class="svg-arrow" d="M0,0 L8,4 L0,8 z"/>
+        </marker>
+        <marker id="u0arr2Acc" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path class="svg-arrow-accent" d="M0,0 L8,4 L0,8 z"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><span class="fig-num">图 0-2</span> · 用户视角的系统能力全景。对话、文档、工具、查询、本地运行 —— 五列能力汇聚成一个零安装的本体建模工作台，支撑从专家知识萃取到联邦查询验证的全链路。</figcaption>
+  </figure>
+</section>
+
+<!-- ========== 1 · 系统总览（技术视角） ========== -->
+<section id="overview">
+  <h2><span class="num">1</span>系统总览</h2>
+  <p class="section-conclusion">
+    onto-studio 是一款<strong>全生命周期可视化本体建模工具</strong>——
+    将客户专家知识与业务体系、客户系统与流程萃取为 ObjectType / LinkType / ActionType 本体模型，
+    支撑从需求分析、本体设计、数据源接入到联邦查询的全链路。底层是对话 LLM、文档摄取、
+    跨数据源查询、Skill 扩展统一在一个零安装的桌面二进制里，业务核心全 Rust、平台层只做 Tauri IPC 薄壳。
+  </p>
+
+  <p>
+    这个项目要回答的核心问题是：<strong>能不能用纯 Rust 单二进制做到零安装，同时不牺牲中文 PDF 解析、
+    Agent 工具编排、跨源联邦查询？</strong> 现有方案要么是 Electron 重壳加多运行时（Python/Node/Java 子进程），
+    要么依赖 LibreOffice / Tesseract / PostgreSQL 等用户需自行安装的系统组件，要么 RAG 路径撑爆 context。
+    onto-studio 的答案是<em>原则驱动的约束</em>——先用五条不可动摇的原则画死边界，再用 20 条 ADR 在边界内逐个化解矛盾。
+  </p>
+
+  <h3>五条原则（贯穿所有决策，优先级最高）</h3>
+
+  <div id="principle-1" class="decision-grid">
+    <div class="decision-card">
+      <div class="dc-num">原则 1</div>
+      <div class="dc-title">Rust 纯栈，运行时零额外原生依赖</div>
+      <div class="dc-body">用户拿到二进制即可运行，无需装任何系统库/运行时/办公软件。SQLite 随源码静态编译，PDFium 预编译库随安装包分发。绝对否决 LibreOffice / FFmpeg / Tesseract / Poppler / OpenSSL / 独立向量库。</div>
+    </div>
+    <div class="decision-card">
+      <div class="dc-num">原则 2</div>
+      <div class="dc-title">轻量化</div>
+      <div class="dc-body">不内嵌本地模型权重（OCR / Whisper / VLM 一律不走本地重型模型）。重型能力走 API，本地推理由用户自配 Ollama 接入。</div>
+    </div>
+    <div class="decision-card">
+      <div class="dc-num">原则 3</div>
+      <div class="dc-title">许可证友好</div>
+      <div class="dc-body">全部 MIT / Apache-2.0 / BSD-3，排除 GPL。引入新 crate 前先核实许可证（如 eBook 否决 GPL 的 <code>epub</code> crate，改用 Apache 的 <code>rbook</code>）。</div>
+    </div>
+    <div class="decision-card">
+      <div class="dc-num">原则 4</div>
+      <div class="dc-title">业务核心与平台解耦</div>
+      <div class="dc-body">业务逻辑全在 <code>crates/</code>（平台无关，可独立 <code>cargo test</code>），Tauri 只做 IPC 薄层 + 平台能力，<code>DocumentParser</code> trait 抽象底层库可平滑替换。</div>
+    </div>
+    <div class="decision-card">
+      <div class="dc-num">原则 5</div>
+      <div class="dc-title">外部服务最小化且显式</div>
+      <div class="dc-body">仅两类外部依赖：模型 API（云端 LLM/VLM 或用户自配 Ollama）、MCP server（用户按需接入的工具服务）。两者都显式可知，无隐式后台调用。</div>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <div class="callout-title">唯一破例 · 决策 5</div>
+    纯 Rust（lopdf / pdfsink-rs）对中文 CID CMap 解码失败，<strong>仅 PDF 解析</strong>破例引入 pdfium-render + 预编译 PDFium 动态库（BSD-3-Clause，随安装包分发，用户零安装）。这是纯 Rust 文本提取能力不足的工程妥协，不开放其他否决项。
+  </div>
+
+  <p id="principle-2">
+    五条原则不是口号，是<em>选型否决的硬边界</em>。下文每个 ADR 都会回到这些原则解释为什么选 A 不选 B——
+    比如联邦查询否决 Trino（JVM 独立进程，违反原则 1）、TextQL 否决 Python sqlglot（需 Python 运行时）、
+    数据源连接否决 SQLAlchemy、Office 否决依赖 LibreOffice 的 LiteParse。这些否决不是事后找补，而是设计之初就画死的红线。
+  </p>
+</section>
+
+<!-- ========== 2 · 四层架构 ========== -->
+<section id="architecture">
+  <h2><span class="num">2</span>四层架构：业务核心与平台解耦</h2>
+  <p class="section-conclusion">
+    自上而下四层单向依赖——表现层（WebView）→ IPC 薄层（Tauri）→ 业务核心（crates/）→ 平台插件。
+    业务逻辑全部在 <code>crates/</code>，平台无关可独立测试；Tauri 只做 <code>#[tauri::command]</code> 薄封装。
+  </p>
+
+  <figure>
+    <svg class="svg-diagram" viewBox="0 0 770 460" xmlns="http://www.w3.org/2000/svg">
+      <!-- 层带 1: 表现层 -->
+      <rect class="svg-layer-band" x="10" y="10" width="750" height="90" rx="6"/>
+      <text class="svg-layer-label" x="24" y="30">表现层 · WEBVIEW</text>
+      <rect class="svg-node svg-node-purple" x="30" y="42" width="710" height="52" rx="6"/>
+      <text class="svg-label-title" x="385" y="64" text-anchor="middle">React 19 + TypeScript + Tailwind v4 + shadcn/ui</text>
+      <text class="svg-label" x="385" y="82" text-anchor="middle">对话流式 · 文件库 · 联邦查询工作台 · Skill 管理 · ⌘K 命令面板</text>
+
+      <!-- 层带 2: IPC -->
+      <rect class="svg-layer-band" x="10" y="115" width="750" height="70" rx="6"/>
+      <text class="svg-layer-label" x="24" y="135">IPC 薄层 · TAURI 2.11</text>
+      <rect class="svg-node svg-node-amber" x="30" y="145" width="710" height="32" rx="6"/>
+      <text class="svg-label" x="385" y="165" text-anchor="middle">#[tauri::command] 薄封装 · tauri-specta 类型安全桥 · Channel&lt;T&gt; 流式 IPC</text>
+
+      <!-- 层带 3: 业务核心 crates -->
+      <rect class="svg-layer-band" x="10" y="200" width="750" height="180" rx="6"/>
+      <text class="svg-layer-label" x="24" y="220">业务核心 · CRATES（全 Rust，平台无关，可独立 cargo test）</text>
+
+      <!-- 4 个 crate 卡片，2x2 网格 -->
+      <rect class="svg-node svg-node-accent" x="30" y="232" width="350" height="66" rx="6"/>
+      <text class="svg-label-title" x="205" y="252" text-anchor="middle">agent-core</text>
+      <text class="svg-label" x="205" y="270" text-anchor="middle">Rig 0.41 agent loop · MCP(rmcp 1.x)</text>
+      <text class="svg-label" x="205" y="286" text-anchor="middle">13 provider · Skill 系统 · 文件检索工具</text>
+
+      <rect class="svg-node svg-node-green" x="390" y="232" width="350" height="66" rx="6"/>
+      <text class="svg-label-title" x="565" y="252" text-anchor="middle">ingest</text>
+      <text class="svg-label" x="565" y="270" text-anchor="middle">DocumentParser trait + 13 格式</text>
+      <text class="svg-label" x="565" y="286" text-anchor="middle">PDFium · Office · eBook · 图片 · 压缩包</text>
+
+      <rect class="svg-node svg-node-amber" x="30" y="308" width="350" height="66" rx="6"/>
+      <text class="svg-label-title" x="205" y="328" text-anchor="middle">memory</text>
+      <text class="svg-label" x="205" y="346" text-anchor="middle">SQLite(bundled) + jieba FTS5</text>
+      <text class="svg-label" x="205" y="362" text-anchor="middle">会话/消息/文档全文/元数据同一 .db</text>
+
+      <rect class="svg-node svg-node-purple" x="390" y="308" width="350" height="66" rx="6"/>
+      <text class="svg-label-title" x="565" y="328" text-anchor="middle">federation（三期）</text>
+      <text class="svg-label" x="565" y="346" text-anchor="middle">DataFusion 54 单进程内嵌</text>
+      <text class="svg-label" x="565" y="362" text-anchor="middle">MySQL/PG/CSV/Excel · TableProvider</text>
+
+      <!-- 层带 4: 平台层 -->
+      <rect class="svg-layer-band" x="10" y="395" width="750" height="55" rx="6"/>
+      <text class="svg-layer-label" x="24" y="415">平台层 · TAURI 官方插件（纯 Rust）</text>
+      <rect class="svg-node svg-node-compound" x="30" y="425" width="710" height="27" rx="6"/>
+      <text class="svg-label-small" x="385" y="440" text-anchor="middle">fs · dialog · store · clipboard · notification · global-shortcut</text>
+    </svg>
+    <figcaption><span class="fig-num">图 2-1</span> · 四层单向依赖架构。业务核心 4 个 crate 平台无关，Tauri 只做 IPC 薄壳，外部依赖仅模型 API 与 MCP server 两类（显式可知）。</figcaption>
+  </figure>
+
+  <p>
+    这个分层不是装饰——它是<em>可测试性的硬保证</em>。根 <code>Cargo.toml</code> 明确
+    <code>exclude = ["src-tauri"]</code>，<code>cargo check --workspace</code> 只验证 <code>crates/*</code>，
+    src-tauri 有独立 target 目录与构建流程（避免 Tauri 的 wasm/mobile target 与业务 crate 的 feature unification 冲突）。
+    这意味着<code>crates/</code>可以在无 Tauri 环境的 CI 里跑全部单元测试，业务逻辑的回归不依赖 GUI。
+  </p>
+
+  <h3>工程结构硬约束</h3>
+  <ul>
+    <li><strong>业务逻辑禁止放进 <code>src-tauri/</code></strong>——<code>src-tauri/src/commands/</code> 下每个文件只是 <code>#[tauri::command]</code> 薄封装，调 <code>crates/</code> 的 service</li>
+    <li><strong><code>crates/</code> 之间可互相依赖，但不得反向依赖 <code>src-tauri/</code> 或 <code>src/</code></strong>——依赖方向永远向下</li>
+    <li><strong>前端四层单向依赖</strong>：UI → State → IPC → Domain，用 ESLint <code>no-restricted-imports</code> 在 CI 强制（<code>components/</code> 不得直接 <code>invoke</code>，<code>stores/</code> 不得 import 组件）</li>
+    <li><strong>IPC 类型安全</strong>：<code>tauri-specta</code> 从 Rust <code>#[tauri::command]</code> 自动生成 TS 绑定，禁止手写 TS 类型</li>
+  </ul>
+</section>
+
+<!-- ========== 2.1 摄取管道 ========== -->
+<section id="ingest">
+  <h2><span class="num">2.1</span>多模态摄取管道</h2>
+  <p class="section-conclusion">
+    <code>DocumentParser</code> trait 统一 13 种格式，dispatcher 按扩展名 + magic bytes 路由，
+    PDF 走 PDFium 进程级锁串行化，Office 走 office_oxide 统一 IR，全程流式解析防 OOM，zip 炸弹有预算守卫。
+  </p>
+
+  <figure>
+    <svg class="svg-diagram" viewBox="0 0 770 420" xmlns="http://www.w3.org/2000/svg">
+      <!-- 输入 -->
+      <rect class="svg-node svg-node-accent" x="20" y="20" width="140" height="52" rx="6"/>
+      <text class="svg-label-title" x="90" y="42" text-anchor="middle">文件输入</text>
+      <text class="svg-label-mono" x="90" y="60" text-anchor="middle">path + magic bytes</text>
+
+      <!-- 箭头 -->
+      <line class="svg-edge" x1="160" y1="44" x2="195" y2="44" marker-end="url(#arr)"/>
+
+      <!-- dispatcher -->
+      <rect class="svg-node svg-node-amber" x="200" y="20" width="160" height="52" rx="6"/>
+      <text class="svg-label-title" x="280" y="42" text-anchor="middle">dispatcher</text>
+      <text class="svg-label-mono" x="280" y="60" text-anchor="middle">pick_parser(ext) → sniff</text>
+
+      <!-- 分支箭头到 4 个 parser 组 -->
+      <line class="svg-edge" x1="360" y1="44" x2="395" y2="44" marker-end="url(#arr)"/>
+
+      <!-- 4 个 parser 组，纵向排列 -->
+      <rect class="svg-node svg-node-green" x="400" y="20" width="350" height="56" rx="6"/>
+      <text class="svg-label-title" x="575" y="42" text-anchor="middle">PDF · pdfium-render 0.9.3</text>
+      <text class="svg-label" x="575" y="60" text-anchor="middle">进程级 Mutex 串行化 · CJK 零乱码</text>
+
+      <rect class="svg-node svg-node-accent" x="400" y="90" width="350" height="56" rx="6"/>
+      <text class="svg-label-title" x="575" y="112" text-anchor="middle">Office · office_oxide 0.1.8</text>
+      <text class="svg-label" x="575" y="130" text-anchor="middle">DOCX/PPTX/老格式 IR · XLSX 用 calamine</text>
+
+      <rect class="svg-node svg-node-purple" x="400" y="160" width="350" height="56" rx="6"/>
+      <text class="svg-label-title" x="575" y="182" text-anchor="middle">eBook · rbook 0.7</text>
+      <text class="svg-label" x="575" y="200" text-anchor="middle">ePub 2/3 · spine+manifest 读章节</text>
+
+      <rect class="svg-node" x="400" y="230" width="350" height="56" rx="6"/>
+      <text class="svg-label-title" x="575" y="252" text-anchor="middle">文本/图片/压缩包</text>
+      <text class="svg-label" x="575" y="270" text-anchor="middle">CSV · JSON · MD · 图片 · zip/tar 递归</text>
+
+      <!-- 分支线 -->
+      <line class="svg-edge" x1="397" y1="44" x2="397" y2="258"/>
+      <line class="svg-edge" x1="397" y1="48" x2="400" y2="48"/>
+      <line class="svg-edge" x1="397" y1="118" x2="400" y2="118"/>
+      <line class="svg-edge" x1="397" y1="188" x2="400" y2="188"/>
+      <line class="svg-edge" x1="397" y1="258" x2="400" y2="258"/>
+
+      <!-- 统一产物 -->
+      <line class="svg-edge" x1="575" y1="76" x2="575" y2="300" stroke="none"/>
+      <line class="svg-edge svg-edge-accent" x1="575" y1="286" x2="575" y2="305" marker-end="url(#arrAcc)"/>
+
+      <rect class="svg-node svg-node-compound" x="200" y="310" width="550" height="80" rx="6"/>
+      <text class="svg-label-title" x="475" y="334" text-anchor="middle">Document { 统一产物 }</text>
+      <text class="svg-label" x="475" y="354" text-anchor="middle">text · tables · multimodal_parts(图片) · meta</text>
+      <text class="svg-label-mono" x="475" y="374" text-anchor="middle">→ upsert_document → FTS5 异步索引</text>
+
+      <defs>
+        <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path class="svg-arrow" d="M0,0 L8,4 L0,8 z"/>
+        </marker>
+        <marker id="arrAcc" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path class="svg-arrow-accent" d="M0,0 L8,4 L0,8 z"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><span class="fig-num">图 2.1-1</span> · 摄取管道：dispatcher 按扩展名路由，magic bytes 兜底嗅探（PDF/ZIP/PNG/JPEG），4 类 parser 产出统一 Document，全文落 memory SQLite 并异步建 FTS5 索引。</figcaption>
+  </figure>
+
+  <h3>PDFium 破例的工程细节</h3>
+  <p>
+    这是整个项目唯一破例引入非 Rust 原生依赖的地方，也是最容易翻车的工程点。<strong>三个关键约束</strong>决定了它必须这样实现：
+  </p>
+  <ul>
+    <li><strong>为什么不纯 Rust</strong>：实测《曾国藩合集》1371 页（Type0 + CIDFontType2 + SimSun 子集 + ToUnicode CMap），lopdf 输出纯乱码（第 2 页仅 42 字符拉丁符号），pdfsink-rs 输出空。pdfium 是 Chrome 内核，渲染级文本提取，1371 页全量 4.15s，中文完美。</li>
+    <li><strong>为什么用预编译库而非编译 C++</strong>：全程使用 bblanchon/pdfium-binaries 社区预编译二进制（BSD-3-Clause），<code>pdfium-render</code> 仅做 FFI 绑定，<code>cargo build</code> 只编译 Rust 代码，无 GN/Ninja/Chromium 编译链。库随 Tauri <code>bundle.resources</code> 打包进安装包，用户零安装。</li>
+    <li><strong>为什么必须进程级 Mutex 串行化</strong>：pdfium-render 0.9.3 的 <code>thread_safe</code> feature <em>仅 impl Send+Sync，不串行化 FFI 调用</em>——native 路径每个 FPDF 函数直接调函数指针无锁。而 PDFium C 库本身非线程安全（<code>fpdfview.h</code> 明确要求调用方加锁）。多文件 batch 并发解析会导致内存损坏（<code>STATUS_STACK_BUFFER_OVERRUN</code>）。故 <code>crates/ingest/src/pdfium.rs</code> 用进程级 <code>Mutex&lt;()&gt;</code> 令牌锁 <code>with_pdfium()</code> 串行化所有 PDFium 操作。</li>
+  </ul>
+
+  <div class="callout">
+    <div class="callout-title">代价与权衡</div>
+    多文件 batch 实际<strong>串行执行 PDF</strong>（非 PDF 文件不受锁影响仍并行），性能依赖单文件速度（实测 1711 页 4.5s，可接受）。库版本 <code>pdfium_7881</code> feature 必须与下载的 PDFium 版本严格一致，否则 <code>bind()</code> 崩溃。
+  </div>
+
+  <h3>Office：统一 IR 与独家能力</h3>
+  <p>
+    <code>office_oxide 0.1.8</code>（2026 年 4 月新库）统一处理 DOCX 读/写、PPTX、老格式 DOC/XLS/PPT，产出结构化 IR（标题/段落/列表/表格/页眉页脚/图片，保留交错顺序），对 agent/RAG 场景比扁平 MD 更顺手。<strong>老格式 DOC/XLS/PPT 是纯 Rust 生态的独家能力</strong>。XLSX 读单独保留 <code>calamine</code>——office_oxide 的 IR 把单元格扁平为 string 丢失类型/公式，精细读 Excel 是损失。
+  </p>
+  <p>
+    选型时<em>决定性否决</em>了 LiteParse v2：它依赖 LibreOffice 系统安装，无法对用户隐藏，违背原则 1，且 Office 转 PDF 再解析丢失原生结构。<code>DocumentParser</code> trait 隔离使 office_oxide 这种极新库（0.1.x）可平滑回退——落地需做兼容性自测（放 <code>crates/ingest/tests/</code>）。
+  </p>
+
+  <h3>安全防护：防 zip 炸弹与 OOM</h3>
+  <p>
+    <code>crates/ingest/src/security.rs</code> 的 <code>ArchiveBudget</code> 守卫：文件大小上限 200MB，解压总量 500MB，条目数 10K，递归深度 5 层。压缩包走流式解析，不在内存持有全部内容。这是对抗恶意输入的硬约束。
+  </p>
+</section>
+
+<!-- ========== 2.2 Agent 内核 ========== -->
+<section id="agent">
+  <h2><span class="num">2.2</span>Agent 内核：Rig + MCP + Skill</h2>
+  <p class="section-conclusion">
+    Rig 0.41 驱动 agent loop，<code>ProviderRuntime</code> trait 擦除泛型统一 13 个 provider，
+    rmcp 1.x 自实现 <code>DynamicTool</code> 桥接 MCP 工具，agent-skills 0.2 实现 agentskills.io 规范的 Skill 渐进式披露。
+  </p>
+
+  <figure>
+    <svg class="svg-diagram" viewBox="0 0 770 470" xmlns="http://www.w3.org/2000/svg">
+      <!-- 用户消息输入 -->
+      <rect class="svg-node svg-node-accent" x="20" y="20" width="150" height="48" rx="6"/>
+      <text class="svg-label-title" x="95" y="40" text-anchor="middle">send_message</text>
+      <text class="svg-label-mono" x="95" y="56" text-anchor="middle">IPC + Channel 流式</text>
+
+      <line class="svg-edge" x1="170" y1="42" x2="205" y2="42" marker-end="url(#arr2)"/>
+
+      <!-- ChatService -->
+      <rect class="svg-node svg-node-purple" x="210" y="20" width="180" height="48" rx="6"/>
+      <text class="svg-label-title" x="300" y="40" text-anchor="middle">ChatService</text>
+      <text class="svg-label-mono" x="300" y="56" text-anchor="middle">stream_with_memory</text>
+
+      <line class="svg-edge" x1="390" y1="42" x2="425" y2="42" marker-end="url(#arr2)"/>
+
+      <!-- Rig agent loop 中心 -->
+      <rect class="svg-node svg-node-amber" x="430" y="20" width="320" height="48" rx="6"/>
+      <text class="svg-label-title" x="590" y="40" text-anchor="middle">Rig 0.41 Agent Loop</text>
+      <text class="svg-label-mono" x="590" y="56" text-anchor="middle">.memory(CompactingMemory).conversation(id)</text>
+
+      <!-- Rig 下挂 4 个能力 -->
+      <line class="svg-edge" x1="590" y1="64" x2="590" y2="90"/>
+
+      <!-- ProviderRuntime -->
+      <rect class="svg-node svg-node-green" x="30" y="100" width="170" height="82" rx="6"/>
+      <text class="svg-label-title" x="115" y="122" text-anchor="middle">ProviderRuntime</text>
+      <text class="svg-label" x="115" y="140" text-anchor="middle">trait 擦除泛型</text>
+      <text class="svg-label-mono" x="115" y="156" text-anchor="middle">13 provider kind</text>
+      <text class="svg-label-small" x="115" y="170" text-anchor="middle">DeepSeek/OpenAI/Gemini...</text>
+
+      <!-- CompactingMemory -->
+      <rect class="svg-node svg-node-accent" x="220" y="100" width="170" height="82" rx="6"/>
+      <text class="svg-label-title" x="305" y="122" text-anchor="middle">CompactingMemory</text>
+      <text class="svg-label" x="305" y="140" text-anchor="middle">rig-memory 0.41 原生</text>
+      <text class="svg-label-mono" x="305" y="156" text-anchor="middle">TokenWindow + LlmCompactor</text>
+      <text class="svg-label-small" x="305" y="170" text-anchor="middle">自动裁剪+滚动摘要</text>
+
+      <!-- ToolServerHandle -->
+      <rect class="svg-node svg-node-purple" x="410" y="100" width="170" height="82" rx="6"/>
+      <text class="svg-label-title" x="495" y="122" text-anchor="middle">ToolServerHandle</text>
+      <text class="svg-label" x="495" y="140" text-anchor="middle">rig 0.41 DynamicTool</text>
+      <text class="svg-label-mono" x="495" y="156" text-anchor="middle">add_dynamic_tool</text>
+      <text class="svg-label-small" x="495" y="170" text-anchor="middle">运行时动态加，幂等替换</text>
+
+      <!-- SkillManager -->
+      <rect class="svg-node svg-node-green" x="600" y="100" width="150" height="82" rx="6"/>
+      <text class="svg-label-title" x="675" y="122" text-anchor="middle">SkillManager</text>
+      <text class="svg-label" x="675" y="140" text-anchor="middle">agentskills.io 规范</text>
+      <text class="svg-label-mono" x="675" y="156" text-anchor="middle">三层 disable</text>
+      <text class="svg-label-small" x="675" y="170" text-anchor="middle">渐进式披露 Tier1/2</text>
+
+      <!-- 三类工具 -->
+      <text class="svg-layer-label" x="20" y="210">三类工具统一注入 ToolServerHandle</text>
+
+      <rect class="svg-node svg-node-green" x="30" y="220" width="170" height="90" rx="6"/>
+      <text class="svg-label-title" x="115" y="242" text-anchor="middle">文件检索工具</text>
+      <text class="svg-label" x="115" y="260" text-anchor="middle">list_documents</text>
+      <text class="svg-label" x="115" y="276" text-anchor="middle">search_documents</text>
+      <text class="svg-label" x="115" y="292" text-anchor="middle">read_document</text>
+
+      <rect class="svg-node svg-node-purple" x="220" y="220" width="170" height="90" rx="6"/>
+      <text class="svg-label-title" x="305" y="242" text-anchor="middle">MCP 工具</text>
+      <text class="svg-label" x="305" y="260" text-anchor="middle">rmcp 1.x client</text>
+      <text class="svg-label" x="305" y="276" text-anchor="middle">stdio: tokio::process</text>
+      <text class="svg-label" x="305" y="292" text-anchor="middle">http: reqwest+rustls</text>
+
+      <rect class="svg-node svg-node-amber" x="410" y="220" width="170" height="90" rx="6"/>
+      <text class="svg-label-title" x="495" y="242" text-anchor="middle">联邦查询工具</text>
+      <text class="svg-label" x="495" y="260" text-anchor="middle">execute_query</text>
+      <text class="svg-label" x="495" y="276" text-anchor="middle">browse_schema</text>
+      <text class="svg-label" x="495" y="292" text-anchor="middle">describe_table</text>
+
+      <rect class="svg-node svg-node-compound" x="600" y="220" width="150" height="90" rx="6"/>
+      <text class="svg-label-title" x="675" y="242" text-anchor="middle">Skill body</text>
+      <text class="svg-label" x="675" y="260" text-anchor="middle">read_document</text>
+      <text class="svg-label-mono" x="675" y="276" text-anchor="middle">skill://&lt;name&gt;</text>
+      <text class="svg-label-small" x="675" y="292" text-anchor="middle">与文件统一路径</text>
+
+      <!-- 输出流 -->
+      <line class="svg-edge svg-edge-accent" x1="590" y1="64" x2="590" y2="340"/>
+      <line class="svg-edge svg-edge-accent" x1="590" y1="340" x2="590" y2="365" marker-end="url(#arr2Acc)"/>
+
+      <rect class="svg-node svg-node-accent" x="210" y="370" width="540" height="80" rx="6"/>
+      <text class="svg-label-title" x="480" y="394" text-anchor="middle">StreamChunk 流（§13.2 契约）</text>
+      <text class="svg-label" x="480" y="414" text-anchor="middle">TextDelta · ReasoningDelta · ToolCallStart/Result · Usage · Done</text>
+      <text class="svg-label-mono" x="480" y="434" text-anchor="middle">→ Channel 推前端实时渲染 → turn 结束整条落库</text>
+
+      <defs>
+        <marker id="arr2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path class="svg-arrow" d="M0,0 L8,4 L0,8 z"/>
+        </marker>
+        <marker id="arr2Acc" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path class="svg-arrow-accent" d="M0,0 L8,4 L0,8 z"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><span class="fig-num">图 2.2-1</span> · Agent 内核：ChatService 持 trait object，Rig agent loop 下挂四类能力，三类工具（文件/MCP/联邦）统一通过 ToolServerHandle 的 add_dynamic_tool 注入，Skill body 复用 read_document 路径。</figcaption>
+  </figure>
+
+  <h3>ProviderRuntime：擦除泛型消除 match 分支</h3>
+  <p>
+    Rig 的 <code>Agent&lt;M&gt;</code> / <code>Client&lt;Ext,H&gt;</code> 是高阶泛型，不同 provider 具体类型不同，无法直接 trait-object 化。决策 7.5 引入 <code>ProviderRuntime</code> trait——把"构造 agent + 设采样参数 + 流式/prompt"封装为返回已擦除类型（<code>StreamChunk</code> 流 / <code>String</code>）的 method。每个 provider kind 在 <code>with_tools</code> 时构造具体 client 并立即包成 <code>Box&lt;dyn ProviderRuntime&gt;</code>，<code>ChatService</code> 持 trait object，<strong>所有调用点零 match 分支</strong>。新增 provider 只需两步：① <code>build_runtime</code> 加构造分支 ② 宏 <code>impl_provider_runtime!</code> 生成 trait impl。
+  </p>
+
+  <div class="callout">
+    <div class="callout-title">P0 正确性修复</div>
+    早期方案把 DeepSeek 塞进通用 <code>openai::Client.completions_api()</code>，丢失 rig 的 <code>OpenAICompatibleProvider</code> capability 声明（DeepSeek 的 <code>EMITS_COMPLETE_SINGLE_CHUNK_TOOL_CALLS=true</code>、<code>SUPPORTS_RESPONSE_FORMAT=false</code>）——可能导致流式 tool call 渲染异常、response_format 被错误发送触发 400。按 kind 路由后各 provider 的 capability 由 rig 正确声明。
+  </div>
+
+  <h3>MCP：版本锁定的工程理由</h3>
+  <p>
+    锁定 <code>rmcp ^1.8</code> 而非 3.0-beta，是<strong>编译可行性的硬约束</strong>：rig 0.41 依赖 rmcp 1.x，若直接用 3.0-beta 会与 rig 拉的 1.x 共存，且 rmcp 3.x 的 macros feature 依赖 pastey/darling，在当前 toolchain 触发 cargo resolver panic。不启用 rig 的 <code>tool::rmcp</code> feature（它针对 3.0-beta API），自实现 <code>DynamicTool</code> 桥接只需 rmcp <code>client</code> + 两个 transport feature，无 macros。
+  </p>
+  <p>
+    <strong>stdio transport 自实现</strong>而非用 rmcp 的 <code>transport-child-process</code>——后者依赖 process-wrap 拉入 windows crate 重型包，当前 toolchain 编译失败。改用 <code>tokio::process::Command</code> spawn + rmcp 的 <code>(AsyncRead, AsyncWrite)</code> transport，零额外原生依赖（符合原则 1），Windows 下设 <code>CREATE_NO_WINDOW</code> 避免弹控制台。
+  </p>
+
+  <h3>Skill 系统：文本扩展而非可执行插件</h3>
+  <p>
+    决策 20 基于 agentskills.io 开放规范。<strong>Skill = SKILL.md（YAML frontmatter + Markdown 正文），不是可执行插件</strong>——需执行能力的 skill 走 MCP server。渐进式披露分两层：Tier 1 是 name + description 常驻 preamble（几十 token），Tier 2 是完整正文按需由模型调 <code>read_document</code> 读取（skill body 入库 documents 表走 <code>skill://&lt;name&gt;</code> doc path，与 <code>@</code> 挂载统一路径）。
+  </p>
+  <p>
+    <strong>三层 disable</strong>：frontmatter <code>disable-model-invocation</code>（层次 1，Govcraft 不解析业务层补）→ 全局禁用 <code>disabled_skills</code> 表（层次 2）→ 会话级激活 <code>conversation_skills</code> 表（层次 3）。<strong>四类来源</strong>：Builtin（随应用分发，只读）/ Imported（用户导入，可写）/ ExternalReadOnly（跨客户端 <code>~/.claude/skills</code> 等扫描）/ Project。preamble 段拼在系统人设之后保 prefix cache，<code>&lt;available_skills&gt;</code> XML 手写极简转义零依赖，空列表返回空串不破 prefix cache。
+  </p>
+</section>
+
+<!-- ========== 2.3 上下文架构 ========== -->
+<section id="context">
+  <h2><span class="num">2.3</span>上下文架构：agentic search 砍 RAG</h2>
+  <p class="section-conclusion">
+    砍掉向量 RAG，改用「文件工具 + FTS5 全文搜索」的 agentic search 模式——模型按需调
+    <code>search_documents</code>/<code>read_document</code> 检索，而非自动注入切片。<code>@</code> 挂载只保留位置语义 token + user message 尾部注脚，不注入全文，prefix cache 友好。
+  </p>
+
+  <figure>
+    <svg class="svg-diagram" viewBox="0 0 770 440" xmlns="http://www.w3.org/2000/svg">
+      <!-- 两条路径对比 -->
+      <text class="svg-layer-label" x="20" y="24">路径 A · 传统 RAG（已否决）</text>
+      <rect class="svg-layer-band" x="10" y="30" width="750" height="70" rx="6"/>
+
+      <rect class="svg-node" x="30" y="44" width="120" height="48" rx="6" opacity="0.5"/>
+      <text class="svg-label-title" x="90" y="64" text-anchor="middle" fill="#a0aec0">用户消息</text>
+      <text class="svg-label-small" x="90" y="80" text-anchor="middle" fill="#a0aec0">→ embed query</text>
+
+      <line class="svg-edge" x1="150" y1="66" x2="180" y2="66" marker-end="url(#arr3)"/>
+
+      <rect class="svg-node" x="185" y="44" width="140" height="48" rx="6" opacity="0.5"/>
+      <text class="svg-label-title" x="255" y="64" text-anchor="middle" fill="#a0aec0">KNN 向量检索</text>
+      <text class="svg-label-small" x="255" y="80" text-anchor="middle" fill="#a0aec0">sqlite-vec 向量检索</text>
+
+      <line class="svg-edge" x1="325" y1="66" x2="355" y2="66" marker-end="url(#arr3)"/>
+
+      <rect class="svg-node" x="360" y="44" width="160" height="48" rx="6" opacity="0.5"/>
+      <text class="svg-label-title" x="440" y="64" text-anchor="middle" fill="#a0aec0">自动注入切片</text>
+      <text class="svg-label-small" x="440" y="80" text-anchor="middle" fill="#a0aec0">撑爆 context / 每轮重发</text>
+
+      <line class="svg-edge" x1="520" y1="66" x2="555" y2="66" marker-end="url(#arr3)"/>
+
+      <rect class="svg-node svg-node-compound" x="560" y="44" width="190" height="48" rx="6" opacity="0.5"/>
+      <text class="svg-label-title" x="655" y="64" text-anchor="middle" fill="#a0aec0">LLM</text>
+      <text class="svg-label-small" x="655" y="80" text-anchor="middle" fill="#a0aec0">embedding API + 本地模型</text>
+
+      <!-- 路径 B -->
+      <text class="svg-layer-label" x="20" y="134">路径 B · agentic search（采用）</text>
+      <rect class="svg-layer-band" x="10" y="140" width="750" height="290" rx="6"/>
+
+      <rect class="svg-node svg-node-accent" x="30" y="160" width="200" height="66" rx="6"/>
+      <text class="svg-label-title" x="130" y="182" text-anchor="middle">用户消息</text>
+      <text class="svg-label" x="130" y="200" text-anchor="middle">@fileName 位置语义 token</text>
+      <text class="svg-label-mono" x="130" y="214" text-anchor="middle">+ &lt;mounted-documents&gt; 注脚</text>
+
+      <line class="svg-edge svg-edge-accent" x1="230" y1="188" x2="265" y2="188" marker-end="url(#arr3Acc)"/>
+
+      <rect class="svg-node svg-node-purple" x="270" y="160" width="180" height="66" rx="6"/>
+      <text class="svg-label-title" x="360" y="182" text-anchor="middle">LLM 自主决策</text>
+      <text class="svg-label" x="360" y="200" text-anchor="middle">是否调工具？调哪个？</text>
+      <text class="svg-label-mono" x="360" y="214" text-anchor="middle">max_turns = 100</text>
+
+      <line class="svg-edge" x1="450" y1="188" x2="485" y2="188" marker-end="url(#arr3)"/>
+
+      <rect class="svg-node svg-node-green" x="490" y="160" width="260" height="66" rx="6"/>
+      <text class="svg-label-title" x="620" y="182" text-anchor="middle">agent 工具（按需）</text>
+      <text class="svg-label" x="620" y="200" text-anchor="middle">search_documents / read_document</text>
+      <text class="svg-label-mono" x="620" y="214" text-anchor="middle">FTS5 + BM25 + snippet</text>
+
+      <!-- FTS5 底层 -->
+      <line class="svg-edge" x1="620" y1="216" x2="620" y2="250"/>
+      <line class="svg-edge" x1="620" y1="250" x2="385" y2="250"/>
+      <line class="svg-edge" x1="385" y1="250" x2="385" y2="270" marker-end="url(#arr3)"/>
+
+      <rect class="svg-node svg-node-amber" x="100" y="275" width="570" height="70" rx="6"/>
+      <text class="svg-label-title" x="385" y="297" text-anchor="middle">memory SQLite · documents + documents_fts</text>
+      <text class="svg-label" x="385" y="315" text-anchor="middle">jieba 分句版 tokenizer（600s→2.91s）· BM25 排序 · external content table</text>
+      <text class="svg-label-mono" x="385" y="333" text-anchor="middle">异步索引（spawn_blocking，indexed_at 标记，不阻塞 ingest 返回）</text>
+
+      <!-- 关键属性 -->
+      <text class="svg-label-small" x="385" y="370" text-anchor="middle">✓ 无 embed API（原则 5）　✓ 无本地 embedding 模型（原则 2）　✓ 无 sqlite-vec（少一个原生扩展）</text>
+      <text class="svg-label-small" x="385" y="390" text-anchor="middle">✓ 口语化 query 无关（模型转关键词，非用户原话做 MATCH）　✓ 与 @ 挂载统一 read_document 路径</text>
+
+      <defs>
+        <marker id="arr3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path class="svg-arrow" d="M0,0 L8,4 L0,8 z"/>
+        </marker>
+        <marker id="arr3Acc" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path class="svg-arrow-accent" d="M0,0 L8,4 L0,8 z"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><span class="fig-num">图 2.3-1</span> · agentic search vs 传统 RAG。砍掉向量检索，模型自主调工具按需读取，FTS5 + jieba 分句版 tokenizer 提速 200 倍，全文存 documents 表，FTS5 异步建索引不阻塞摄取。</figcaption>
+  </figure>
+
+  <h3>为什么砍 RAG：业界共识 + 三原则协同</h3>
+  <ul>
+    <li><strong>业界共识（2026）</strong>：小语料文件工具优于 RAG（Anthropic 在 Claude Code 用 agentic search 替换 RAG，+2.7% 准确率）。onto-studio 是本体建模工具（几十到几百文档），适合文件工具模式。</li>
+    <li><strong>FTS5 是白送的能力</strong>：bundled SQLite 默认编译 <code>-DSQLITE_ENABLE_FTS5</code>，支持 BM25 排序、snippet 高亮、external content table（全文只存一份），无需加任何依赖。</li>
+    <li><strong>口语化 query 问题在工具路径下不存在</strong>：用户口语化长 query 直接做 FTS5 MATCH 会翻车，但走文件工具路径，query 来自模型的 <code>search_documents</code> 调用——模型天然会把口语化意图转成搜索关键词。</li>
+    <li><strong>三原则协同</strong>：无需 embed API（原则 5 外部服务最小化）、无本地 embedding 模型（原则 2 轻量化）、无 sqlite-vec（少一个原生扩展，原则 1）。</li>
+  </ul>
+
+  <div class="callout success">
+    <div class="callout-title">jieba 分句版 tokenizer · 200 倍提速</div>
+    替代 <code>sqlite-jieba-tokenizer 0.6</code>——该 crate 的 <code>tokenize</code> 直接对整段文本 <code>JIEBA.cut(text, true)</code>，jieba DAG 对超长连续文本 O(n²) 退化（1.4M 字符 PDF 需 600s+）。自实现分句版先按标点/换行分句再逐句 cut，offset 按 byte 精确累加，实测 <strong>600s → 2.91s</strong>（提升 200 倍）。stopword/stemmer/小写归一化逻辑与原版一致，索引兼容。
+  </div>
+
+  <h3>`@` 挂载：位置语义 + prompt cache 友好</h3>
+  <p>
+    决策 17 推翻了早期"全文注入"设计。<strong>核心是 prompt cache 友好的上下文架构</strong>——prompt caching 是 prefix match，前缀任意一字节变化后面全失效。因此：
+  </p>
+  <ol>
+    <li><strong>静态前缀冻结</strong>：tools 定义、system prompt 在会话期间永不变化，动态状态绝不进 system prompt。</li>
+    <li><strong>挂载信息进 user message</strong>：用户 <code>@</code> 的文档清单作为 <code>&lt;mounted-documents&gt;</code> 注脚追加到本轮 user message 尾部，每轮变化但不影响已缓存 prefix。</li>
+    <li><strong>不给摘要</strong>：注脚只给 <code>id + name</code>，避免 batch 上传多文档时生成摘要的延迟，文件名已足够模型决策。</li>
+    <li><strong>不注入全文</strong>：模型按需调 <code>read_document(id)</code> 工具分页读取，与未挂载文档走同一套路径完全统一。</li>
+  </ol>
+
+  <div class="callout">
+    <div class="callout-title">prefix cache 经济性</div>
+    18k tokens 静态前缀，50 轮会话：无缓存 $13.50 vs 有缓存 $1.35（差 10 倍，仅前缀成本）。system prompt 塞文件清单会每轮失效，成本飙升。Anthropic static-first 架构（Claude Code 实现）达成 90-96% cache hit rate。
+  </div>
+
+  <h3>CompactingMemory：复用 rig 原生，不手写 trim</h3>
+  <p>
+    决策 16 直接复用 rig 0.41 + rig-memory 0.41 的上下文管理基础设施。<code>crates/agent-core/memory_bridge.rs</code> 把项目 <code>Memory</code>（SQLite）适配为 rig <code>ConversationMemory</code>（newtype <code>SqliteMemory</code> 绕过孤儿规则），再挂 <code>CompactingMemory</code> 组合 <code>TokenWindowMemory</code> policy（超预算裁剪）+ 自实现 <code>LlmCompactor</code>（LLM 生成滚动摘要）。<em>不引入 tokenizer</em>（原则 2）——<code>HeuristicTokenCounter::openai()</code> = chars/4，与原手写 <code>estimate_tokens</code> 同语义。
+  </p>
+  <p>
+    模型上下文窗口动态获取：<code>context_window.rs</code> 四层 fallback（用户配置 &gt; <code>/v1/models</code> 探测 &gt; Ollama <code>/api/show</code> &gt; 默认 100K），1h 缓存，配置变更 <code>invalidate_cache()</code> 清空。真实 usage 落库（rig 流式上报 <code>CompletionCall</code> 含 <code>Usage</code>，过滤全 0 哨兵后落库到 assistant 消息）。
+  </p>
+</section>
+
+<!-- ========== 2.4 数据知识进化 ========== -->
+<section id="federation">
+  <h2><span class="num">2.4</span>本体建模核心链路：从数据源到知识图谱</h2>
+  <p class="section-conclusion">
+    三期夯实本体建模的全链路闭环——用户注册异构数据源 → DataFusion 单进程联邦查询 →
+    本体层定义 ObjectType / LinkType / ActionType → Agent 通过 TextQL 自主跨源查询验证模型。SQLite 单库统一存储，零 JVM 零独立进程。
+  </p>
+
+  <figure>
+    <svg class="svg-diagram" viewBox="0 0 770 400" xmlns="http://www.w3.org/2000/svg">
+      <!-- 三期阶段 -->
+      <text class="svg-layer-label" x="20" y="24">三期 · 本体建模全链路（联邦查询已落地）</text>
+      <rect class="svg-layer-band" x="10" y="30" width="750" height="150" rx="6"/>
+
+      <!-- 数据源 -->
+      <rect class="svg-node svg-node-green" x="30" y="50" width="120" height="102" rx="6"/>
+      <text class="svg-label-title" x="90" y="74" text-anchor="middle">数据源</text>
+      <text class="svg-label" x="90" y="92" text-anchor="middle">MySQL</text>
+      <text class="svg-label" x="90" y="108" text-anchor="middle">PostgreSQL</text>
+      <text class="svg-label" x="90" y="124" text-anchor="middle">CSV</text>
+      <text class="svg-label" x="90" y="140" text-anchor="middle">Excel</text>
+
+      <line class="svg-edge" x1="150" y1="100" x2="180" y2="100" marker-end="url(#arr4)"/>
+
+      <!-- TableProvider -->
+      <rect class="svg-node svg-node-amber" x="185" y="50" width="140" height="102" rx="6"/>
+      <text class="svg-label-title" x="255" y="74" text-anchor="middle">TableProvider</text>
+      <text class="svg-label" x="255" y="92" text-anchor="middle">sqlx 0.9 + rustls</text>
+      <text class="svg-label" x="255" y="108" text-anchor="middle">MySQL/PG executor</text>
+      <text class="svg-label" x="255" y="124" text-anchor="middle">CSV/Excel MemTable</text>
+      <text class="svg-label-mono" x="255" y="140" text-anchor="middle">catalog.schema.table</text>
+
+      <line class="svg-edge" x1="325" y1="100" x2="355" y2="100" marker-end="url(#arr4)"/>
+
+      <!-- DataFusion -->
+      <rect class="svg-node svg-node-purple" x="360" y="50" width="160" height="102" rx="6"/>
+      <text class="svg-label-title" x="440" y="74" text-anchor="middle">DataFusion 54</text>
+      <text class="svg-label" x="440" y="92" text-anchor="middle">单进程内嵌</text>
+      <text class="svg-label" x="440" y="108" text-anchor="middle">零 JVM</text>
+      <text class="svg-label" x="440" y="124" text-anchor="middle">Arrow RecordBatch</text>
+      <text class="svg-label-mono" x="440" y="140" text-anchor="middle">只读守卫 + LIMIT 注入</text>
+
+      <line class="svg-edge svg-edge-accent" x1="520" y1="100" x2="550" y2="100" marker-end="url(#arr4Acc)"/>
+
+      <!-- Agent 工具 -->
+      <rect class="svg-node svg-node-accent" x="555" y="50" width="195" height="102" rx="6"/>
+      <text class="svg-label-title" x="652" y="74" text-anchor="middle">Agent 工具暴露</text>
+      <text class="svg-label" x="652" y="92" text-anchor="middle">execute_query</text>
+      <text class="svg-label" x="652" y="108" text-anchor="middle">browse_schema</text>
+      <text class="svg-label" x="652" y="124" text-anchor="middle">describe_table</text>
+      <text class="svg-label-mono" x="652" y="140" text-anchor="middle">DynamicTool 注入</text>
+
+      <!-- 四期 -->
+      <text class="svg-layer-label" x="20" y="214">四期（可选）· 本地高精度 + 移动端</text>
+      <rect class="svg-layer-band" x="10" y="220" width="750" height="70" rx="6"/>
+
+      <rect class="svg-node svg-node-compound" x="30" y="240" width="350" height="50" rx="6"/>
+      <text class="svg-label-title" x="205" y="262" text-anchor="middle">本地 Ollama + Qwen2.5-VL</text>
+      <text class="svg-label-small" x="205" y="278" text-anchor="middle">离线高精度 VLM · 解决扫描件死区</text>
+
+      <rect class="svg-node svg-node-compound" x="395" y="240" width="355" height="50" rx="6"/>
+      <text class="svg-label-title" x="572" y="262" text-anchor="middle">移动端适配（已落地 F11）</text>
+      <text class="svg-label-small" x="572" y="278" text-anchor="middle">单套代码 + Tailwind 断点 + Drawer 自适应</text>
+
+      <!-- 价值 -->
+      <text class="svg-label-small" x="385" y="318" text-anchor="middle">三期核心价值：客户系统→数据源注册→本体建模(ObjectType/LinkType/ActionType)→联邦查询验证模型</text>
+      <text class="svg-label-small" x="385" y="338" text-anchor="middle">前置依赖二期 MCP 工具系统（联邦查询作为 MCP tool 暴露给 Agent）</text>
+
+      <defs>
+        <marker id="arr4" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path class="svg-arrow" d="M0,0 L8,4 L0,8 z"/>
+        </marker>
+        <marker id="arr4Acc" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+          <path class="svg-arrow-accent" d="M0,0 L8,4 L0,8 z"/>
+        </marker>
+      </defs>
+    </svg>
+    <figcaption><span class="fig-num">图 2.4-1</span> · 数据知识进化路径。三期联邦查询全栈已落地（DataFusion 54 + sqlx + TableProvider），四期本地 VLM 与移动端适配。SQLite 单库统一存储本体元数据，零 JVM 零独立进程。</figcaption>
+  </figure>
+
+  <h3>联邦查询的安全护栏</h3>
+  <p>
+    <code>crates/federation/src/query.rs</code> 实现只读查询执行：<strong>sqlparser 解析，仅 <code>Query</code>/<code>Explain(Query)</code> 放行</strong>（拒绝 DDL/DML），自动 LIMIT 注入（默认 200，max 1000），30s 超时。schema 浏览走三段式 <code>{catalog}.information_schema.tables WHERE table_schema='public'</code> 避开系统表，<code>table_provider</code> 回退。
+  </p>
+
+  <div class="callout warn">
+    <div class="callout-title">DataFusion 54 已知限制</div>
+    <code>deregister_catalog</code> 不存在，catalog 随进程留存（重启不恢复，启动时 <code>restore_data_sources</code> 重新注册）；CSV 无法直接注册为带 schema provider 的 catalog，改走 temp table 模式。
+  </div>
+
+  <h3>TextQL 与本体：LLM 生成意图，sqlparser 生成 SQL</h3>
+  <p>
+    决策 11 用 <code>sqlparser 0.62</code>（ANSI SQL:2011）替代 Python sqlglot——原方案需 Python 运行时违反原则 1。TextQL 的自然语言→逻辑计划部分走 LLM（复用 agent-core 的 Rig），<em>非硬编码规则</em>。LLM 产出结构化意图，sqlparser-rs 负责语法正确的 SQL 生成，TextQL→逻辑计划→各源方言 SQL 三段式编译，逻辑层与 DataFusion 的逻辑计划自然衔接。
+  </p>
+  <p>
+    本体元数据（ObjectType/LinkType/ActionType/数据源注册/凭证）全部存入 <code>memory</code> crate 的同一 SQLite <code>.db</code>，新增 <code>ontology</code> 表族（决策 10）——否决 PostgreSQL（独立进程违反原则 1）、嵌入式 PostgreSQL（体积过大）。单文件 <code>~/.onto-studio/onto-studio.db</code> 便携备份。
+  </p>
+</section>
+
+<!-- ========== 3 · 关键决策清单 ========== -->
+<section id="decisions">
+  <h2><span class="num">3</span>关键决策清单（ADR 摘要）</h2>
+  <p class="section-conclusion">
+    20 条 ADR 覆盖 Agent 框架、存储、文件解析、上下文管理、IPC 边界、Skill 系统六大领域。
+    每条决策都含明确的否决项与工程理由——否决不是事后找补，而是设计之初画死的红线。
+  </p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th style="width:60px">#</th>
+          <th>决策</th>
+          <th>核心选型</th>
+          <th>关键否决项</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>1</td><td>Agent 框架</td><td><code>rig 0.41</code>（agent+memory+rustls+derive feature）</td><td>pi_agent_rust、官方 pi-agent、LangChain-rust</td></tr>
+        <tr><td>2</td><td>不用 Rig loaders</td><td>关闭 pdf/epub feature，自建 ingest 是超集</td><td>Rig <code>PdfFileLoader</code>（冗余）、GPL 的 <code>epub</code> crate</td></tr>
+        <tr><td>3</td><td>存储统一 SQLite</td><td><code>rusqlite</code>(bundled) + 自实现 jieba FTS5 tokenizer</td><td>qdrant/lancedb、redb</td></tr>
+        <tr><td>4</td><td>Office 解析</td><td><code>office_oxide 0.1.8</code>（DOCX/PPTX/老格式）+ <code>calamine</code>（XLSX 读）</td><td>LiteParse（依赖 LibreOffice 违反原则 1）</td></tr>
+        <tr><td>5</td><td>PDF 解析（破例）</td><td><code>pdfium-render 0.9.3</code> + 预编译 PDFium 动态库</td><td>lopdf/pdfsink-rs（中文 CID CMap 解码失败）</td></tr>
+        <tr><td>6</td><td>eBook</td><td><code>rbook 0.7</code>（Apache-2.0）</td><td><code>epub</code>（danigm，GPL-3.0 传染）</td></tr>
+        <tr><td>7</td><td>多模态</td><td>Rig 原生 <code>UserContent::Image</code>，走 VLM API</td><td>本地 Tesseract/whisper-candle（重，违原则 2）</td></tr>
+        <tr><td>7.5</td><td>Provider 路由</td><td><code>ProviderRuntime</code> trait 擦除泛型，13 种 kind 按 kind 路由</td><td>全塞 <code>openai::Client</code>（丢 capability，P0 bug）</td></tr>
+        <tr><td>8</td><td>分层架构</td><td><code>DocumentParser</code> trait + dispatcher + 统一错误枚举</td><td>—</td></tr>
+        <tr><td>9</td><td>联邦查询引擎</td><td><code>datafusion 54</code> 单进程内嵌</td><td>Trino（JVM 独立进程）、DuckDB（federation 生态弱）</td></tr>
+        <tr><td>10</td><td>本体存储</td><td>复用 memory 的 SQLite，新增 ontology 表族</td><td>PostgreSQL（独立进程违原则 1）</td></tr>
+        <tr><td>11</td><td>TextQL 编译器</td><td><code>sqlparser 0.62</code>，NL→意图走 LLM</td><td>Python sqlglot（需 Python 运行时）</td></tr>
+        <tr><td>12</td><td>数据源连接</td><td><code>sqlx 0.9</code> 纯 Rust + rustls</td><td>SQLAlchemy（Python）、OpenSSL</td></tr>
+        <tr><td>13</td><td>上下文体积管控</td><td>字节预算（512KiB/篇 + 2MiB 总）+ 图片降采样</td><td>tokenizer 精确计数（二期）、逐 delta 落库</td></tr>
+        <tr><td>14</td><td>MCP 工具系统</td><td><code>rmcp ^1.8</code> + 自实现 <code>DynamicTool</code> 桥接</td><td>rmcp 3.0-beta（resolver bug）、transport-child-process（编译失败）</td></tr>
+        <tr><td>15</td><td>文件检索</td><td>agentic search（FTS5 + jieba + agent 工具）</td><td>向量 RAG（sqlite-vec + embedding）、独立向量库</td></tr>
+        <tr><td>16</td><td>上下文管理</td><td>rig 0.41 原生 <code>CompactingMemory</code> + <code>TokenWindowMemory</code></td><td>手写 trim/compact、tiktoken-rs、摘要落 DB</td></tr>
+        <tr><td>17</td><td>`@` 挂载语义</td><td>位置语义 token + user message 注脚 + 工具按需读</td><td>全文注入、system prompt 塞文件清单（破 prefix cache）</td></tr>
+        <tr><td>18</td><td>IPC BigInt 公约</td><td><code>#[specta(type = Number)]</code> 逐字段注解</td><td>手写 newtype（冗余非官方）、JS BigInt（兼容差）</td></tr>
+        <tr><td>19</td><td>会话级知识范围</td><td>文件夹层级 + 激活集（conversation_documents 表）</td><td>—</td></tr>
+        <tr><td>20</td><td>Agent Skill 系统</td><td><code>agent-skills 0.2</code> + 三层 disable + 四类来源 + 渐进式披露</td><td>自造 SKILL.md 解析器、skill 全文注入 preamble</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout warn">
+    <div class="callout-title">历史教训 · 决策 18</div>
+    specta-typescript 0.0.12 的 <code>BigIntForbidden</code> 错误，其 <code>error.rs</code> 顶部官方文档明确列了 5 种迁移路径（含 <code>#[specta(type = specta_typescript::Number)]</code> 一行注解方案），但 agent 只读了 <code>primitives.rs</code> 一个硬编码 <code>return Err</code> 就断定"无配置开关"，转而手写 5 个 newtype，浪费大量时间。<strong>正确做法：遇库报错先读源码文档注释 + 官方文档，再 web_search 确认业界方案，不要凭局部信息下"无解"结论</strong>。
+  </div>
+</section>
+
+<!-- ========== 4 · 落地路线 ========== -->
+<section id="roadmap">
+  <h2><span class="num">4</span>落地路线与当前状态</h2>
+  <p class="section-conclusion">
+    一期 MVP 核心完成（DeepSeek 端到端验证）→ 二期 A3 MCP + B1/B2 上下文管理 + 文件工具 + Skill 系统全栈 →
+    三期本体建模全链路（联邦查询已落地，TextQL 待）→ 四期本地 VLM 与移动端适配。实际落地顺序与原计划有调整（A2 RAG 砍掉改 agentic search）。
+  </p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>阶段</th>
+          <th>内容</th>
+          <th style="width:90px">状态</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>一期 MVP</strong></td>
+          <td>脚手架 → Rig 接云端多模态 → 基础对话+流式 → ingest 核心 parser（PDF/Office/文本）→ 图片输入 → SQLite 会话；前端 AppShell 三栏 + 对话流式 + 拖拽摄入 + ⌘K</td>
+          <td><span class="pill green">✅ 完成</span></td>
+        </tr>
+        <tr>
+          <td><strong>二期 A3</strong></td>
+          <td>MCP 工具系统（rmcp 1.x + 自实现 DynamicTool 桥接，决策 14）</td>
+          <td><span class="pill green">✅ 完成</span></td>
+        </tr>
+        <tr>
+          <td><strong>二期 A2</strong></td>
+          <td>~~向量检索 RAG~~（sqlite-vec KNN + embedding）→ 砍掉，改文件工具 + jieba FTS5 agentic search（决策 15）</td>
+          <td><span class="pill red">已砍</span></td>
+        </tr>
+        <tr>
+          <td><strong>二期 A1</strong></td>
+          <td>VLM 增强解析（复杂度检测 + 扫描件走 VLM）→ 暂缓，无可用 VLM 模型，待四期 Ollama 本地 VLM</td>
+          <td><span class="pill amber">暂缓</span></td>
+        </tr>
+        <tr>
+          <td><strong>二期 B1/B2</strong></td>
+          <td>token 预算 + 历史自动压缩（rig 0.41 原生 ConversationMemory + CompactingMemory，决策 16）</td>
+          <td><span class="pill green">✅ 完成</span></td>
+        </tr>
+        <tr>
+          <td><strong>二期收尾</strong></td>
+          <td>`@` 挂载统一 agentic search（决策 17）+ 会话级知识范围（决策 19）+ Agent Skill 系统（决策 20）</td>
+          <td><span class="pill green">✅ 完成</span></td>
+        </tr>
+        <tr>
+          <td><strong>三期</strong></td>
+          <td>数据源注册（MySQL/PG/CSV/Excel）→ DataFusion 联邦查询全栈 → 本体建模（ObjectType/LinkType/ActionType）→ TextQL NL→SQL（待）→ Agent 工具化</td>
+          <td><span class="pill amber">联邦✅ 本体建模中</span></td>
+        </tr>
+        <tr>
+          <td><strong>四期</strong></td>
+          <td>本地 Ollama + Qwen2.5-VL 离线高精度 → 移动端适配（已落地 F11）</td>
+          <td><span class="pill gray">可选</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>架构演进的三个关键反转</h3>
+  <ol>
+    <li><strong>RAG → agentic search</strong>（决策 15）：二期原计划 sqlite-vec 向量检索，砍掉改 FTS5 + 文件工具。理由是业界共识 + 三原则协同，架构大幅简化（移除 <code>crates/retrieval/</code>、<code>crates/vendor/sqlite-vec/</code>、<code>vectors.rs</code>、所有 RAG IPC 命令）。</li>
+    <li><strong>全文注入 → 位置语义</strong>（决策 17）：早期 <code>@</code> 挂载走 <code>context_texts</code> 整篇注入，推翻为"位置语义 token + user message 注脚 + 工具按需读"，保 prefix cache + 大文档安全 + 统一检索路径。</li>
+    <li><strong>手写 trim → rig 原生</strong>（决策 16）：手写 <code>trim_history</code>/<code>compact_history</code> 废弃，改用 rig 0.41 + rig-memory 0.41 原生 <code>CompactingMemory</code>，不重复造轮。</li>
+  </ol>
+</section>
+
+<footer id="footer-anchor">
+  <p>onto-studio 技术架构文档 · 全生命周期可视化本体建模工具 · 基于 <code>ARCHITECTURE.md</code>（126KB ADR）+ <code>PROGRESS.md</code> + 源码核实生成</p>
+  <p style="margin-top:8px;">五条原则 · 20 条 ADR · 4 个 Rust crate · 13 种文档格式 · 13 个 LLM provider</p>
+  <p style="margin-top:8px; font-size:12px;">文档遵循 Cloudflare/Stripe 工程博客风格 · 手绘内联 SVG · 金字塔结构</p>
+</footer>
+
+</div>
+
+<script>
+  // 阅读进度条
+  const bar = document.getElementById('progress-bar');
+  window.addEventListener('scroll', () => {
+    const h = document.documentElement;
+    const scrolled = (h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100;
+    bar.style.width = scrolled + '%';
+  }, { passive: true });
+
+  // TOC 高亮当前章节
+  const tocLinks = document.querySelectorAll('#toc a[href^="#"]');
+  const sections = [...document.querySelectorAll('section[id], header[id], footer[id]')];
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        const id = entry.target.id;
+        tocLinks.forEach(link => {
+          link.classList.toggle('active', link.getAttribute('href') === '#' + id);
+        });
+      }
+    });
+  }, { rootMargin: '-20% 0px -70% 0px' });
+  sections.forEach(s => observer.observe(s));
+</script>
+
+</body>
+</html>

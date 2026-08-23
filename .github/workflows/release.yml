@@ -210,12 +210,14 @@ jobs:
           fi
           echo "待上传文件数: ${#FILES[@]}"
 
-          for f in "${FILES[@]}"; do
-            fname="$(basename "$f")"
-            echo "── 上传 $fname ──"
+          upload_one() {
+            local f="$1" idx="$2" total="$3"
+            local fname="$(basename "$f")"
+            echo "[$idx/$total] ── 上传 $fname ($(du -m "$f" | cut -f1)MB) ──"
             # 步骤1: GET upload_url 拿预签名地址 + headers
             # 用 --get --data-urlencode 让 curl 自动 URL-encode 文件名（含空格，
             # 如 "Ontology Studio_0.1.0_aarch64.dmg"），根治 Malformed URL 错误。
+            local INFO UPLOAD_URL
             INFO=$(curl -sS --get \
               --data-urlencode "file_name=$fname" \
               -H "PRIVATE-TOKEN: $TOKEN" \
@@ -223,30 +225,54 @@ jobs:
               "$API/repos/$REPO/releases/$TAG/upload_url")
             UPLOAD_URL=$(echo "$INFO" | jq -r '.url')
             if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
-              echo "❌ 拿不到 upload_url："
+              echo "❌ [$idx/$total] $fname 拿不到 upload_url："
               echo "$INFO"
-              exit 1
+              return 1
             fi
             # 构造 headers 数组（GitCode 返回 {headers:{k:v,...}}）
-            HDR_ARGS=()
+            local -a HDR_ARGS=()
             while IFS= read -r line; do
               [ -n "$line" ] && HDR_ARGS+=(-H "$line")
             done < <(echo "$INFO" | jq -r '.headers // {} | to_entries[] | "\(.key): \(.value)"')
 
             # 步骤2: PUT 二进制到预签名地址
-            HTTP=$(curl -X PUT -sS -o /tmp/up.json -w "%{http_code}" \
+            local HTTP
+            HTTP=$(curl -X PUT -sS -o /tmp/up_$idx.json -w "%{http_code}" \
               --retry 3 --retry-delay 5 \
               "${HDR_ARGS[@]}" \
               -T "$f" \
               "$UPLOAD_URL")
             if [ "$HTTP" = "200" ]; then
-              echo "  ✅ $fname 上传成功"
+              echo "  ✅ [$idx/$total] $fname 上传成功"
             else
-              echo "  ❌ $fname 上传失败 HTTP=$HTTP"
-              cat /tmp/up.json
-              exit 1
+              echo "  ❌ [$idx/$total] $fname 上传失败 HTTP=$HTTP"
+              cat /tmp/up_$idx.json
+              return 1
             fi
+          }
+          export -f upload_one
+          export TOKEN REPO API TAG
+
+          # 并行上传（所有文件同时 PUT，跨境带宽是瓶颈，并行能显著加速）
+          total=${#FILES[@]}
+          pids=()
+          i=0
+          for f in "${FILES[@]}"; do
+            i=$((i+1))
+            upload_one "$f" "$i" "$total" &
+            pids+=($!)
           done
+
+          # 等待所有上传，任一失败则整体失败
+          fail=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || fail=1
+          done
+          if [ "$fail" = "1" ]; then
+            echo "❌ 有文件上传失败"
+            exit 1
+          fi
+          echo "🎉 全部上传完成"
           echo "🎉 全部上传完成"
 
       - name: Summary

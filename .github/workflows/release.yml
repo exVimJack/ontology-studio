@@ -17,7 +17,17 @@ name: Build & Release to GitCode
 on:
   workflow_dispatch: # 手动触发（测试流水线用）
   push:
-    tags: ["v*"] # 打 tag 触发正式发版
+    # 打 tag 触发正式发版（含 GitCode Release 同步）
+    tags: ["v*"]
+    # push 到 main 只做 build + 缓存预热，不发版
+    # 关键：让 main 分支保存 Rust cache，后续 tag 触发的 run 能命中
+    # （GitHub Actions cache 按 ref 隔离，tag run 能读 main 的 cache，
+    # 但不同 tag 之间互相读不到；必须有 main 的 cache 供 tag 复用）
+    branches: [main]
+    paths-ignore: # 这些路径变更不影响构建，跳过省 CI 时间
+      - "docs/**"
+      - "*.md"
+      - "scripts/init-standalone-repo.sh"
 
 permissions:
   contents: read # 只读 GitHub 仓内容即可（不在 GitHub 建 Release）
@@ -94,7 +104,7 @@ jobs:
       # 产物路径：根 .cargo/config.toml 设 target-dir="target"，产物落在仓库根
       # target/<target>/release/bundle/（日志佐证）。src-tauri/target/ 作兜底 glob。
       - name: Upload build artifacts (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.label }}
@@ -106,7 +116,7 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
 
       - name: Upload build artifacts (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.label }}
@@ -121,6 +131,8 @@ jobs:
   sync_gitcode_release:
     name: Sync Release to GitCode
     needs: build
+    # 只在 tag 触发时同步 GitCode Release；main 分支 push 只做 build 预热 cache，不发版
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts

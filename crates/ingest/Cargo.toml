@@ -21,10 +21,10 @@ pdfium-render = { version = "0.9.3", default-features = false, features = ["thre
 
 # ── Office（决策 4） ──
 # office_oxide：DOCX 读/写 + PPTX + 老格式 DOC/XLS/PPT（统一 IR）
-# XLSX 读用 calamine（类型/公式保真），写用 rust_xlsxwriter（领域标准）
+# XLSX 读用 calamine（类型/公式保真）。
+# 注：XLSX 写功能未实现时暂移除 rust_xlsxwriter，实现时加回 `rust_xlsxwriter = "0.96"`。
 office_oxide = "0.1.8"
 calamine = "0.36"
-rust_xlsxwriter = "0.96"
 
 # ── eBook（决策 6） ──
 # rbook：Apache-2.0，ePub 2/3（否决 GPL 的 epub crate）

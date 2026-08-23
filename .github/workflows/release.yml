@@ -5,13 +5,14 @@ name: Build & Release to GitCode
 # 产物回传到 GitCode Release，国内用户在 gitcode.com 下载。
 #
 # 与 tauri 官方模板的关键差异：
-#   1. tauri-action 不传 tagName/releaseName → 只产出 artifact，
-#      不在 GitHub 建 Release（Release 建在 GitCode）
-#   2. 纯 curl 调 GitCode API（零第三方 action 依赖），根治：
+#   1. tauri-action 不传 tagName/releaseName → 只产出 artifact，不在 tauri-action 内建 Release
+#      （Release 由后面的 gh release create / GitCode API 步骤独立建）
+#   2. 双 Release 发布：GitHub Release（公开仓免费不限速，备份源）+ GitCode Release（国内镜像）
+#   3. 纯 curl 调 GitCode API（零第三方 action 依赖），根治：
 #      - secrets 块必须与 with 同级（不是嵌套）
 #      - bash globstar 问题（自己用 find 递归）
 #      - 失败时能看到完整响应体
-#   3. 保留 onto-studio 特有的 PDFium 动态库拉取步骤
+#   4. PDFium 动态库已入库，CI 无需下载步骤
 # ─────────────────────────────────────────────────────────────
 
 on:
@@ -30,7 +31,7 @@ on:
       - "scripts/init-standalone-repo.sh"
 
 permissions:
-  contents: read # 只读 GitHub 仓内容即可（不在 GitHub 建 Release）
+  contents: write # 需写权限：在 GitHub 建 Release（原来只读因不发版）
 
 env:
   # GitCode 仓库路径（owner/repo）
@@ -144,6 +145,42 @@ jobs:
 
       - name: List downloaded files
         run: find ./assets -type f | sort
+
+      # ── 发布 GitHub Release（作为 GitCode 的备份源 + 代理用户直连下载）──
+      # 公开仓库 GitHub Release 存储免费、不限速。用内置 GITHUB_TOKEN，零配置。
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # 收集所有安装包
+          mapfile -t ASSETS < <(find ./assets -type f \( \
+            -name '*.exe' -o -name '*.msi' -o -name '*.dmg' \
+            -o -name '*.AppImage' -o -name '*.deb' \) | sort)
+          echo "上传到 GitHub Release: ${#ASSETS[@]} 个文件"
+          # gh release create：tag 已存在（push 触发），--draft 可改。幂等：已存在则跳过创建只传资产
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，追加资产"
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "Ontology Studio $TAG
+
+          ## 下载
+          - **macOS (Apple Silicon)**: \`.dmg\`
+          - **Windows x64**: \`.exe\` (NSIS) 或 \`.msi\`
+          - 国内用户如下载慢，请到 [GitCode Release](https://gitcode.com/JasonSmiths/ontology-studio/releases) 镜像下载
+
+          ## macOS 安装提示
+          DMG 未签名，首次打开请右键 → 打开。"
+          fi
+          # 上传所有资产到 GitHub Release
+          for f in "${ASSETS[@]}"; do
+            echo "上传 $(basename "$f")..."
+            gh release upload "$TAG" "$f" --clobber
+          done
+          echo "✅ GitHub Release $TAG 发布完成"
 
       # ── 创建/更新 GitCode Release ──
       - name: Create or Update GitCode Release

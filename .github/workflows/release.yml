@@ -66,17 +66,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-          # Windows 上装 llvm-tools 以启用 rust-lld（self-contained linker）
-          # 替代 MSVC link.exe，大产物链接提速 2-3×（见 .cargo/config.toml 配置）
-          components: ${{ runner.os == 'Windows' && 'llvm-tools' || '' }}
 
       # Rust 编译缓存（swatinem/rust-cache）
       # 关键：根 .cargo/config.toml 设 target-dir="target"，所有 cargo invocation
       # （根 workspace 5 个 crate + src-tauri Tauri crate）产物都落在仓库根 target/。
       # 必须缓存根 target/ + ~/.cargo/registry，否则下次仍全量编译（593 个 crate）。
-      # cache key 含 Cargo.lock hash：依赖或代码改动导致 target/ 部分失效时，
-      # 至少 Cargo.lock 未变的 crate 仍能复用编译产物（Swatinem 以 lock hash
-      # 做 restore-key fallback，命中率更高）。
+      # cache key 含 Cargo.lock hash（shared-key）：依赖或代码改动导致 target/
+      # 部分失效时，至少 Cargo.lock 未变的 crate 仍能复用编译产物。
+      #
+      # 曾尝试 Windows 用 rust-lld 替代 link.exe 提速链接，但实测在含 PDFium 等
+      # 原生静态库的 Tauri 项目上 rust-lld 会卡死/超慢（29min+ 未完成），已回退。
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:

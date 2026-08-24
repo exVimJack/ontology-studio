@@ -67,20 +67,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Windows CI 提速三件套（实测方案，见 github.com/andrewdavidmackenzie/flow/pull/2908）：
-      # 1. 禁 Defender 实时扫描工作区——Rust 编译产生海量中间 .rlib/.rmeta，
-      #    Defender 实时扫描会严重拖慢 IO（该 PR 实测单此一项省 ~8%）
-      # 2. rust-lld 替代 link.exe——env var 方式（不用 .cargo/config.toml，
-      #    避开 [target] 表下 linker-flavor 字段解析报错），rustc 随 toolchain 自带
-      # 3. CARGO_INCREMENTAL=1（profile.release 已开 incremental，此处显式兜底）
-      # 组合实测 Windows 23m→18.4m（-20%）。仅 Windows job 生效，mac 不受影响。
-      - name: Optimize Windows build (Defender exclusion + rust-lld)
+      # Windows CI 提速：禁 Defender 实时扫描工作区
+      # Rust 编译产生海量中间 .rlib/.rmeta，Defender 实时扫描会严重拖慢 IO
+      #（github.com/andrewdavidmackenzie/flow/pull/2908 实测单此一项省 ~8%）。
+      # 纯收益零风险，配 link.exe 同样有效。仅 Windows job 生效。
+      #
+      # 注：曾配 rust-lld 替代 link.exe，但首次切换需全量重编 cache 失效（>33min），
+      # 且 Tauri+PDFium 原生库上提速未验证，性价比不佳已放弃。
+      - name: Optimize Windows build (Defender exclusion)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
-          echo "CARGO_INCREMENTAL=1" >> $env:GITHUB_ENV
-          echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=rust-lld" >> $env:GITHUB_ENV
+        run: Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
 
       # Rust 编译缓存（swatinem/rust-cache）
       # 关键：根 .cargo/config.toml 设 target-dir="target"，所有 cargo invocation

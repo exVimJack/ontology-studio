@@ -1,5 +1,7 @@
 name: Build & Release to GitCode
 
+# 双平台 CI 提速优化验证中（Dev Drive + rust-lld + Defender + CARGO_INCREMENTAL=0）。
+
 # ─────────────────────────────────────────────────────────────
 # 方案1（修正版）：GitHub 公有 runner 编译 Win/macOS 包，
 # 产物回传到 GitCode Release，国内用户在 gitcode.com 下载。

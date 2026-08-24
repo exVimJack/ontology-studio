@@ -116,16 +116,15 @@ jobs:
       # tauri-action 纯构建模式：不传 tagName/releaseName/releaseDraft，
       # 只 build + 输出本地产物，不碰 GitHub Release
       #
-      # ⚡ 提速诊断：分阶段计时（cargo build vs tauri bundle），拿真实的 Windows
-      # 耗时分布，供后续优化决策。--timings 生成 cargo-timing.html 上传供分析。
-      - name: Build Tauri app (with timing diagnostics)
+      # ⚡ 提速诊断：args 加 -- --timings 透传给底层 cargo build，
+      # 生成 cargo-timing.html 供分析 Windows 真实 Top 20 crate 耗时。
+      # （CARGO_BUILD_TIMINGS env var 不透传 tauri-cli，改用 flag）
+      - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # 启用 cargo --timings（生成 target/cargo-timings/cargo-timing.html）
-          CARGO_BUILD_TIMINGS: "1"
         with:
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} -- --timings
 
       # 上传 cargo timing 报告供分析（每个平台一份）
       - name: Upload cargo timing report
@@ -133,10 +132,10 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: cargo-timing-${{ matrix.label }}
-          if-no-files-found: warn # timing 文件可能不存在（如 build 前失败），不阻断
+          if-no-files-found: warn # timing 文件可能不存在，不阻断
           path: |
-            target/cargo-timings/cargo-timing.html
             src-tauri/target/cargo-timings/cargo-timing.html
+            target/cargo-timings/cargo-timing.html
 
       # 把构建出的安装包上传为 artifact（命名按平台区分，便于聚合下载）
       # 产物路径：仓库根 target/<target>/release/bundle/（.cargo/config.toml 指定）。

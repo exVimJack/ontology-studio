@@ -64,89 +64,39 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # ── Rust 编译优化（双平台通用） ──
-      # CARGO_INCREMENTAL=0：CI 是 from-scratch 全量编译，incremental 的簿记开销
-      # 反而拖慢（corrode.dev 实测建议）。profile.release 里的 incremental=true
-      # 只对本地开发有用，CI 里用 env var 覆盖关闭。
-      # CARGO_NET_RETRY/CARGO_NET_FETCH_TIMEOUT： crates.io 网络增强鲁棒。
-      - name: Set Rust env
-        run: |
-          echo "CARGO_INCREMENTAL=0" >> $GITHUB_ENV
-          echo "CARGO_NET_RETRY=5" >> $GITHUB_ENV
-          echo "CARGO_NET_FETCH_TIMEOUT=120" >> $GITHUB_ENV
-
-      # ── Windows CI 提速三件套（Dev Drive + Defender 排除 + rust-lld） ──
-      # 综合预期提速：13m → 8-9m（-35%~40%）。仅 Windows job 生效。
-      #
-      # 1. Dev Drive（ReFS）：samypr100/setup-dev-drive 创建 VHDX，IO 密集型工作负载
-      #    提速 25%+。C: drive IOPS ~4.3k vs Dev Drive ~124k（29×）。重定向
-      #    CARGO_HOME/RUSTUP_HOME/TEMP/TMP + CARGO_TARGET_DIR 到 Dev Drive。
-      #    必须在 Rust toolchain 安装前创建，让 CARGO_HOME 一开始在快盘。
-      # 2. Defender 排除：排除 workspace + Dev Drive。Rust 编译产生海量 .rlib/.rmeta，
-      #    Defender 实时扫描是 IO 杀手（flow PR #2908 实测省 ~8%）。
-      #
-      # ⚠️ rust-lld 已移除：实测在含 PDFium 原生库的 Tauri 项目上，rust-lld
-      #    链接阶段卡死/超慢（20min+ Build Tauri 未完成，远超 link.exe 正常耗时）。
-      #    非环境问题（Defender 已排除），是 rust-lld 对大型原生静态库的兼容问题。
-      #    保留 link.exe，依赖 Dev Drive + Defender 提速 IO。
-      - name: Setup Windows Dev Drive
-        if: runner.os == 'Windows'
-        uses: samypr100/setup-dev-drive@v4
-        with:
-          # drive-size 默认 2GB 太小，Rust registry（593 crate 解压 ~4GB）+
-          # target/ 编译产物 ~5GB + RUSTUP_HOME ~1GB，至少需 12GB。
-          # public runner 约 15GB 可用，设 14GB Dynamic（按需扩展，不预占）。
-          drive-size: 14GB
-          env-mapping: |
-            CARGO_HOME,{{ DEV_DRIVE }}/.cargo
-            RUSTUP_HOME,{{ DEV_DRIVE }}/.rustup
-            CARGO_TARGET_DIR,{{ DEV_DRIVE }}/target
-            TEMP,{{ DEV_DRIVE }}/Temp
-            TMP,{{ DEV_DRIVE }}/Temp
-
-      - name: Optimize Windows build (Defender exclusion)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
-          if ($env:DEV_DRIVE) {
-            Add-MpPreference -ExclusionPath "$env:DEV_DRIVE"
-            # 验证 Dev Drive 环境变量已设
-            Write-Host "DEV_DRIVE=$env:DEV_DRIVE"
-            Write-Host "CARGO_HOME=$env:CARGO_HOME"
-            Write-Host "CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR"
-          }
-
-      # ── macOS 提速：TEMP 重定向到 /tmp（APFS 已快，仅避免污染 home） ──
-      # macOS 不配 rust-lld：Darwin target 用 lld 需 -Z unstable 选项，社区反馈
-      # 不稳定且 mac 默认 ld64 已不错，风险高于收益。只做纯收益的 TEMP 重定向。
-      - name: Optimize macOS build
-        if: runner.os == 'macOS'
-        run: |
-          echo "TMPDIR=/tmp" >> $GITHUB_ENV
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      # Rust 编译缓存（swatinem/rust-cache）
-      # Windows: CARGO_TARGET_DIR=Dev Drive/target（绝对路径，swatinem 需显式 workspaces）
-      # macOS: 仓库根 target/（默认）
-      # cache key：平台 target，shared-key 用 Cargo.lock hash 保证依赖变动时仍命中。
-      - name: Rust cache (Windows)
+      # Windows CI 提速：禁 Defender 实时扫描工作区
+      # Rust 编译产生海量中间 .rlib/.rmeta，Defender 实时扫描是 IO 杀手
+      #（github.com/andrewdavidmackenzie/flow/pull/2908 实测单此一项省 ~8%）。
+      # 纯收益零风险，这是本项目唯一实测稳定的 Windows 提速措施。
+      #
+      # ⚠️ 以下优化均实测不适用本项目（含 PDFium 原生库的 Tauri 项目），勿重复尝试：
+      # - rust-lld：链接阶段卡死/超慢（20min+ 未完成，cache 命中后仍卡），
+      #   rust-lld 对大型原生静态库兼容不佳，非环境问题（Defender 已排除）
+      # - Dev Drive (samypr100/setup-dev-drive)：CARGO_TARGET_DIR 重定向到
+      #   Dev Drive 后 swatinem cache 路径失配，每次全量重编，IO 优势抵不过
+      #   全量重编代价；且 VHDX 默认 2GB 不足（需 14GB）
+      # - CARGO_INCREMENTAL=0：与 profile.release 的 incremental=true 冲突无明显收益
+      # - sccache：不缓存 cdylib（Tauri app_lib 是 cdylib）+ 不缓存 incremental +
+      #   与 swatinem 冗余（apache/iggy 等项目均移除 sccache 只留 rust-cache）
+      - name: Optimize Windows build (Defender exclusion)
         if: runner.os == 'Windows'
-        uses: swatinem/rust-cache@v2
-        with:
-          # CARGO_TARGET_DIR 被 Dev Drive 重定向到绝对路径，swatinem 需显式指定
-          workspaces: ${{ env.CARGO_TARGET_DIR }}
-          key: ${{ matrix.target }}
-          shared-key: ${{ hashFiles('**/Cargo.lock') }}
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
 
-      - name: Rust cache (macOS)
-        if: runner.os == 'macOS'
+      # Rust 编译缓存（swatinem/rust-cache）
+      # 根 .cargo/config.toml 设 target-dir="target"，所有 cargo invocation
+      # （根 workspace 5 个 crate + src-tauri Tauri crate）产物都落在仓库根 target/。
+      # cache key：平台 target，shared-key 用 Cargo.lock hash 保证依赖变动时
+      # 仍命中未变 crate 的编译产物。
+      - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
+          workspaces: ". -> target"
           key: ${{ matrix.target }}
           shared-key: ${{ hashFiles('**/Cargo.lock') }}
 
@@ -173,7 +123,7 @@ jobs:
           args: --target ${{ matrix.target }}
 
       # 把构建出的安装包上传为 artifact（命名按平台区分，便于聚合下载）
-      # 产物路径：Windows 在 Dev Drive/target/，mac 在仓库根 target/。
+      # 产物路径：仓库根 target/<target>/release/bundle/（.cargo/config.toml 指定）。
       # src-tauri/target/ 作兜底 glob（tauri-action 可能用独立 target）。
       - name: Upload build artifacts (Windows)
         if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/')
@@ -182,8 +132,6 @@ jobs:
           name: artifacts-${{ matrix.label }}
           if-no-files-found: error # 产物缺失直接失败，避免空 Release
           path: |
-            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release/bundle/nsis/*.exe
-            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release/bundle/msi/*.msi
             target/${{ matrix.target }}/release/bundle/nsis/*.exe
             target/${{ matrix.target }}/release/bundle/msi/*.msi
             src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe

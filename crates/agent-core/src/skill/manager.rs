@@ -96,13 +96,27 @@ impl SkillManager {
         let total_start = std::time::Instant::now();
         let mut records: Vec<SkillRecord> = Vec::new();
 
-        // 1. 内置（resource_dir/skills/）
+        // 1. 内置（resource_dir/skills/）— 最高优先级，必须扫到
         self.scan_dir_timed(&self.builtin_dir, SkillSource::Builtin, &mut records);
-        // 2. 用户导入（~/.onto-studio/skills/）
+        // 2. 用户导入（~/.onto-studio/skills/）— 重要
         self.scan_dir_timed(&self.user_dir, SkillSource::Imported, &mut records);
-        // 3. 跨客户端只读
+
+        // 3. 跨客户端只读（~/.pi/, ~/.claude/, ~/.agents/）— 互操作 bonus，
+        //    绝不能因为某个 external 目录扫描卡死/出错而影响上面 builtin/user 的结果。
+        //    每个目录独立容错：出错只 warn 跳过，不影响其它。
         for dir in &self.external_dirs {
+            let ext_t = std::time::Instant::now();
+            let before = records.len();
             self.scan_dir_timed(dir, SkillSource::ExternalReadOnly, &mut records);
+            let elapsed = ext_t.elapsed();
+            if elapsed.as_secs() >= 2 {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    added = records.len() - before,
+                    "external skills dir scan slow (>=2s), but continuing (fail-soft)"
+                );
+            }
         }
 
         // 去重：同名取高优先级 source
@@ -156,17 +170,36 @@ impl SkillManager {
     /// 扫描单个目录下的所有 skill 子目录，追加到 out。
     /// 目录不存在则静默跳过（external_dirs 可能未配置）。
     fn scan_dir(&self, dir: &Path, source: SkillSource, out: &mut Vec<SkillRecord>) {
+        let t = std::time::Instant::now();
         let Ok(entries) = std::fs::read_dir(dir) else {
+            tracing::info!(dir = %dir.display(), source = ?source, "scan_dir: read_dir failed (dir not exist)");
             return; // 目录不存在则跳过
         };
+        tracing::info!(dir = %dir.display(), source = ?source, "scan_dir: read_dir ok, iterating entries");
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            // 用 symlink_metadata 而非 path.is_dir()：后者调 std::fs::metadata，
+            // 在 Windows 上对 reparse point / junction / 网络符号链接会阻塞解析，
+            // 可能卡死整个 scan_dir（进而卡死 list_skills）。symlink_metadata
+            // 只读链接自身信息（不跟随），file_type().is_dir() 判断符号链接
+            // 指向的目标类型（不实际解析），安全且快速。
+            let is_dir = std::fs::symlink_metadata(&path)
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false);
+            if !is_dir {
                 continue;
             }
+            let load_t = std::time::Instant::now();
+            tracing::info!(subdir = %path.display(), "scan_dir: before SkillDirectory::load");
             match SkillDirectory::load(&path) {
                 Ok(skill_dir) => {
                     let skill = skill_dir.skill();
+                    tracing::info!(
+                        subdir = %path.display(),
+                        name = %skill.name().as_str(),
+                        elapsed_ms = load_t.elapsed().as_millis() as u64,
+                        "scan_dir: load ok"
+                    );
                     let dmi = parse_disable_model_invocation(&path);
                     let allowed_tools = skill
                         .frontmatter()
@@ -182,8 +215,8 @@ impl SkillManager {
                         description: skill.description().as_str().to_string(),
                         source,
                         dir_path: path,
-                        doc_id: None, // 延迟到 ensure_skill_documented
-                        resource_doc_paths: None, // 延迟到 ensure_skill_documented
+                        doc_id: None,
+                        resource_doc_paths: None,
                         disable_model_invocation: dmi,
                         allowed_tools,
                         license,
@@ -191,14 +224,20 @@ impl SkillManager {
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        dir = %path.display(),
+                    tracing::info!(
+                        subdir = %path.display(),
                         error = ?e,
-                        "skill load failed, skipping"
+                        elapsed_ms = load_t.elapsed().as_millis() as u64,
+                        "scan_dir: load failed, skipping"
                     );
                 }
             }
         }
+        tracing::info!(
+            dir = %dir.display(),
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "scan_dir: done"
+        );
     }
 
     /// 把 skill body + references/assets/scripts 三个规范子目录下所有文本文件

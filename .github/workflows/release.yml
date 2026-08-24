@@ -90,6 +90,10 @@ jobs:
         if: runner.os == 'Windows'
         uses: samypr100/setup-dev-drive@v4
         with:
+          # drive-size 默认 2GB 太小，Rust registry（593 crate 解压 ~4GB）+
+          # target/ 编译产物 ~5GB + RUSTUP_HOME ~1GB，至少需 12GB。
+          # public runner 约 15GB 可用，设 14GB Dynamic（按需扩展，不预占）。
+          drive-size: 14GB
           env-mapping: |
             CARGO_HOME,{{ DEV_DRIVE }}/.cargo
             RUSTUP_HOME,{{ DEV_DRIVE }}/.rustup

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use agent_skills::SkillDirectory;
+use agent_skills::Skill;
 
 use super::builtin::parse_disable_model_invocation;
 use super::{
@@ -32,6 +32,10 @@ pub struct SkillManager {
     /// discover_all 结果缓存：(写入时刻, 已去重的 SkillRecord 列表)。
     /// None = 缓存空（首次或已 invalidate）。Mutex 临界区极短（仅取/存 Vec）。
     discover_cache: Mutex<Option<(Instant, Vec<SkillRecord>)>>,
+    /// 扫盘 single-flight 锁：并发 discover_all 只允许一个真正扫盘，
+    /// 其余等它完成后直接读缓存。避免多个 list_skills 并发重复扫盘
+    /// （Windows 上重复触发 Defender/同步软件的实时扫描，加剧 IO 阻塞）。
+    scan_lock: Mutex<()>,
 }
 
 impl SkillManager {
@@ -48,6 +52,7 @@ impl SkillManager {
             user_dir,
             external_dirs,
             discover_cache: Mutex::new(None),
+            scan_lock: Mutex::new(()),
         }
     }
 
@@ -66,7 +71,20 @@ impl SkillManager {
     /// `active_skill_doc_paths` 复用同一缓存，单次发消息不再扫描两遍磁盘。
     /// 缓存返回的是 clone（SkillRecord 含 String/PathBuf，量小可接受）。
     pub fn discover_all(&self) -> Vec<SkillRecord> {
-        // 先查缓存（命中且未过期直接返回 clone）
+        // fast path：先查缓存（命中且未过期直接返回 clone）
+        if let Ok(cache) = self.discover_cache.lock() {
+            if let Some((written_at, records)) = cache.as_ref() {
+                if written_at.elapsed().as_secs() < DISCOVER_CACHE_TTL_SECS {
+                    return records.clone();
+                }
+            }
+        }
+        // single-flight：持锁扫盘，并发调用在此排队。持锁期间再次 double-check
+        // 缓存（第一个扫描者可能已完成并填入）。
+        let _guard = self
+            .scan_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if let Ok(cache) = self.discover_cache.lock() {
             if let Some((written_at, records)) = cache.as_ref() {
                 if written_at.elapsed().as_secs() < DISCOVER_CACHE_TTL_SECS {
@@ -93,14 +111,30 @@ impl SkillManager {
 
     /// 无缓存的扫描实现（discover_all 内部调，或测试直接调验证磁盘状态）。
     fn discover_all_uncached(&self) -> Vec<SkillRecord> {
+        let total_start = std::time::Instant::now();
         let mut records: Vec<SkillRecord> = Vec::new();
-        // 1. 内置（resource_dir/skills/）
-        self.scan_dir(&self.builtin_dir, SkillSource::Builtin, &mut records);
-        // 2. 用户导入（~/.onto-studio/skills/）
-        self.scan_dir(&self.user_dir, SkillSource::Imported, &mut records);
-        // 3. 跨客户端只读
+
+        // 1. 内置（resource_dir/skills/）— 最高优先级，必须扫到
+        self.scan_dir_timed(&self.builtin_dir, SkillSource::Builtin, &mut records);
+        // 2. 用户导入（~/.onto-studio/skills/）— 重要
+        self.scan_dir_timed(&self.user_dir, SkillSource::Imported, &mut records);
+
+        // 3. 跨客户端只读（~/.pi/, ~/.claude/, ~/.agents/）— 互操作 bonus，
+        //    绝不能因为某个 external 目录扫描卡死/出错而影响上面 builtin/user 的结果。
+        //    每个目录独立容错：出错只 warn 跳过，不影响其它。
         for dir in &self.external_dirs {
-            self.scan_dir(dir, SkillSource::ExternalReadOnly, &mut records);
+            let ext_t = std::time::Instant::now();
+            let before = records.len();
+            self.scan_dir_timed(dir, SkillSource::ExternalReadOnly, &mut records);
+            let elapsed = ext_t.elapsed();
+            if elapsed.as_secs() >= 2 {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    added = records.len() - before,
+                    "external skills dir scan slow (>=2s), but continuing (fail-soft)"
+                );
+            }
         }
 
         // 去重：同名取高优先级 source
@@ -116,55 +150,167 @@ impl SkillManager {
                 }
             }
         }
-        deduped.into_values().collect()
+        let out: Vec<_> = deduped.into_values().collect();
+        tracing::info!(
+            total_ms = total_start.elapsed().as_millis() as u64,
+            found = out.len(),
+            names = ?out.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+            "discover_all_uncached done"
+        );
+        out
+    }
+
+    /// scan_dir 带耗时日志（定位「某目录扫描极慢」问题，如 Windows 上
+    /// `~/.pi/agent/skills` 含巨型 .venv 子目录）。
+    fn scan_dir_timed(&self, dir: &Path, source: SkillSource, out: &mut Vec<SkillRecord>) {
+        let t = std::time::Instant::now();
+        let before = out.len();
+        self.scan_dir(dir, source, out);
+        let added = out.len() - before;
+        let exists = dir.exists();
+        tracing::debug!(
+            dir = %dir.display(),
+            source = ?source,
+            exists,
+            added,
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "scan_dir"
+        );
+        if t.elapsed().as_millis() > 500 {
+            tracing::warn!(
+                dir = %dir.display(),
+                elapsed_ms = t.elapsed().as_millis() as u64,
+                "scan_dir slow (>500ms), this may cause skills window loading"
+            );
+        }
     }
 
     /// 扫描单个目录下的所有 skill 子目录，追加到 out。
     /// 目录不存在则静默跳过（external_dirs 可能未配置）。
     fn scan_dir(&self, dir: &Path, source: SkillSource, out: &mut Vec<SkillRecord>) {
+        let t = std::time::Instant::now();
         let Ok(entries) = std::fs::read_dir(dir) else {
+            tracing::info!(dir = %dir.display(), source = ?source, "scan_dir: read_dir failed (dir not exist)");
             return; // 目录不存在则跳过
         };
+        tracing::info!(dir = %dir.display(), source = ?source, "scan_dir: read_dir ok, iterating entries");
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            // 用 symlink_metadata 而非 path.is_dir()：后者调 std::fs::metadata，
+            // 在 Windows 上对 reparse point / junction / 网络符号链接会阻塞解析，
+            // 可能卡死整个 scan_dir（进而卡死 list_skills）。symlink_metadata
+            // 只读链接自身信息（不跟随），file_type().is_dir() 判断符号链接
+            // 指向的目标类型（不实际解析），安全且快速。
+            let is_dir = std::fs::symlink_metadata(&path)
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false);
+            if !is_dir {
                 continue;
             }
-            match SkillDirectory::load(&path) {
-                Ok(skill_dir) => {
-                    let skill = skill_dir.skill();
-                    let dmi = parse_disable_model_invocation(&path);
-                    let allowed_tools = skill
-                        .frontmatter()
-                        .allowed_tools()
-                        .map(|at| at.as_slice().to_vec());
-                    let license = skill.frontmatter().license().map(String::from);
-                    let compatibility = skill
-                        .frontmatter()
-                        .compatibility()
-                        .map(|c| c.as_str().to_string());
-                    out.push(SkillRecord {
-                        name: skill.name().as_str().to_string(),
-                        description: skill.description().as_str().to_string(),
-                        source,
-                        dir_path: path,
-                        doc_id: None, // 延迟到 ensure_skill_documented
-                        resource_doc_paths: None, // 延迟到 ensure_skill_documented
-                        disable_model_invocation: dmi,
-                        allowed_tools,
-                        license,
-                        compatibility,
-                    });
-                }
+            let load_t = std::time::Instant::now();
+            // 不用 SkillDirectory::load（其内部 fs 调用不可观测，Windows 卡死时
+            // 日志只能停在“before load”，无法定位具体哪一步阻塞）。改为等效实现，
+            // 每个 fs 调用都打计时日志：metadata → read → parse，哪步卡一眼可见。
+            // 语义与 SkillDirectory::load 完全一致（含 name == 目录名校验）。
+            let skill_md = path.join("SKILL.md");
+            tracing::info!(subdir = %path.display(), "scan_dir: before load");
+            let meta_t = Instant::now();
+            let md = std::fs::symlink_metadata(&skill_md);
+            let md_is_file = md.as_ref().map(|m| m.is_file()).unwrap_or(false);
+            tracing::info!(
+                subdir = %path.display(),
+                skil_md_exists = md.is_ok(),
+                is_file = md_is_file,
+                elapsed_ms = meta_t.elapsed().as_millis() as u64,
+                "scan_dir: SKILL.md metadata"
+            );
+            if !md_is_file {
+                tracing::info!(subdir = %path.display(), "scan_dir: no SKILL.md, skipping");
+                continue;
+            }
+            let read_t = Instant::now();
+            let raw = match std::fs::read_to_string(&skill_md) {
+                Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!(
-                        dir = %path.display(),
-                        error = ?e,
-                        "skill load failed, skipping"
+                    tracing::info!(
+                        subdir = %path.display(),
+                        error = %e,
+                        elapsed_ms = read_t.elapsed().as_millis() as u64,
+                        "scan_dir: SKILL.md read failed, skipping"
                     );
+                    continue;
                 }
+            };
+            // CRLF → LF 归一化：绕开 agent-skills 0.2 `find_closing_delimiter` 的
+            // CRLF bug（其用 `lines()` 迭代 + `line.len()+1` 累计字节偏移，
+            // `lines()` 会剩掉 `\r`，导致偏移落入多字节字符中间，
+            // `&content[..pos]` 在 char boundary 内切片 → panic。
+            // Windows 安装包里的 SKILL.md 若是 CRLF 行尾必中招；mac LF 不触发）。
+            let content = raw.replace("\r\n", "\n");
+            tracing::info!(
+                subdir = %path.display(),
+                bytes = content.len(),
+                elapsed_ms = read_t.elapsed().as_millis() as u64,
+                "scan_dir: SKILL.md read ok"
+            );
+            let skill = match Skill::parse(&content) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::info!(
+                        subdir = %path.display(),
+                        error = ?e,
+                        "scan_dir: SKILL.md parse failed, skipping"
+                    );
+                    continue;
+                }
+            };
+            // name 与目录名一致性（原 SkillDirectory::load 同款校验）
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if skill.name().as_str() != dir_name {
+                tracing::info!(
+                    subdir = %path.display(),
+                    dir_name,
+                    skill_name = skill.name().as_str(),
+                    "scan_dir: name mismatch dir vs frontmatter, skipping"
+                );
+                continue;
+            }
+            {
+                tracing::info!(
+                    subdir = %path.display(),
+                    name = %skill.name().as_str(),
+                    elapsed_ms = load_t.elapsed().as_millis() as u64,
+                    "scan_dir: load ok"
+                );
+                let dmi = parse_disable_model_invocation(&path);
+                let allowed_tools = skill
+                    .frontmatter()
+                    .allowed_tools()
+                    .map(|at| at.as_slice().to_vec());
+                let license = skill.frontmatter().license().map(String::from);
+                let compatibility = skill
+                    .frontmatter()
+                    .compatibility()
+                    .map(|c| c.as_str().to_string());
+                out.push(SkillRecord {
+                    name: skill.name().as_str().to_string(),
+                    description: skill.description().as_str().to_string(),
+                    source,
+                    dir_path: path,
+                    doc_id: None,
+                    resource_doc_paths: None,
+                    disable_model_invocation: dmi,
+                    allowed_tools,
+                    license,
+                    compatibility,
+                });
             }
         }
+        tracing::info!(
+            dir = %dir.display(),
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "scan_dir: done"
+        );
     }
 
     /// 把 skill body + references/assets/scripts 三个规范子目录下所有文本文件
@@ -192,9 +338,12 @@ impl SkillManager {
         if let Some(id) = &record.doc_id {
             return Ok(id.clone());
         }
-        let skill_dir =
-            SkillDirectory::load(&record.dir_path).map_err(|e| SkillError::Load(e.to_string()))?;
-        let body = skill_dir.skill().body();
+        let raw = std::fs::read_to_string(record.dir_path.join("SKILL.md"))
+            .map_err(|e| SkillError::Load(e.to_string()))?;
+        // CRLF→LF 归一化，绕开 agent-skills 0.2 find_closing_delimiter 的 CRLF panic
+        let content = raw.replace("\r\n", "\n");
+        let skill = Skill::parse(&content).map_err(|e| SkillError::Load(e.to_string()))?;
+        let body = skill.body();
 
         // skill body 放在 /Skills/<name>/ 下，避免平铺到知识库根目录干扰用户浏览
         let folder = format!("/Skills/{}", record.name);
@@ -216,7 +365,7 @@ impl SkillManager {
         // 失败仅 warn（单个资源入库失败不应阻断整个 skill 加载）。
         let mut res_paths: Vec<String> = Vec::new();
         for subdir in SkillSubdir::all() {
-            for res_file in scan_subdir_files(&skill_dir, *subdir) {
+            for res_file in scan_subdir_files(&record.dir_path, *subdir) {
                 let filename = match res_file.file_name().and_then(|n| n.to_str()) {
                     Some(n) => n.to_string(),
                     None => continue,
@@ -373,6 +522,32 @@ mod tests {
         assert!(names.contains(&"a-skill".to_string()));
         assert!(names.contains(&"b-skill".to_string()));
         assert_eq!(all.len(), 2);
+    }
+
+    /// Windows 回归：SKILL.md 为 CRLF 行尾时，agent-skills 0.2 的
+    /// `find_closing_delimiter` 用 `lines()` 迭代 + `line.len()+1` 累计字节偏移，
+    /// `lines()` 会剩掉 `\r` → 偏移落入多字节字符中间 → 切片 panic。我们读后
+    /// 先 `\r\n`→`\n` 归一化绕开。此测试用 CRLF + 中文（多字节）复现。
+    #[test]
+    fn discover_all_handles_crlf_skill_md_with_multibyte_chars() {
+        let root = temp_root();
+        let builtin = root.join("builtin");
+        let skill_dir = builtin.join("crlf-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // CRLF 行尾 + 多字节字符（中文）在前言体里
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\r\nname: crlf-skill\r\ndescription: 中文版测试技能\r\n---\r\n# 正文中文\r\n",
+        )
+        .unwrap();
+        let mgr = make_manager(builtin, std::path::PathBuf::from("/nonexistent"));
+
+        // 不应 panic；应正常发现并解析
+        let all = mgr.discover_all();
+        let found = all.iter().find(|r| r.name == "crlf-skill");
+        assert!(found.is_some(), "CRLF SKILL.md 应被正常解析发现");
+        let r = found.unwrap();
+        assert_eq!(r.description, "中文版测试技能");
     }
 
     #[test]

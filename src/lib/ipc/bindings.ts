@@ -223,6 +223,9 @@ export const commands = {
 	 *  列出全部已发现的 skill，合并激活状态。
 	 * 
 	 *  `conversation_id` 为 None 时只返回全局状态（conversation_enabled 全 None）。
+	 * 
+	 *  扫盘是同步磁盘 IO，放 spawn_blocking 避免阻塞 async runtime；外加超时
+	 *  兑底（SkillManager 内部有 single-flight + 60s TTL 缓存，正常路径秒回）。
 	 */
 	listSkills: (conversationId: string | null) => typedError<SkillDto[], AppError>(__TAURI_INVOKE("list_skills", { conversationId })),
 	/**  导入本地 skill 目录（复制到 ~/.onto-studio/skills/<name>/）。 */
@@ -315,7 +318,7 @@ export type ActiveScopeDto = {
 	ontologies: string[],
 };
 
-export type AppError = { kind: "Ingest"; message: string } | { kind: "Agent"; message: string } | { kind: "Memory"; message: string } | { kind: "Provider"; message: string } | { kind: "Federation"; message: string } | { kind: "Ontology"; message: string } | 
+export type AppError = { kind: "Ingest"; message: string } | { kind: "Agent"; message: string } | { kind: "Memory"; message: string } | { kind: "Provider"; message: string } | { kind: "Federation"; message: string } | { kind: "Ontology"; message: string } | { kind: "Skill"; message: string } | { kind: "SkillScanTimeout"; message: string } | 
 /**  用户主动中断（§15 状态机 Cancelled）——前端静默处理 */
 { kind: "Cancelled" };
 

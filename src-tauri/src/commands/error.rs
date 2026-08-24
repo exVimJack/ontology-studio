@@ -27,6 +27,12 @@ pub enum AppError {
     #[error("ontology: {0}")]
     Ontology(String),
 
+    #[error("skill: {0}")]
+    Skill(String),
+
+    #[error("skill-scan-timeout: {0}")]
+    SkillScanTimeout(String),
+
     /// 用户主动中断（§15 状态机 Cancelled）——前端静默处理
     #[error("cancelled")]
     Cancelled,

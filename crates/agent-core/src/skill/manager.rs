@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use agent_skills::{Skill, SkillDirectory};
+use agent_skills::Skill;
 
 use super::builtin::parse_disable_model_invocation;
 use super::{
@@ -229,7 +229,7 @@ impl SkillManager {
                 continue;
             }
             let read_t = Instant::now();
-            let content = match std::fs::read_to_string(&skill_md) {
+            let raw = match std::fs::read_to_string(&skill_md) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::info!(
@@ -241,6 +241,12 @@ impl SkillManager {
                     continue;
                 }
             };
+            // CRLF → LF 归一化：绕开 agent-skills 0.2 `find_closing_delimiter` 的
+            // CRLF bug（其用 `lines()` 迭代 + `line.len()+1` 累计字节偏移，
+            // `lines()` 会剩掉 `\r`，导致偏移落入多字节字符中间，
+            // `&content[..pos]` 在 char boundary 内切片 → panic。
+            // Windows 安装包里的 SKILL.md 若是 CRLF 行尾必中招；mac LF 不触发）。
+            let content = raw.replace("\r\n", "\n");
             tracing::info!(
                 subdir = %path.display(),
                 bytes = content.len(),
@@ -332,9 +338,12 @@ impl SkillManager {
         if let Some(id) = &record.doc_id {
             return Ok(id.clone());
         }
-        let skill_dir =
-            SkillDirectory::load(&record.dir_path).map_err(|e| SkillError::Load(e.to_string()))?;
-        let body = skill_dir.skill().body();
+        let raw = std::fs::read_to_string(record.dir_path.join("SKILL.md"))
+            .map_err(|e| SkillError::Load(e.to_string()))?;
+        // CRLF→LF 归一化，绕开 agent-skills 0.2 find_closing_delimiter 的 CRLF panic
+        let content = raw.replace("\r\n", "\n");
+        let skill = Skill::parse(&content).map_err(|e| SkillError::Load(e.to_string()))?;
+        let body = skill.body();
 
         // skill body 放在 /Skills/<name>/ 下，避免平铺到知识库根目录干扰用户浏览
         let folder = format!("/Skills/{}", record.name);
@@ -356,7 +365,7 @@ impl SkillManager {
         // 失败仅 warn（单个资源入库失败不应阻断整个 skill 加载）。
         let mut res_paths: Vec<String> = Vec::new();
         for subdir in SkillSubdir::all() {
-            for res_file in scan_subdir_files(&skill_dir, *subdir) {
+            for res_file in scan_subdir_files(&record.dir_path, *subdir) {
                 let filename = match res_file.file_name().and_then(|n| n.to_str()) {
                     Some(n) => n.to_string(),
                     None => continue,
@@ -513,6 +522,32 @@ mod tests {
         assert!(names.contains(&"a-skill".to_string()));
         assert!(names.contains(&"b-skill".to_string()));
         assert_eq!(all.len(), 2);
+    }
+
+    /// Windows 回归：SKILL.md 为 CRLF 行尾时，agent-skills 0.2 的
+    /// `find_closing_delimiter` 用 `lines()` 迭代 + `line.len()+1` 累计字节偏移，
+    /// `lines()` 会剩掉 `\r` → 偏移落入多字节字符中间 → 切片 panic。我们读后
+    /// 先 `\r\n`→`\n` 归一化绕开。此测试用 CRLF + 中文（多字节）复现。
+    #[test]
+    fn discover_all_handles_crlf_skill_md_with_multibyte_chars() {
+        let root = temp_root();
+        let builtin = root.join("builtin");
+        let skill_dir = builtin.join("crlf-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // CRLF 行尾 + 多字节字符（中文）在前言体里
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\r\nname: crlf-skill\r\ndescription: 中文版测试技能\r\n---\r\n# 正文中文\r\n",
+        )
+        .unwrap();
+        let mgr = make_manager(builtin, std::path::PathBuf::from("/nonexistent"));
+
+        // 不应 panic；应正常发现并解析
+        let all = mgr.discover_all();
+        let found = all.iter().find(|r| r.name == "crlf-skill");
+        assert!(found.is_some(), "CRLF SKILL.md 应被正常解析发现");
+        let r = found.unwrap();
+        assert_eq!(r.description, "中文版测试技能");
     }
 
     #[test]

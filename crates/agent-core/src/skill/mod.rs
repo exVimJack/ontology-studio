@@ -189,18 +189,22 @@ pub(super) fn is_text_resource(path: &Path) -> bool {
 /// 扫描 skill 目录下某个规范子目录，返回所有可入库的文本文件路径
 /// （按文件名排序，保证 discover 顺序稳定）。目录不存在或无匹配文件返回空。
 ///
-/// 复用 `agent_skills::SkillDirectory` 的枚举 API（scripts()/references()/assets()），
-/// 避免手写 read_dir 与规范目录名脱节。
+/// 直接用 read_dir 扫规范子目录名（references/assets/scripts），不再依赖
+/// `agent_skills::SkillDirectory` 的枚举 API——后者只能经会 panic 的
+/// `SkillDirectory::load` 构造（CRLF frontmatter bug）。独立扫描更鲁棒。
 pub(super) fn scan_subdir_files(
-    skill_dir: &agent_skills::SkillDirectory,
+    skill_dir: &Path,
     subdir: SkillSubdir,
 ) -> Vec<PathBuf> {
-    let mut files = match subdir {
-        SkillSubdir::References => skill_dir.references().unwrap_or_default(),
-        SkillSubdir::Assets => skill_dir.assets().unwrap_or_default(),
-        SkillSubdir::Scripts => skill_dir.scripts().unwrap_or_default(),
+    let subdir_path = skill_dir.join(subdir.dir_name());
+    let Ok(entries) = std::fs::read_dir(&subdir_path) else {
+        return Vec::new();
     };
-    files.retain(|p| p.is_file() && is_text_resource(p));
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && is_text_resource(p))
+        .collect();
     files.sort();
     files
 }

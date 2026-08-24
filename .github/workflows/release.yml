@@ -181,6 +181,7 @@ jobs:
             gh release create "$TAG" \
               --repo "$REPO" \
               --title "$TAG" \
+              --draft=false \
               --notes "Ontology Studio $TAG
 
           ## 下载
@@ -199,7 +200,9 @@ jobs:
           echo "✅ GitHub Release $TAG 发布完成"
 
       # ── 创建/更新 GitCode Release ──
+      # 同上，GitCode API 偶发 502，不阻塞发版。
       - name: Create or Update GitCode Release
+        continue-on-error: true
         id: gc_release
         env:
           TOKEN: ${{ secrets.GITCODE_TOKEN }}
@@ -245,7 +248,11 @@ jobs:
           fi
 
       # ── 上传安装包到 GitCode Release（两步式预签名 OSS 直传） ──
+      # GitCode 是国内镜像，其 OSS 直传偶发 502 Bad Gateway（70MB 大文件尤甚）。
+      # 这是外部服务故障，不应阻塞发版——GitHub Release（主分发渠道）已发布
+      # 即算发版成功。GitCode 失败仅警告，下次 push tag 可重试补传。
       - name: Upload assets to GitCode Release
+        continue-on-error: true
         env:
           TOKEN: ${{ secrets.GITCODE_TOKEN }}
           REPO: ${{ env.GITCODE_REPO }}
@@ -329,7 +336,16 @@ jobs:
           echo "🎉 全部上传完成"
 
       - name: Summary
+        if: always()
+        env:
+          GC_RESULT: ${{ steps.gc_release.outcome }}
+          TAG: ${{ github.ref_name }}
         run: |
-          echo "### Release ${{ github.ref_name }} 已发布到 GitCode" >> $GITHUB_STEP_SUMMARY
+          echo "### Release $TAG 发版结果" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "下载页：https://gitcode.com/${{ env.GITCODE_REPO }}/releases/${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "✅ GitHub Release（主下载渠道）：https://github.com/${{ github.repository }}/releases/tag/$TAG" >> $GITHUB_STEP_SUMMARY
+          if [ "$GC_RESULT" = "success" ]; then
+            echo "✅ GitCode 镜像：https://gitcode.com/${{ env.GITCODE_REPO }}/releases/$TAG" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ GitCode 镜像同步失败（$GC_RESULT），国内用户可走 GitHub Release 或后续重试补传" >> $GITHUB_STEP_SUMMARY
+          fi

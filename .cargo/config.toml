@@ -14,6 +14,10 @@ target-dir = "target"
 # Rust release 产物体积大（含 Tauri/pdfium/datafusion），MSVC link.exe 链接
 # 阶段极慢；rust-lld 随 Rust toolchain 发布（需 llvm-tools 组件），大产物
 # 链接提速 2-3×。仅 Windows target 生效，macOS/Linux 不受影响。
+#
+# 注意：`linker-flavor` 不是 [target.<triple>] 下的合法字段（Cargo Book 只允许
+# linker/runner/rustflags/rustdocflags），直接写会报 "expected a table, but
+# found a string"。rustc 能从 `rust-lld` 这个名字 + target 的 is_like_windows
+# 推断出 Msvc(Lld) flavor（见 rust PR #128656），故只需设 linker 即可。
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld"
-linker-flavor = "lld-link"

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use agent_skills::SkillDirectory;
+use agent_skills::{Skill, SkillDirectory};
 
 use super::builtin::parse_disable_model_invocation;
 use super::{
@@ -32,6 +32,10 @@ pub struct SkillManager {
     /// discover_all 结果缓存：(写入时刻, 已去重的 SkillRecord 列表)。
     /// None = 缓存空（首次或已 invalidate）。Mutex 临界区极短（仅取/存 Vec）。
     discover_cache: Mutex<Option<(Instant, Vec<SkillRecord>)>>,
+    /// 扫盘 single-flight 锁：并发 discover_all 只允许一个真正扫盘，
+    /// 其余等它完成后直接读缓存。避免多个 list_skills 并发重复扫盘
+    /// （Windows 上重复触发 Defender/同步软件的实时扫描，加剧 IO 阻塞）。
+    scan_lock: Mutex<()>,
 }
 
 impl SkillManager {
@@ -48,6 +52,7 @@ impl SkillManager {
             user_dir,
             external_dirs,
             discover_cache: Mutex::new(None),
+            scan_lock: Mutex::new(()),
         }
     }
 
@@ -66,7 +71,20 @@ impl SkillManager {
     /// `active_skill_doc_paths` 复用同一缓存，单次发消息不再扫描两遍磁盘。
     /// 缓存返回的是 clone（SkillRecord 含 String/PathBuf，量小可接受）。
     pub fn discover_all(&self) -> Vec<SkillRecord> {
-        // 先查缓存（命中且未过期直接返回 clone）
+        // fast path：先查缓存（命中且未过期直接返回 clone）
+        if let Ok(cache) = self.discover_cache.lock() {
+            if let Some((written_at, records)) = cache.as_ref() {
+                if written_at.elapsed().as_secs() < DISCOVER_CACHE_TTL_SECS {
+                    return records.clone();
+                }
+            }
+        }
+        // single-flight：持锁扫盘，并发调用在此排队。持锁期间再次 double-check
+        // 缓存（第一个扫描者可能已完成并填入）。
+        let _guard = self
+            .scan_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if let Ok(cache) = self.discover_cache.lock() {
             if let Some((written_at, records)) = cache.as_ref() {
                 if written_at.elapsed().as_secs() < DISCOVER_CACHE_TTL_SECS {
@@ -190,47 +208,96 @@ impl SkillManager {
                 continue;
             }
             let load_t = std::time::Instant::now();
-            tracing::info!(subdir = %path.display(), "scan_dir: before SkillDirectory::load");
-            match SkillDirectory::load(&path) {
-                Ok(skill_dir) => {
-                    let skill = skill_dir.skill();
+            // 不用 SkillDirectory::load（其内部 fs 调用不可观测，Windows 卡死时
+            // 日志只能停在“before load”，无法定位具体哪一步阻塞）。改为等效实现，
+            // 每个 fs 调用都打计时日志：metadata → read → parse，哪步卡一眼可见。
+            // 语义与 SkillDirectory::load 完全一致（含 name == 目录名校验）。
+            let skill_md = path.join("SKILL.md");
+            tracing::info!(subdir = %path.display(), "scan_dir: before load");
+            let meta_t = Instant::now();
+            let md = std::fs::symlink_metadata(&skill_md);
+            let md_is_file = md.as_ref().map(|m| m.is_file()).unwrap_or(false);
+            tracing::info!(
+                subdir = %path.display(),
+                skil_md_exists = md.is_ok(),
+                is_file = md_is_file,
+                elapsed_ms = meta_t.elapsed().as_millis() as u64,
+                "scan_dir: SKILL.md metadata"
+            );
+            if !md_is_file {
+                tracing::info!(subdir = %path.display(), "scan_dir: no SKILL.md, skipping");
+                continue;
+            }
+            let read_t = Instant::now();
+            let content = match std::fs::read_to_string(&skill_md) {
+                Ok(c) => c,
+                Err(e) => {
                     tracing::info!(
                         subdir = %path.display(),
-                        name = %skill.name().as_str(),
-                        elapsed_ms = load_t.elapsed().as_millis() as u64,
-                        "scan_dir: load ok"
+                        error = %e,
+                        elapsed_ms = read_t.elapsed().as_millis() as u64,
+                        "scan_dir: SKILL.md read failed, skipping"
                     );
-                    let dmi = parse_disable_model_invocation(&path);
-                    let allowed_tools = skill
-                        .frontmatter()
-                        .allowed_tools()
-                        .map(|at| at.as_slice().to_vec());
-                    let license = skill.frontmatter().license().map(String::from);
-                    let compatibility = skill
-                        .frontmatter()
-                        .compatibility()
-                        .map(|c| c.as_str().to_string());
-                    out.push(SkillRecord {
-                        name: skill.name().as_str().to_string(),
-                        description: skill.description().as_str().to_string(),
-                        source,
-                        dir_path: path,
-                        doc_id: None,
-                        resource_doc_paths: None,
-                        disable_model_invocation: dmi,
-                        allowed_tools,
-                        license,
-                        compatibility,
-                    });
+                    continue;
                 }
+            };
+            tracing::info!(
+                subdir = %path.display(),
+                bytes = content.len(),
+                elapsed_ms = read_t.elapsed().as_millis() as u64,
+                "scan_dir: SKILL.md read ok"
+            );
+            let skill = match Skill::parse(&content) {
+                Ok(s) => s,
                 Err(e) => {
                     tracing::info!(
                         subdir = %path.display(),
                         error = ?e,
-                        elapsed_ms = load_t.elapsed().as_millis() as u64,
-                        "scan_dir: load failed, skipping"
+                        "scan_dir: SKILL.md parse failed, skipping"
                     );
+                    continue;
                 }
+            };
+            // name 与目录名一致性（原 SkillDirectory::load 同款校验）
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if skill.name().as_str() != dir_name {
+                tracing::info!(
+                    subdir = %path.display(),
+                    dir_name,
+                    skill_name = skill.name().as_str(),
+                    "scan_dir: name mismatch dir vs frontmatter, skipping"
+                );
+                continue;
+            }
+            {
+                tracing::info!(
+                    subdir = %path.display(),
+                    name = %skill.name().as_str(),
+                    elapsed_ms = load_t.elapsed().as_millis() as u64,
+                    "scan_dir: load ok"
+                );
+                let dmi = parse_disable_model_invocation(&path);
+                let allowed_tools = skill
+                    .frontmatter()
+                    .allowed_tools()
+                    .map(|at| at.as_slice().to_vec());
+                let license = skill.frontmatter().license().map(String::from);
+                let compatibility = skill
+                    .frontmatter()
+                    .compatibility()
+                    .map(|c| c.as_str().to_string());
+                out.push(SkillRecord {
+                    name: skill.name().as_str().to_string(),
+                    description: skill.description().as_str().to_string(),
+                    source,
+                    dir_path: path,
+                    doc_id: None,
+                    resource_doc_paths: None,
+                    disable_model_invocation: dmi,
+                    allowed_tools,
+                    license,
+                    compatibility,
+                });
             }
         }
         tracing::info!(

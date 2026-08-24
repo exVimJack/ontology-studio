@@ -29,9 +29,16 @@ pub struct SkillDto {
     pub globally_disabled: bool,
 }
 
+/// 技能扫描超时（秒）。磁盘 IO 在 Windows 上可能被杀毒/同步软件长时间阻塞，
+/// 超时后返回明确错误（前端展示重试），不再永久挂起。
+const SKILL_SCAN_TIMEOUT_SECS: u64 = 15;
+
 /// 列出全部已发现的 skill，合并激活状态。
 ///
 /// `conversation_id` 为 None 时只返回全局状态（conversation_enabled 全 None）。
+///
+/// 扫盘是同步磁盘 IO，放 spawn_blocking 避免阻塞 async runtime；外加超时
+/// 兑底（SkillManager 内部有 single-flight + 60s TTL 缓存，正常路径秒回）。
 #[tauri::command]
 #[specta::specta]
 pub async fn list_skills(
@@ -43,8 +50,23 @@ pub async fn list_skills(
         conversation_id = ?conversation_id,
         "list_skills invoked"
     );
+    let mgr = std::sync::Arc::clone(&state.skill_manager);
+    let records = tokio::time::timeout(
+        std::time::Duration::from_secs(SKILL_SCAN_TIMEOUT_SECS),
+        tauri::async_runtime::spawn_blocking(move || mgr.discover_all()),
+    )
+    .await
+    .map_err(|_| {
+        tracing::error!(
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "list_skills: skill scan timed out"
+        );
+        AppError::SkillScanTimeout(format!(
+            "技能扫描超时（{SKILL_SCAN_TIMEOUT_SECS}s），可能被杀毒/同步软件阻塞，请重试"
+        ))
+    })?
+    .map_err(|e| AppError::Skill(format!("skill scan join error: {e}")))?;
     let mgr = &state.skill_manager;
-    let records = mgr.discover_all();
     let disabled: std::collections::HashSet<String> = mgr.memory()
         .list_disabled_skills()
         .map_err(|e| AppError::Memory(e.to_string()))?

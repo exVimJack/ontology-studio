@@ -59,7 +59,13 @@ const FILTER_TABS: { key: FilterTab; label: string }[] = [
 
 export function SkillView() {
   const setSkillsOpen = useUiStore((s) => s.setSkillsOpen);
-  const { data: skills = [], isLoading, refetch } = useSkillsGlobal();
+  const {
+    data: skills = [],
+    isLoading,
+    isError,
+    error,
+    refetch,
+  } = useSkillsGlobal();
   const importDir = useImportSkillFromDir();
   const importZip = useImportSkillFromZip();
   const uninstall = useUninstallSkill();
@@ -226,6 +232,18 @@ export function SkillView() {
         {isLoading ? (
           <div className="flex items-center justify-center gap-1.5 py-12 text-sm text-fg-subtle">
             <Loader2 size={16} className="animate-spin" /> 加载中…
+          </div>
+        ) : isError ? (
+          <div className="flex flex-col items-center justify-center gap-2 py-12 text-center">
+            <Sparkles size={32} className="text-fg-subtle" />
+            <p className="text-sm text-fg-muted">技能加载失败</p>
+            <p className="max-w-md text-xs text-fg-subtle">{String(error)}</p>
+            <button
+              onClick={() => refetch()}
+              className="mt-2 rounded-md border border-border px-3 py-1 text-xs hover:bg-bg-hover"
+            >
+              重试
+            </button>
           </div>
         ) : filtered.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-2 py-12 text-center">

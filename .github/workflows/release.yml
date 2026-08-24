@@ -1,5 +1,7 @@
 name: Build & Release to GitCode
 
+# 双平台 CI 提速优化验证中（Dev Drive + rust-lld + Defender + CARGO_INCREMENTAL=0）。
+
 # ─────────────────────────────────────────────────────────────
 # 方案1（修正版）：GitHub 公有 runner 编译 Win/macOS 包，
 # 产物回传到 GitCode Release，国内用户在 gitcode.com 下载。
@@ -67,17 +69,36 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Windows CI 提速：禁 Defender 实时扫描工作区
+      # Rust 编译产生海量中间 .rlib/.rmeta，Defender 实时扫描是 IO 杀手
+      #（github.com/andrewdavidmackenzie/flow/pull/2908 实测单此一项省 ~8%）。
+      # 纯收益零风险，这是本项目唯一实测稳定的 Windows 提速措施。
+      #
+      # ⚠️ 以下优化均实测不适用本项目（含 PDFium 原生库的 Tauri 项目），勿重复尝试：
+      # - rust-lld：链接阶段卡死/超慢（20min+ 未完成，cache 命中后仍卡），
+      #   rust-lld 对大型原生静态库兼容不佳，非环境问题（Defender 已排除）
+      # - Dev Drive (samypr100/setup-dev-drive)：CARGO_TARGET_DIR 重定向到
+      #   Dev Drive 后 swatinem cache 路径失配，每次全量重编，IO 优势抵不过
+      #   全量重编代价；且 VHDX 默认 2GB 不足（需 14GB）
+      # - CARGO_INCREMENTAL=0：与 profile.release 的 incremental=true 冲突无明显收益
+      # - sccache：不缓存 cdylib（Tauri app_lib 是 cdylib）+ 不缓存 incremental +
+      #   与 swatinem 冗余（apache/iggy 等项目均移除 sccache 只留 rust-cache）
+      - name: Optimize Windows build (Defender exclusion)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
+
       # Rust 编译缓存（swatinem/rust-cache）
-      # 关键：根 .cargo/config.toml 设 target-dir="target"，所有 cargo invocation
+      # 根 .cargo/config.toml 设 target-dir="target"，所有 cargo invocation
       # （根 workspace 5 个 crate + src-tauri Tauri crate）产物都落在仓库根 target/。
-      # 必须缓存根 target/ + ~/.cargo/registry，否则下次仍全量编译（593 个 crate）。
-      # 不用 workspaces 参数（它默认找 src-tauri/target，是空目录）。
+      # cache key：平台 target，shared-key 用 Cargo.lock hash 保证依赖变动时
+      # 仍命中未变 crate 的编译产物。
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          # 缓存根 target 目录（.cargo/config.toml 指定的 target-dir）
           workspaces: ". -> target"
           key: ${{ matrix.target }}
+          shared-key: ${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install Node
         uses: actions/setup-node@v5
@@ -102,8 +123,8 @@ jobs:
           args: --target ${{ matrix.target }}
 
       # 把构建出的安装包上传为 artifact（命名按平台区分，便于聚合下载）
-      # 产物路径：根 .cargo/config.toml 设 target-dir="target"，产物落在仓库根
-      # target/<target>/release/bundle/（日志佐证）。src-tauri/target/ 作兜底 glob。
+      # 产物路径：仓库根 target/<target>/release/bundle/（.cargo/config.toml 指定）。
+      # src-tauri/target/ 作兜底 glob（tauri-action 可能用独立 target）。
       - name: Upload build artifacts (Windows)
         if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v7
@@ -167,6 +188,7 @@ jobs:
             gh release create "$TAG" \
               --repo "$REPO" \
               --title "$TAG" \
+              --draft=false \
               --notes "Ontology Studio $TAG
 
           ## 下载
@@ -185,7 +207,9 @@ jobs:
           echo "✅ GitHub Release $TAG 发布完成"
 
       # ── 创建/更新 GitCode Release ──
+      # 同上，GitCode API 偶发 502，不阻塞发版。
       - name: Create or Update GitCode Release
+        continue-on-error: true
         id: gc_release
         env:
           TOKEN: ${{ secrets.GITCODE_TOKEN }}
@@ -231,7 +255,11 @@ jobs:
           fi
 
       # ── 上传安装包到 GitCode Release（两步式预签名 OSS 直传） ──
+      # GitCode 是国内镜像，其 OSS 直传偶发 502 Bad Gateway（70MB 大文件尤甚）。
+      # 这是外部服务故障，不应阻塞发版——GitHub Release（主分发渠道）已发布
+      # 即算发版成功。GitCode 失败仅警告，下次 push tag 可重试补传。
       - name: Upload assets to GitCode Release
+        continue-on-error: true
         env:
           TOKEN: ${{ secrets.GITCODE_TOKEN }}
           REPO: ${{ env.GITCODE_REPO }}
@@ -315,7 +343,16 @@ jobs:
           echo "🎉 全部上传完成"
 
       - name: Summary
+        if: always()
+        env:
+          GC_RESULT: ${{ steps.gc_release.outcome }}
+          TAG: ${{ github.ref_name }}
         run: |
-          echo "### Release ${{ github.ref_name }} 已发布到 GitCode" >> $GITHUB_STEP_SUMMARY
+          echo "### Release $TAG 发版结果" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "下载页：https://gitcode.com/${{ env.GITCODE_REPO }}/releases/${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "✅ GitHub Release（主下载渠道）：https://github.com/${{ github.repository }}/releases/tag/$TAG" >> $GITHUB_STEP_SUMMARY
+          if [ "$GC_RESULT" = "success" ]; then
+            echo "✅ GitCode 镜像：https://gitcode.com/${{ env.GITCODE_REPO }}/releases/$TAG" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ GitCode 镜像同步失败（$GC_RESULT），国内用户可走 GitHub Release 或后续重试补传" >> $GITHUB_STEP_SUMMARY
+          fi

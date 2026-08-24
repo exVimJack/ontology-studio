@@ -38,6 +38,11 @@ pub async fn list_skills(
     state: State<'_, AppState>,
     conversation_id: Option<String>,
 ) -> AppResult<Vec<SkillDto>> {
+    let t = std::time::Instant::now();
+    tracing::info!(
+        conversation_id = ?conversation_id,
+        "list_skills invoked"
+    );
     let mgr = &state.skill_manager;
     let records = mgr.discover_all();
     let disabled: std::collections::HashSet<String> = mgr.memory()
@@ -69,6 +74,11 @@ pub async fn list_skills(
             globally_disabled,
         });
     }
+    tracing::info!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        count = out.len(),
+        "list_skills done"
+    );
     Ok(out)
 }
 

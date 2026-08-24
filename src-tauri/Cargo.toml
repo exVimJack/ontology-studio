@@ -50,6 +50,9 @@ tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 文件日志 appender（prod 往 app_data_dir/logs/ 写，按天滚动）。
+# tracing 官方配套 crate，MIT/Apache-2.0，符合原则 3。
+tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 futures-util = "0.3"
 # ── 目录解析（skill 系统决策 20：~/.onto-studio/skills/ 等） ──

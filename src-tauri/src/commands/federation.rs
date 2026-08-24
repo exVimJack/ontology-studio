@@ -38,8 +38,16 @@ pub async fn register_data_source(
     config: DataSourceConfig,
     state: State<'_, AppState>,
 ) -> AppResult<DataSourceSummary> {
+    let t = std::time::Instant::now();
+    let kind = format!("{:?}", config.connection);
+    tracing::info!(name = %config.name, kind = %kind, "register_data_source invoked");
     let svc = get_svc(&state).await?;
-    Ok(svc.register(config).await?)
+    let r = svc.register(config).await;
+    match &r {
+        Ok(s) => tracing::info!(name = %s.name, tables = s.table_count, elapsed_ms = t.elapsed().as_millis() as u64, "register_data_source ok"),
+        Err(e) => tracing::warn!(error = %e, elapsed_ms = t.elapsed().as_millis() as u64, "register_data_source failed"),
+    }
+    Ok(r?)
 }
 
 /// 测试连接（临时注册探查后注销，不落库）。返回表结构快照。
@@ -117,8 +125,15 @@ pub async fn execute_federation_query(
     limit: Option<u32>,
     state: State<'_, AppState>,
 ) -> AppResult<QueryResult> {
+    let t = std::time::Instant::now();
+    tracing::info!(sql = %sql, limit = ?limit, "execute_federation_query invoked");
     let svc = get_svc(&state).await?;
-    Ok(federation::query::execute_query(svc.ctx(), &sql, limit.map(|n| n as usize)).await?)
+    let r = federation::query::execute_query(svc.ctx(), &sql, limit.map(|n| n as usize)).await;
+    match &r {
+        Ok(qr) => tracing::info!(rows = qr.rows.len(), cols = qr.columns.len(), elapsed_ms = t.elapsed().as_millis() as u64, "execute_federation_query ok"),
+        Err(e) => tracing::warn!(error = %e, sql = %sql, elapsed_ms = t.elapsed().as_millis() as u64, "execute_federation_query failed"),
+    }
+    Ok(r?)
 }
 
 /// EXPLAIN：生成执行计划摘要（调试/审计，本身只读）。

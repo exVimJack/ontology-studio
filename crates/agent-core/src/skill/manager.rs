@@ -93,14 +93,16 @@ impl SkillManager {
 
     /// 无缓存的扫描实现（discover_all 内部调，或测试直接调验证磁盘状态）。
     fn discover_all_uncached(&self) -> Vec<SkillRecord> {
+        let total_start = std::time::Instant::now();
         let mut records: Vec<SkillRecord> = Vec::new();
+
         // 1. 内置（resource_dir/skills/）
-        self.scan_dir(&self.builtin_dir, SkillSource::Builtin, &mut records);
+        self.scan_dir_timed(&self.builtin_dir, SkillSource::Builtin, &mut records);
         // 2. 用户导入（~/.onto-studio/skills/）
-        self.scan_dir(&self.user_dir, SkillSource::Imported, &mut records);
+        self.scan_dir_timed(&self.user_dir, SkillSource::Imported, &mut records);
         // 3. 跨客户端只读
         for dir in &self.external_dirs {
-            self.scan_dir(dir, SkillSource::ExternalReadOnly, &mut records);
+            self.scan_dir_timed(dir, SkillSource::ExternalReadOnly, &mut records);
         }
 
         // 去重：同名取高优先级 source
@@ -116,7 +118,39 @@ impl SkillManager {
                 }
             }
         }
-        deduped.into_values().collect()
+        let out: Vec<_> = deduped.into_values().collect();
+        tracing::info!(
+            total_ms = total_start.elapsed().as_millis() as u64,
+            found = out.len(),
+            names = ?out.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+            "discover_all_uncached done"
+        );
+        out
+    }
+
+    /// scan_dir 带耗时日志（定位「某目录扫描极慢」问题，如 Windows 上
+    /// `~/.pi/agent/skills` 含巨型 .venv 子目录）。
+    fn scan_dir_timed(&self, dir: &Path, source: SkillSource, out: &mut Vec<SkillRecord>) {
+        let t = std::time::Instant::now();
+        let before = out.len();
+        self.scan_dir(dir, source, out);
+        let added = out.len() - before;
+        let exists = dir.exists();
+        tracing::debug!(
+            dir = %dir.display(),
+            source = ?source,
+            exists,
+            added,
+            elapsed_ms = t.elapsed().as_millis() as u64,
+            "scan_dir"
+        );
+        if t.elapsed().as_millis() > 500 {
+            tracing::warn!(
+                dir = %dir.display(),
+                elapsed_ms = t.elapsed().as_millis() as u64,
+                "scan_dir slow (>500ms), this may cause skills window loading"
+            );
+        }
     }
 
     /// 扫描单个目录下的所有 skill 子目录，追加到 out。

@@ -84,10 +84,11 @@ jobs:
       #    必须在 Rust toolchain 安装前创建，让 CARGO_HOME 一开始在快盘。
       # 2. Defender 排除：排除 workspace + Dev Drive。Rust 编译产生海量 .rlib/.rmeta，
       #    Defender 实时扫描是 IO 杀手（flow PR #2908 实测省 ~8%）。
-      # 3. rust-lld：env var 方式（不用 .cargo/config.toml，避开 linker-flavor 字段解析报错）。
-      #    flow 实测配 Defender 后 rust-lld 再省 ~12%（组合 23m→18.4m）。
-      #    ⚠️ 首次切 rust-lld cache 会全失效（target/ 旧产物不兼容），需全量重编一次。
-      #    cache key 带 -lld 标记，rust-lld 与 link.exe 的 cache 互不污染。
+      #
+      # ⚠️ rust-lld 已移除：实测在含 PDFium 原生库的 Tauri 项目上，rust-lld
+      #    链接阶段卡死/超慢（20min+ Build Tauri 未完成，远超 link.exe 正常耗时）。
+      #    非环境问题（Defender 已排除），是 rust-lld 对大型原生静态库的兼容问题。
+      #    保留 link.exe，依赖 Dev Drive + Defender 提速 IO。
       - name: Setup Windows Dev Drive
         if: runner.os == 'Windows'
         uses: samypr100/setup-dev-drive@v4
@@ -103,7 +104,7 @@ jobs:
             TEMP,{{ DEV_DRIVE }}/Temp
             TMP,{{ DEV_DRIVE }}/Temp
 
-      - name: Optimize Windows build (Defender exclusion + rust-lld)
+      - name: Optimize Windows build (Defender exclusion)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -115,7 +116,6 @@ jobs:
             Write-Host "CARGO_HOME=$env:CARGO_HOME"
             Write-Host "CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR"
           }
-          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=rust-lld" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # ── macOS 提速：TEMP 重定向到 /tmp（APFS 已快，仅避免污染 home） ──
       # macOS 不配 rust-lld：Darwin target 用 lld 需 -Z unstable 选项，社区反馈
@@ -133,22 +133,21 @@ jobs:
       # Rust 编译缓存（swatinem/rust-cache）
       # Windows: CARGO_TARGET_DIR=Dev Drive/target（绝对路径，swatinem 需显式 workspaces）
       # macOS: 仓库根 target/（默认）
-      # cache key：平台 target + linker 标记（-lld 隔离 rust-lld 与 link.exe 产物），
-      # shared-key 用 Cargo.lock hash 保证依赖变动时仍命中未变 crate。
+      # cache key：平台 target，shared-key 用 Cargo.lock hash 保证依赖变动时仍命中。
       - name: Rust cache (Windows)
         if: runner.os == 'Windows'
         uses: swatinem/rust-cache@v2
         with:
           # CARGO_TARGET_DIR 被 Dev Drive 重定向到绝对路径，swatinem 需显式指定
           workspaces: ${{ env.CARGO_TARGET_DIR }}
-          key: ${{ matrix.target }}-lld
+          key: ${{ matrix.target }}
           shared-key: ${{ hashFiles('**/Cargo.lock') }}
 
       - name: Rust cache (macOS)
         if: runner.os == 'macOS'
         uses: swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}-lld
+          key: ${{ matrix.target }}
           shared-key: ${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install Node

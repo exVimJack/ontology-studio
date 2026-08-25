@@ -121,6 +121,11 @@ pub fn gen_bindings(path: &str) -> std::result::Result<(), String> {
         list_ontology_changelog,
         list_ontology_datasets, list_ontology_data_sources,
         get_ontology_charter, set_ontology_charter,
+        // 本体建模 W3C（Turtle，对齐 skill ontology-modeling-w3c）
+        list_ontology_ttl, export_ontology_ttl, validate_ontology_ttl, import_ontology_ttl,
+        delete_ontology_ttl, query_ontology_sparql,
+        get_ontology_ttl_charter, set_ontology_ttl_charter,
+        list_ontology_ttl_changelog, commit_ontology_ttl_change,
     };
     let builder = tauri_specta::Builder::<tauri::Wry>::new().commands(collect_commands![
         create_conversation,
@@ -186,6 +191,17 @@ pub fn gen_bindings(path: &str) -> std::result::Result<(), String> {
         list_ontology_data_sources,
         get_ontology_charter,
         set_ontology_charter,
+        // 本体建模 W3C（Turtle）
+        list_ontology_ttl,
+        export_ontology_ttl,
+        validate_ontology_ttl,
+        import_ontology_ttl,
+        delete_ontology_ttl,
+        query_ontology_sparql,
+        get_ontology_ttl_charter,
+        set_ontology_ttl_charter,
+        list_ontology_ttl_changelog,
+        commit_ontology_ttl_change,
     ]);
     // 时间戳等 i64 字段已由 memory::Timestamp 包装（specta 导出为 number），
     // 故用默认 Typescript 配置即可。
@@ -219,6 +235,11 @@ delete_ontology,
 list_ontology_changelog,
 list_ontology_datasets, list_ontology_data_sources,
 get_ontology_charter, set_ontology_charter,
+// 本体建模 W3C（Turtle，对齐 skill ontology-modeling-w3c）
+list_ontology_ttl, export_ontology_ttl, validate_ontology_ttl, import_ontology_ttl,
+delete_ontology_ttl, query_ontology_sparql,
+get_ontology_ttl_charter, set_ontology_ttl_charter,
+list_ontology_ttl_changelog, commit_ontology_ttl_change,
 };
     let builder = tauri_specta::Builder::<tauri::Wry>::new().commands(collect_commands![
         create_conversation,
@@ -284,6 +305,17 @@ get_ontology_charter, set_ontology_charter,
         list_ontology_data_sources,
         get_ontology_charter,
         set_ontology_charter,
+        // 本体建模 W3C（Turtle）
+        list_ontology_ttl,
+        export_ontology_ttl,
+        validate_ontology_ttl,
+        import_ontology_ttl,
+        delete_ontology_ttl,
+        query_ontology_sparql,
+        get_ontology_ttl_charter,
+        set_ontology_ttl_charter,
+        list_ontology_ttl_changelog,
+        commit_ontology_ttl_change,
     ]);
 
     // debug 模式下 dev 运行也刷新 bindings（CI/首次用 examples/gen_bindings）
@@ -335,6 +367,11 @@ get_ontology_charter, set_ontology_charter,
                 ontology_store::OntologyStore::open(&ontology_db_path)
             })?);
 
+            // open W3C Turtle store（ontology-modeling-w3c skill 闭环）。复用 ontology.db
+            // 文件——表族不冲突（OntologyStore 用 Gaia 表族，TtlStore 用 ontology_ttl 表），
+            // SQLite 多连接同文件在 WAL 模式下安全（两个 connection 独立 Mutex 串行化）。
+            let ttl_store = std::sync::Arc::new(ontology_store::TtlStore::open(&ontology_db_path)?);
+
             // Skill 系统初始化（决策 20）：解析各 skill 目录路径，构造 SkillManager。
             // builtin_dir 缺失时用空目录（manager 降级为空列表，不阻断启动）。
             let builtin_skills_dir = skill::builtin_dir(app.handle())
@@ -359,9 +396,7 @@ get_ontology_charter, set_ontology_charter,
                 )
             }));
 
-            let state = measure("create AppState", || {
-                AppState::new_with_memory(memory, ontology_store, skill_manager)
-            })?;
+            let state = AppState::new_with_memory(memory, ontology_store, ttl_store, skill_manager)?;
 
             // 本体落库变更通知（前端 query 失效用）：
             // 会话内 agent 工具（import_ontology）不经过 IPC 命令层，
@@ -375,7 +410,18 @@ get_ontology_charter, set_ontology_charter,
                             warn!(error = %e, "emit ontology-changed failed");
                         }
                     }));
-            };
+            }
+            // TtlStore 落库变更同样发 event（前端 query 失效，与 Palantir store 统一路径）。
+            {
+                let handle = app.handle().clone();
+                state
+                    .ttl_store
+                    .set_on_change(Box::new(move || {
+                        if let Err(e) = handle.emit("ontology-changed", ()) {
+                            tracing::warn!(error = %e, "emit ontology-changed (ttl) failed");
+                        }
+                    }));
+            }
             // 从 store 恢复 provider 配置
             if let Err(e) = restore_provider(app.handle(), &state) {
                 warn!(error = %e, "restore provider failed");

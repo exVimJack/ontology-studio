@@ -13,7 +13,9 @@ pub mod naming;
 pub mod payload;
 pub mod schema;
 pub mod store;
+pub mod ttl;
 
 pub use error::{StoreError, StoreResult};
 pub use payload::*;
 pub use store::OntologyStore;
+pub use ttl::{TtlChangelog, TtlCharter, TtlImportResult, TtlOntologySummary, TtlStore, TtlValidation};

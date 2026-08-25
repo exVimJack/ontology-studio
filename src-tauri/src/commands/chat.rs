@@ -296,32 +296,36 @@ pub async fn send_message(
                 buf.push_str(&format!("- id: {id}, name: {name}\n"));
             }
         }
-        // 本体引用（可用 describe_ontology 钻取 OT 目录，再 describe_object_type 看详情）
-        // 注脚附加 charter 摘要（业务本质 + 补充说明前 200 字）——让 AI 无需调工具
+        // 本体引用（混存两种：Palantir api_name 或 W3C 本体 IRI，二者不冲突）。
+        //  - W3C：IRI 含 `://`（如 https://...#Ont），用 export_ontology_ttl / query_ontology_sparql 钻取
+        //  - Palantir：PascalCase api_name，用 describe_ontology / describe_object_type 钻取
+        // 注脚附 charter 摘要（业务本质 + 补充说明前 200 字）——让 AI 无需调工具
         // 就知道本体是干什么的、有哪些红线（决策：本体不变点，向 AI 说明业务本质）。
         if !active_ontologies.is_empty() {
-            buf.push_str("\n[本体] 可用 describe_ontology 工具获取 OT 目录，describe_object_type 看单个 OT 详情，list_link_types/describe_link_type 看关系：\n");
+            let (mut ttl_refs, mut palantir_refs) = (Vec::new(), Vec::new());
             for ont in &active_ontologies {
-                buf.push_str(&format!("- {ont}\n"));
-                // 附 charter 摘要（不变点）：不随历史变化，是 AI 理解业务的基线。
-                if let Ok(charter) = state.ontology_store.get_charter(ont) {
-                    if !charter.business_essence.is_empty() {
-                        buf.push_str(&format!("  业务本质：{}\n", charter.business_essence));
+                if ont.contains("://") {
+                    ttl_refs.push(ont);
+                } else {
+                    palantir_refs.push(ont);
+                }
+            }
+            if !palantir_refs.is_empty() {
+                buf.push_str("\n[本体·平台私有] 可用 describe_ontology 工具获取 OT 目录，describe_object_type 看单个 OT 详情，list_link_types/describe_link_type 看关系：\n");
+                for ont in &palantir_refs {
+                    buf.push_str(&format!("- {ont}\n"));
+                    if let Ok(charter) = state.ontology_store.get_charter(ont) {
+                        append_charter_summary(&mut buf, &charter.business_essence, &charter.design_intent, &charter.invariants);
                     }
-                    if !charter.design_intent.is_empty() {
-                        buf.push_str(&format!("  设计意图：{}\n", charter.design_intent));
+                }
+            }
+            if !ttl_refs.is_empty() {
+                buf.push_str("\n[本体·W3C 标准] 可用 export_ontology_ttl(ontology_iri) 取 Turtle 全文，query_ontology_sparql(ontology_iri, sparql) 跑 SPARQL 查询（类/属性/规则/实例）：\n");
+                for iri in &ttl_refs {
+                    buf.push_str(&format!("- {iri}\n"));
+                    if let Ok(charter) = state.ttl_store.get_charter(iri) {
+                        append_charter_summary(&mut buf, &charter.business_essence, &charter.design_intent, &charter.invariants);
                     }
-                    if !charter.invariants.is_empty() {
-                        // 补充说明可能较长，截断到 200 字避免注脚膨胀
-                        let inv = if charter.invariants.chars().count() > 200 {
-                            let cut: String = charter.invariants.chars().take(200).collect();
-                            format!("{cut}…")
-                        } else {
-                            charter.invariants.clone()
-                        };
-                        buf.push_str(&format!("  业务约束：{inv}\n"));
-                    }
-                    // 全 charter 内容用 describe_ontology 工具获取（只读工具返回完整 charter）
                 }
             }
         }
@@ -659,6 +663,34 @@ pub async fn cancel_stream(
         tracing::warn!(message_id = %message_id, "cancel_stream: no active stream found");
     }
     Ok(())
+}
+
+/// 把本体设计宪章（不变点）摘要追加到 conversation-scope 注脚。
+///
+/// Palantir `OntologyCharter` 与 W3C `TtlCharter` 字段完全一致（业务场景/本质/
+/// 设计意图/补充说明），调用方取其四字段 String 传入即可，避免泛型/重复代码。
+/// 补充说明超过 200 字截断（避免注脚膨胀）。完整 charter 走只读工具获取。
+fn append_charter_summary(
+    buf: &mut String,
+    business_essence: &str,
+    design_intent: &str,
+    invariants: &str,
+) {
+    if !business_essence.is_empty() {
+        buf.push_str(&format!("  业务本质：{business_essence}\n"));
+    }
+    if !design_intent.is_empty() {
+        buf.push_str(&format!("  设计意图：{design_intent}\n"));
+    }
+    if !invariants.is_empty() {
+        let inv = if invariants.chars().count() > 200 {
+            let cut: String = invariants.chars().take(200).collect();
+            format!("{cut}…")
+        } else {
+            invariants.to_string()
+        };
+        buf.push_str(&format!("  业务约束：{inv}\n"));
+    }
 }
 
 

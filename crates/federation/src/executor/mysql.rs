@@ -279,7 +279,7 @@ async fn rows_to_batch(
             Vec::new()
         } else {
             // 所有行共享同一列信息（同一 query）
-            rows[0].columns().iter().cloned().collect::<Vec<_>>()
+            rows[0].columns().to_vec()
         }
     };
 

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use agent_core::{ChatService, McpManager, ToolServer, ToolServerHandle};
 use federation::FederationService;
 use memory::Memory;
-use ontology_store::OntologyStore;
+use ontology_store::{OntologyStore, TtlStore};
 use tokio::sync::{oneshot, RwLock};
 
 use crate::commands::error::AppResult;
@@ -47,6 +47,11 @@ pub struct AppState {
     /// 会话模式挂 5 个只读 drill-in 工具（不挂建模组），始终可用（无激活集过滤）。
     pub ontology_store: Arc<OntologyStore>,
 
+    /// W3C Turtle 本体存储（ontology-modeling-w3c skill 闭环）。setup hook 同步
+    /// open 后写入。挂 5 个工具（validate/import/export/list/query_sparql），
+    /// 与 Palantir 工具组共存——skill preamble 控制模型用哪组。始终可用。
+    pub ttl_store: Arc<TtlStore>,
+
     /// Skill 管理器（决策 20）。setup hook 构造后写入，始终存在（即使内置 skill
     /// 目录缺失也是空 manager）。命令通过 state.skill_manager 取用。
     pub skill_manager: Arc<agent_core::SkillManager>,
@@ -65,6 +70,7 @@ impl AppState {
     pub fn new_with_memory(
         memory: Arc<Memory>,
         ontology_store: Arc<OntologyStore>,
+        ttl_store: Arc<TtlStore>,
         skill_manager: Arc<agent_core::SkillManager>,
     ) -> AppResult<Self> {
         let tool_handle = ToolServer::new().run();
@@ -76,6 +82,7 @@ impl AppState {
             mcp: RwLock::new(None),
             federation: RwLock::new(None),
             ontology_store,
+            ttl_store,
             skill_manager,
             cancel_signals: std::sync::Mutex::new(HashMap::new()),
         })
@@ -86,6 +93,7 @@ impl AppState {
     pub fn in_memory() -> AppResult<Self> {
         let memory = Arc::new(Memory::open_in_memory()?);
         let ontology_store = Arc::new(OntologyStore::open_in_memory()?);
+        let ttl_store = Arc::new(TtlStore::open_in_memory()?);
         let tool_handle = ToolServer::new().run();
         let skill_manager = Arc::new(agent_core::SkillManager::new(
             std::sync::Arc::clone(&memory),
@@ -101,6 +109,7 @@ impl AppState {
             mcp: RwLock::new(None),
             federation: RwLock::new(None),
             ontology_store,
+            ttl_store,
             skill_manager,
             cancel_signals: std::sync::Mutex::new(HashMap::new()),
         })
@@ -116,7 +125,8 @@ impl AppState {
         if let Some(chat) = self.chat.write().await.as_mut() {
             chat.set_federation(svc_arc.clone());
             chat.set_ontology_store(self.ontology_store.clone());
-            tracing::info!("federation + ontology tools injected into ChatService (init_federation)");
+            chat.set_ttl_store(self.ttl_store.clone());
+            tracing::info!("federation + ontology + ttl tools injected into ChatService (init_federation)");
         }
         Ok(())
     }

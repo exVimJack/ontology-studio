@@ -29,6 +29,7 @@ import {
   Zap,
   Shield,
   Boxes,
+  Network,
 } from "lucide-react";
 import type {
   DocumentSummaryDto,
@@ -53,6 +54,7 @@ import {
   useSetActiveOntologies,
 } from "@/hooks/useActiveScope";
 import { useOntologies } from "@/hooks/useOntology";
+import { useOntologyTtls } from "@/hooks/useOntologyTtl";
 import { useFolders } from "@/hooks/useFolders";
 import { getFileIcon } from "@/lib/file-icons";
 import { isSkillActive } from "@/lib/domain";
@@ -72,6 +74,7 @@ interface MentionMenuProps {
  * - table：数据源表；选中 = 加 active_sources + 插 token
  * - skill：技能（决策 20）；选中 = 即时激活（写 conversation_skills.enabled=true） + 插 `@skillName` token
  * - ontology：本体（会话引用本体）；选中 = 加 active_ontologies + 插 `@OntologyApiName` token
+ * - ontology_ttl：W3C 本体（会话引用）；选中 = 加 active_ontologies（存完整 IRI） + 插 `@短名` token
  */
 type Candidate =
   | { kind: "folder"; path: string; name: string; hasChildren: boolean }
@@ -79,7 +82,8 @@ type Candidate =
   | { kind: "source"; name: string; hasTables: boolean }
   | { kind: "table"; sourceName: string; tableName: string }
   | { kind: "skill"; skill: SkillDto }
-  | { kind: "ontology"; ont: OntologySummary };
+  | { kind: "ontology"; ont: OntologySummary }
+  | { kind: "ontology_ttl"; iri: string; label: string };
 
 /** 选中后插入的 token。 */
 function candidateToken(c: Candidate): string {
@@ -96,6 +100,8 @@ function candidateToken(c: Candidate): string {
       return `@${c.skill.name}`;
     case "ontology":
       return `@${c.ont.api_name}`;
+    case "ontology_ttl":
+      return `@${c.label}`;
   }
 }
 
@@ -152,6 +158,7 @@ export function MentionMenu({
   const { data: mountedDocs = [] } = useMountedDocuments(conversationId);
   const { data: skills = [] } = useSkillsConversation(conversationId);
   const { data: ontologies = [] } = useOntologies();
+  const { data: ttlOntologies = [] } = useOntologyTtls();
   const mount = useMountDocument();
   const setSkillEnabled = useSetSkillConversationEnabled(conversationId);
   const { data: scope } = useActiveScope(conversationId);
@@ -249,6 +256,14 @@ export function MentionMenu({
       for (const o of ontologies) {
         list.push({ kind: "ontology", ont: o });
       }
+      // W3C 本体（会话引用：@短名，加 active_ontologies 存完整 IRI）
+      for (const t of ttlOntologies) {
+        list.push({
+          kind: "ontology_ttl",
+          iri: t.ontology_iri,
+          label: shortTtlIri(t.ontology_iri),
+        });
+      }
     } else if (nav.mode === "folder") {
       // 文件夹内：子文件夹 + 直接子文件
       for (const n of currentFolderChildren) {
@@ -289,7 +304,9 @@ export function MentionMenu({
                 ? c.skill.name
                 : c.kind === "ontology"
                   ? c.ont.api_name
-                  : c.tableName;
+                  : c.kind === "ontology_ttl"
+                    ? c.label
+                    : c.tableName;
       return name.toLowerCase().includes(term);
     });
   }, [
@@ -299,6 +316,7 @@ export function MentionMenu({
     allDocs,
     skills,
     ontologies,
+    ttlOntologies,
     schemaQueries,
     currentFolderChildren,
     folderPath,
@@ -375,6 +393,15 @@ export function MentionMenu({
         setActiveOntologies.mutate({
           conversationId,
           ontologies: [...current, c.ont.api_name],
+        });
+      }
+    } else if (c.kind === "ontology_ttl") {
+      // W3C 本体引用：active_ontologies 存完整 IRI（后端按 `://` 特征识别为 TTL）
+      const current = scope?.ontologies ?? [];
+      if (!current.includes(c.iri)) {
+        setActiveOntologies.mutate({
+          conversationId,
+          ontologies: [...current, c.iri],
         });
       }
     } else {
@@ -499,10 +526,12 @@ export function MentionMenu({
               : c.kind === "doc" && prevKind !== "doc"
                 ? { icon: FileText, label: "文件" }
                 : c.kind === "ontology" && prevKind !== "ontology"
-                  ? { icon: Boxes, label: "本体" }
-                  : c.kind === "skill" && prevKind !== "skill"
-                    ? { icon: Zap, label: "技能" }
-                    : null;
+                  ? { icon: Boxes, label: "本体（Palantir标准）" }
+                  : c.kind === "ontology_ttl" && prevKind !== "ontology_ttl"
+                    ? { icon: Network, label: "本体（W3C 标准）" }
+                    : c.kind === "skill" && prevKind !== "skill"
+                      ? { icon: Zap, label: "技能" }
+                      : null;
           return (
             <Fragment
               key={
@@ -516,7 +545,9 @@ export function MentionMenu({
                         ? `skl-${c.skill.source}-${c.skill.name}`
                         : c.kind === "ontology"
                           ? `ont-${c.ont.api_name}`
-                          : `tbl-${c.sourceName}-${c.tableName}`
+                          : c.kind === "ontology_ttl"
+                            ? `ontttl-${c.iri}`
+                            : `tbl-${c.sourceName}-${c.tableName}`
               }
             >
               {header && (
@@ -619,6 +650,27 @@ export function MentionMenu({
                     </div>
                   </>
                 )}
+                {c.kind === "ontology_ttl" && (
+                  <>
+                    <Network size={14} className="shrink-0 text-accent/70" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-1">
+                        <span className="truncate text-fg">{c.label}</span>
+                        {scope?.ontologies?.includes(c.iri) && (
+                          <span className="shrink-0 rounded bg-accent/10 px-1 text-[9px] text-accent">
+                            已引用
+                          </span>
+                        )}
+                      </div>
+                      <p
+                        className="truncate text-[10px] text-fg-subtle"
+                        title={c.iri}
+                      >
+                        {c.iri}
+                      </p>
+                    </div>
+                  </>
+                )}
                 {c.kind === "skill" && (
                   <>
                     <Zap size={14} className="shrink-0 text-amber-500" />
@@ -654,4 +706,12 @@ export function MentionMenu({
       )}
     </div>
   );
+}
+
+/** 从 W3C 本体 IRI 提取短名（# 或 / 后最后一段）。
+ *  用于 @ 挂载的 token 文本（位置标记，实际存完整 IRI 到 active_ontologies）。 */
+function shortTtlIri(iri: string): string {
+  const parts = iri.split(/[#/]/);
+  const local = parts.length > 1 ? parts[parts.length - 1] : "";
+  return local || iri;
 }

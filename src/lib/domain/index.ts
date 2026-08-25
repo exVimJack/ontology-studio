@@ -61,6 +61,11 @@ export type {
   OntologySummary,
   OntologyChangelog,
   OntologyCharter,
+  TtlOntologySummary,
+  TtlValidation,
+  TtlImportResult,
+  TtlCharter,
+  TtlChangelog,
 } from "@/lib/ipc/bindings";
 
 /**

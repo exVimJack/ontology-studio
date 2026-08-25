@@ -303,6 +303,29 @@ export const commands = {
 	 *  `updated_by` 为 "agent" | "user"。写后不触发 ontology-changed（charter 不影响实体定义）。
 	 */
 	setOntologyCharter: (ontologyApiName: string, charter: OntologyCharter) => typedError<null, AppError>(__TAURI_INVOKE("set_ontology_charter", { ontologyApiName, charter })),
+	/**  列出所有已存 W3C Turtle 本体（前端列表页用）。 */
+	listOntologyTtl: () => typedError<TtlOntologySummary[], AppError>(__TAURI_INVOKE("list_ontology_ttl")),
+	/**  导出指定本体 IRI 的 Turtle 文本。 */
+	exportOntologyTtl: (ontologyIri: string) => typedError<string, AppError>(__TAURI_INVOKE("export_ontology_ttl", { ontologyIri })),
+	/**  校验 Turtle（dry-run，不写库）。返回 TtlValidation（errors 非空则禁止 import）。 */
+	validateOntologyTtl: (ttlContent: string) => typedError<TtlValidation, AppError>(__TAURI_INVOKE("validate_ontology_ttl", { ttlContent })),
+	/**  导入 Turtle 到存储（best-effort）。返回 TtlImportResult。 */
+	importOntologyTtl: (ttlContent: string, overwrite: boolean) => typedError<TtlImportResult, AppError>(__TAURI_INVOKE("import_ontology_ttl", { ttlContent, overwrite })),
+	/**  删除指定本体 IRI（幂等，级联清 charter/changelog）。 */
+	deleteOntologyTtl: (ontologyIri: string) => typedError<boolean, AppError>(__TAURI_INVOKE("delete_ontology_ttl", { ontologyIri })),
+	/**  执行 SPARQL 查询（第 7 类 CRUD）。返回 SPARQL Results JSON 字符串。 */
+	queryOntologySparql: (ontologyIri: string, sparql: string) => typedError<string, AppError>(__TAURI_INVOKE("query_ontology_sparql", { ontologyIri, sparql })),
+	/**  读取 W3C 本体设计宪章（不变点）。 */
+	getOntologyTtlCharter: (ontologyIri: string) => typedError<TtlCharter, AppError>(__TAURI_INVOKE("get_ontology_ttl_charter", { ontologyIri })),
+	/**  写入/更新 W3C 本体设计宪章（不变点）。只有用户明确要求调整时才调用。 */
+	setOntologyTtlCharter: (ontologyIri: string, charter: TtlCharter) => typedError<null, AppError>(__TAURI_INVOKE("set_ontology_ttl_charter", { ontologyIri, charter })),
+	/**  列出 W3C 本体变更历史（revision 倒序）。 */
+	listOntologyTtlChangelog: (ontologyIri: string) => typedError<TtlChangelog_Serialize[], AppError>(__TAURI_INVOKE("list_ontology_ttl_changelog", { ontologyIri })),
+	/**
+	 *  提交一条 W3C 本体变更日志（每次 import/delete 后调用）。
+	 *  返回分配的 revision 序号。
+	 */
+	commitOntologyTtlChange: (ontologyIri: string, title: string, body: string, changeSummary: string, conversationId: string | null) => typedError<number, AppError>(__TAURI_INVOKE("commit_ontology_ttl_change", { ontologyIri, title, body, changeSummary, conversationId })),
 };
 
 /* Types */
@@ -1341,6 +1364,117 @@ export type ToolCallInfo = {
 	result: string | null,
 	/**  是否出错（工具报告 is_error 或执行异常） */
 	is_error: boolean,
+};
+
+/**
+ *  本体变更日志条目（git commit log 式，对齐 Palantir `OntologyChangelog`）。
+ * 
+ *  每条记录一次 import/delete 后的设计说明：title+body 为人可读的 commit message，
+ *  change_summary 为机器可读的实体级 +/−/~ 摘要。revision 每本体从 1 递增。
+ */
+export type TtlChangelog = TtlChangelog_Serialize | TtlChangelog_Deserialize;
+
+/**
+ *  本体变更日志条目（git commit log 式，对齐 Palantir `OntologyChangelog`）。
+ * 
+ *  每条记录一次 import/delete 后的设计说明：title+body 为人可读的 commit message，
+ *  change_summary 为机器可读的实体级 +/−/~ 摘要。revision 每本体从 1 递增。
+ */
+export type TtlChangelog_Deserialize = {
+	/**  本体内递增序号 */
+	revision: number,
+	/**  一句话标题 */
+	title: string,
+	/**  设计说明正文 */
+	body: string,
+	/**  JSON 字符串：{"created":[...],"deleted":[...],"modified":[...]} */
+	change_summary: string,
+	/**  来源会话 id（可空，手工导入无） */
+	conversation_id?: string | null,
+	/**  "agent" | "user" */
+	author: string,
+	/**  unix ms */
+	created_at: number,
+};
+
+/**
+ *  本体变更日志条目（git commit log 式，对齐 Palantir `OntologyChangelog`）。
+ * 
+ *  每条记录一次 import/delete 后的设计说明：title+body 为人可读的 commit message，
+ *  change_summary 为机器可读的实体级 +/−/~ 摘要。revision 每本体从 1 递增。
+ */
+export type TtlChangelog_Serialize = {
+	/**  本体内递增序号 */
+	revision: number,
+	/**  一句话标题 */
+	title: string,
+	/**  设计说明正文 */
+	body: string,
+	/**  JSON 字符串：{"created":[...],"deleted":[...],"modified":[...]} */
+	change_summary: string,
+	/**  来源会话 id（可空，手工导入无） */
+	conversation_id?: string | null,
+	/**  "agent" | "user" */
+	author: string,
+	/**  unix ms */
+	created_at: number,
+};
+
+/**
+ *  本体设计宪章（不变点，对齐 Palantir `OntologyCharter`）。
+ * 
+ *  字段语义与 Palantir `OntologyCharter` 完全一致，仅主键改为 `ontology_iri`。
+ *  charter 记录业务本质说明（不随历史变化），与 changelog（变化点）分离。
+ *  额外设计：charter 的四字段可同步以 W3C 原生词汇（`dcterms:` + `skos:note`）
+ *  写入 .ttl 文本，本表是可查询的结构化索引。
+ */
+export type TtlCharter = {
+	/**  业务场景（服务于什么业务目标、谁用、解决什么问题） */
+	business_scenario?: string,
+	/**  业务本质（核心业务对象/状态/关系/动态行为的一句话本质概括） */
+	business_essence?: string,
+	/**  设计意图（为什么这样建模、够用且可扩展的取舍、可扩展方向） */
+	design_intent?: string,
+	/**  补充说明（自由文本，记录不可违反的业务约束、边界条件等） */
+	invariants?: string,
+	/**  "agent" | "user" */
+	updated_by?: string,
+	/**  unix ms */
+	updated_at: number,
+};
+
+/**  Turtle 导入结果（对应 Palantir `ImportResult`）。 */
+export type TtlImportResult = {
+	/**  本体 IRI（从 ttl 里 owl:Ontology 提取） */
+	ontology_iri: string,
+	/**  已导入三元组数 */
+	triple_count: number,
+	/**  导入期间发生的错误（best-effort，单三元组失败不整体回滚） */
+	errors: string[],
+	/**  导入期间发生的警告 */
+	warnings: string[],
+};
+
+/**  本体摘要（对齐 Palantir `OntologySummary`，用于列表页）。 */
+export type TtlOntologySummary = {
+	/**  本体 IRI（主键） */
+	ontology_iri: string,
+	/**  版本（owl:versionInfo，可空） */
+	version: string,
+	/**  三元组数 */
+	triple_count: number,
+	/**  最后更新时间（unix ms） */
+	updated_at: number,
+};
+
+/**  Turtle 校验结果（对应 Palantir `ImportPreview` 的 dry-run 角色）。 */
+export type TtlValidation = {
+	/**  三元组总数（解析成功后） */
+	triple_count: number,
+	/**  阻断性错误（非空则禁止 import） */
+	errors: string[],
+	/**  非阻断性警告（可继续 import） */
+	warnings: string[],
 };
 
 /* Tauri Specta runtime */

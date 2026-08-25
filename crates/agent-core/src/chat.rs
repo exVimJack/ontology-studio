@@ -438,6 +438,12 @@ pub struct ChatService {
     /// 可选本体存储（会话页面引用本体）。set_ontology_store 后保存，
     /// stream_with_memory 时构造 ontology_readonly_tools（5 个只读 drill-in）。
     ontology_store: Option<Arc<ontology_store::OntologyStore>>,
+    /// 可选 W3C Turtle 本体存储（ontology-modeling-w3c skill 闭环）。
+    /// set_ttl_store 后保存，stream_with_memory 时构造 ontology_ttl_tools
+    /// （validate_ontology_ttl / import_ontology_ttl / export_ontology_ttl /
+    /// list_ontology_ttl / query_ontology_sparql）。与 Palantir 工具组共存——
+    /// skill preamble 渐进式披露控制模型用哪组（不做工具级动态过滤）。
+    ttl_store: Option<Arc<ontology_store::TtlStore>>,
     /// 可选 Skill 管理器（决策 20）。set_skill_manager 后保存，
     /// stream_with_memory 时构造 preamble Tier 1 + active skill doc_paths。
     skill_manager: Option<Arc<crate::skill::SkillManager>>,
@@ -463,6 +469,7 @@ impl ChatService {
             raw_memory: None,
             federation: None,
             ontology_store: None,
+            ttl_store: None,
             skill_manager: None,
         })
     }
@@ -513,6 +520,17 @@ impl ChatService {
     /// 本体工具始终可用（无激活集过滤，会话引用场景下 agent 按需钻取）。
     pub fn set_ontology_store(&mut self, store: std::sync::Arc<ontology_store::OntologyStore>) {
         self.ontology_store = Some(store);
+    }
+
+    /// 注入 W3C Turtle 本体存储（ontology-modeling-w3c skill 闭环）。
+    ///
+    /// 接收全局 `Arc<TtlStore>`，`stream_with_memory` 时构造 `ontology_ttl_tools`
+    /// （validate_ontology_ttl / import_ontology_ttl / export_ontology_ttl /
+    /// list_ontology_ttl / query_ontology_sparql）与 Palantir 工具组合并注入同一
+    /// ToolServerHandle。agent 按 skill preamble 指引用哪组工具。始终可用（无激活
+    /// 集过滤）。
+    pub fn set_ttl_store(&mut self, store: std::sync::Arc<ontology_store::TtlStore>) {
+        self.ttl_store = Some(store);
     }
 
     /// 注入 Skill 管理器（决策 20）。
@@ -639,7 +657,14 @@ impl ChatService {
             }
             None => Vec::new(),
         };
-        let all_tools: Vec<_> = doc_tools.into_iter().chain(fed_tools).chain(ont_tools).collect();
+        // W3C Turtle 工具组（ontology-modeling-w3c skill 闭环：validate/import/
+        // export/list/query_sparql）。与 Palantir 工具组共存——skill preamble 控制
+        // 模型用哪组。始终挂（无激活集过滤）。
+        let ttl_tools: Vec<_> = match &self.ttl_store {
+            Some(s) => crate::ontology_ttl_tools::ontology_ttl_tools(s.clone()),
+            None => Vec::new(),
+        };
+        let all_tools: Vec<_> = doc_tools.into_iter().chain(fed_tools).chain(ont_tools).chain(ttl_tools).collect();
         let handle = if !all_tools.is_empty() {
             // 复用已有 MCP handle，或新建空 ToolServer。两者都能 add_dynamic_tool。
             let h = handle.clone().unwrap_or_else(|| {

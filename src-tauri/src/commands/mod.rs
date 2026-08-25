@@ -42,6 +42,10 @@ pub use ontology::{
     list_ontology_changelog,
     list_ontology_datasets, list_ontology_data_sources,
     get_ontology_charter, set_ontology_charter,
+    list_ontology_ttl, export_ontology_ttl, validate_ontology_ttl, import_ontology_ttl,
+    delete_ontology_ttl, query_ontology_sparql,
+    get_ontology_ttl_charter, set_ontology_ttl_charter,
+    list_ontology_ttl_changelog, commit_ontology_ttl_change,
 };
 pub use provider::{get_provider, set_provider, restore_provider, SetProviderInput};
 pub use skill::{

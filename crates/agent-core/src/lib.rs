@@ -18,6 +18,7 @@ pub mod federation_tools;
 pub mod mcp;
 pub mod memory_bridge;
 pub mod ontology_tools;
+pub mod ontology_ttl_tools;
 pub mod provider;
 pub mod skill;
 

@@ -16,6 +16,7 @@ use tauri::State;
 
 use ontology_store::{
     ImportRequest, OntologyChangelog, OntologyCharter, OntologyStore, OntologySummary,
+    TtlChangelog, TtlCharter, TtlImportResult, TtlOntologySummary, TtlStore, TtlValidation,
 };
 
 use crate::commands::error::{AppError, AppResult};
@@ -24,6 +25,11 @@ use crate::state::AppState;
 /// 取 OntologyStore 克隆（AppState 始终持有，不会为 None）。
 fn get_store(state: &AppState) -> AppResult<std::sync::Arc<OntologyStore>> {
     Ok(state.ontology_store.clone())
+}
+
+/// 取 TtlStore 克隆（AppState 始终持有，不会为 None）。
+fn get_ttl_store(state: &AppState) -> AppResult<std::sync::Arc<TtlStore>> {
+    Ok(state.ttl_store.clone())
 }
 
 /// 列出所有已存储本体（前端列表页用）。
@@ -207,4 +213,133 @@ pub async fn set_ontology_charter(
     let store = get_store(&state)?;
     store.set_charter(&ontology_api_name, &charter)?;
     Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════
+// W3C Turtle 本体 IPC 命令（对齐 skill `ontology-modeling-w3c`）
+// 薄封装 `state.ttl_store`（crates/ontology-store/src/ttl.rs 已全就绪）。
+// 与 Palantir `OntologyStore` 命令并列，主键改为 ontology_iri（完整 URI）。
+// ════════════════════════════════════════════════════════════════
+
+/// 列出所有已存 W3C Turtle 本体（前端列表页用）。
+#[tauri::command]
+#[specta::specta]
+pub async fn list_ontology_ttl(state: State<'_, AppState>) -> AppResult<Vec<TtlOntologySummary>> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.list_ontologies()?)
+}
+
+/// 导出指定本体 IRI 的 Turtle 文本。
+#[tauri::command]
+#[specta::specta]
+pub async fn export_ontology_ttl(
+    ontology_iri: String,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.export_ttl(&ontology_iri)?)
+}
+
+/// 校验 Turtle（dry-run，不写库）。返回 TtlValidation（errors 非空则禁止 import）。
+#[tauri::command]
+#[specta::specta]
+pub async fn validate_ontology_ttl(
+    ttl_content: String,
+    state: State<'_, AppState>,
+) -> AppResult<TtlValidation> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.validate_ttl(&ttl_content)?)
+}
+
+/// 导入 Turtle 到存储（best-effort）。返回 TtlImportResult。
+#[tauri::command]
+#[specta::specta]
+pub async fn import_ontology_ttl(
+    ttl_content: String,
+    overwrite: bool,
+    state: State<'_, AppState>,
+) -> AppResult<TtlImportResult> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.import_ttl(&ttl_content, overwrite)?)
+}
+
+/// 删除指定本体 IRI（幂等，级联清 charter/changelog）。
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_ontology_ttl(
+    ontology_iri: String,
+    state: State<'_, AppState>,
+) -> AppResult<bool> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.delete_ontology(&ontology_iri)?)
+}
+
+/// 执行 SPARQL 查询（第 7 类 CRUD）。返回 SPARQL Results JSON 字符串。
+#[tauri::command]
+#[specta::specta]
+pub async fn query_ontology_sparql(
+    ontology_iri: String,
+    sparql: String,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.query_sparql(&ontology_iri, &sparql)?)
+}
+
+/// 读取 W3C 本体设计宪章（不变点）。
+#[tauri::command]
+#[specta::specta]
+pub async fn get_ontology_ttl_charter(
+    ontology_iri: String,
+    state: State<'_, AppState>,
+) -> AppResult<TtlCharter> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.get_charter(&ontology_iri)?)
+}
+
+/// 写入/更新 W3C 本体设计宪章（不变点）。只有用户明确要求调整时才调用。
+#[tauri::command]
+#[specta::specta]
+pub async fn set_ontology_ttl_charter(
+    ontology_iri: String,
+    charter: TtlCharter,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let store = get_ttl_store(&state)?;
+    store.set_charter(&ontology_iri, &charter)?;
+    Ok(())
+}
+
+/// 列出 W3C 本体变更历史（revision 倒序）。
+#[tauri::command]
+#[specta::specta]
+pub async fn list_ontology_ttl_changelog(
+    ontology_iri: String,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<TtlChangelog>> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.list_changelog(&ontology_iri)?)
+}
+
+/// 提交一条 W3C 本体变更日志（每次 import/delete 后调用）。
+/// 返回分配的 revision 序号。
+#[tauri::command]
+#[specta::specta]
+pub async fn commit_ontology_ttl_change(
+    ontology_iri: String,
+    title: String,
+    body: String,
+    change_summary: String,
+    conversation_id: Option<String>,
+    state: State<'_, AppState>,
+) -> AppResult<u32> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.commit_change(
+        &ontology_iri,
+        &title,
+        &body,
+        &change_summary,
+        conversation_id.as_deref(),
+        "user",
+    )?)
 }

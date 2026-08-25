@@ -36,6 +36,11 @@ import type {
   OntologySummary,
   OntologyChangelog,
   OntologyCharter,
+  TtlOntologySummary,
+  TtlValidation,
+  TtlImportResult,
+  TtlCharter,
+  TtlChangelog,
 } from "@/lib/ipc/bindings";
 import type {
   ActiveScopeDto,
@@ -296,4 +301,49 @@ export const ipc = {
   /** 写入/更新本体设计宪章（只有用户明确要求调整时才调用）。 */
   setOntologyCharter: (apiName: string, charter: OntologyCharter) =>
     unwrap<null>(raw.setOntologyCharter(apiName, charter)),
+
+  // ── W3C Turtle 本体（对齐 skill ontology-modeling-w3c）──
+  /** 列出所有已存 W3C Turtle 本体。 */
+  listOntologyTtl: () => unwrap<TtlOntologySummary[]>(raw.listOntologyTtl()),
+  /** 导出指定本体 IRI 的 Turtle 文本。 */
+  exportOntologyTtl: (iri: string) =>
+    unwrap<string>(raw.exportOntologyTtl(iri)),
+  /** 校验 Turtle（dry-run）。 */
+  validateOntologyTtl: (ttl: string) =>
+    unwrap<TtlValidation>(raw.validateOntologyTtl(ttl)),
+  /** 导入 Turtle（best-effort 落库）。 */
+  importOntologyTtl: (ttl: string, overwrite: boolean) =>
+    unwrap<TtlImportResult>(raw.importOntologyTtl(ttl, overwrite)),
+  /** 删除指定本体 IRI（幂等，级联清 charter/changelog）。 */
+  deleteOntologyTtl: (iri: string) =>
+    unwrap<boolean>(raw.deleteOntologyTtl(iri)),
+  /** 执行 SPARQL 查询，返回 SPARQL Results JSON 字符串。 */
+  queryOntologySparql: (iri: string, sparql: string) =>
+    unwrap<string>(raw.queryOntologySparql(iri, sparql)),
+  /** 读取 W3C 本体设计宪章（不变点）。 */
+  getOntologyTtlCharter: (iri: string) =>
+    unwrap<TtlCharter>(raw.getOntologyTtlCharter(iri)),
+  /** 写入/更新 W3C 本体设计宪章（只有用户明确要求调整时才调用）。 */
+  setOntologyTtlCharter: (iri: string, charter: TtlCharter) =>
+    unwrap<null>(raw.setOntologyTtlCharter(iri, charter)),
+  /** 列出 W3C 本体变更历史（revision 倒序）。 */
+  listOntologyTtlChangelog: (iri: string) =>
+    unwrap<TtlChangelog[]>(raw.listOntologyTtlChangelog(iri)),
+  /** 提交一条 W3C 本体变更日志。返回 revision 序号。 */
+  commitOntologyTtlChange: (
+    iri: string,
+    title: string,
+    body: string,
+    changeSummary: string,
+    conversationId: string | null,
+  ) =>
+    unwrap<number>(
+      raw.commitOntologyTtlChange(
+        iri,
+        title,
+        body,
+        changeSummary,
+        conversationId,
+      ),
+    ),
 };

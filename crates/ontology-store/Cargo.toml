@@ -26,3 +26,9 @@ regex = "1"
 specta = { version = "2.0.0-rc.25", features = ["derive", "serde_json"] }
 # specta-typescript：仅用于 #[specta(type = Number)] 注解绕 BigInt 导出禁令（见 AGENTS.md IPC 边界 BigInt 公约）。
 specta-typescript = "0.0.12"
+
+# ── W3C 本体存储（对齐 skill `ontology-modeling-w3c`）：RDF 图数据库 + SPARQL 1.1 ──
+# oxigraph 0.5，MIT/Apache-2.0。default-features=false 关掉 rocksdb 后端（避免构建期编译 C++，
+# 守 AGENTS.md 原则 2 轻量化）。持久化走 SQLite 存 .ttl 文本（见 ttl.rs），oxigraph 仅做内存校验/查询。
+# 推理暂不内置（对齐 oxigraph 官方设计决策 + AGENTS.md 原则 2 轻量化）。
+oxigraph = { version = "0.5", default-features = false }

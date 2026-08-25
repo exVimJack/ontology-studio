@@ -11,6 +11,7 @@ import { Fragment, useState } from "react";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import {
     Boxes,
+    Network,
     Plus,
     X,
     Loader2,
@@ -50,6 +51,7 @@ import {
     useOntologyDatasets,
     useOntologyDataSources,
 } from "@/hooks/useOntology";
+import { OntologyTtlView } from "@/components/ontology/OntologyTtlView";
 import { saveTextFile } from "@/lib/save-file";
 import type {
     OntologyPayload,
@@ -79,6 +81,9 @@ const PREVIEW_STATUS_META: Record<
 export function OntologyView() {
     const setOntologyOpen = useUiStore((s) => s.setOntologyOpen);
     const isMobile = useIsMobile();
+    const [ontologyTab, setOntologyTab] = useState<"palantir" | "w3c">(
+        "palantir",
+    );
     const { data: ontologies = [], isLoading, refetch } = useOntologies();
     // 会话内 agent 工具导入后自动刷新（事件由 store 层回调发出）
     useOntologyChangedListener();
@@ -114,28 +119,51 @@ export function OntologyView() {
         <div className="fixed inset-0 z-40 flex flex-col bg-bg max-md:pt-[env(safe-area-inset-top)] max-md:pb-[env(safe-area-inset-bottom)]">
             {/* 顶栏 */}
             <div className="flex items-center justify-between border-b border-border px-4 py-2">
-                <div className="flex items-center gap-2">
-                    <Boxes size={16} className="text-accent" />
-                    <h1 className="text-sm font-semibold">本体</h1>
-                    <span className="text-xs text-fg-subtle">
-                        三期 · ontology-store
-                    </span>
-                </div>
                 <div className="flex items-center gap-1">
                     <button
-                        onClick={() => refetch()}
-                        className="rounded-md p-1.5 text-fg-subtle hover:bg-bg-hover"
-                        title="刷新"
+                        onClick={() => setOntologyTab("palantir")}
+                        className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs transition ${
+                            ontologyTab === "palantir"
+                                ? "bg-bg-hover font-medium text-accent"
+                                : "text-fg-subtle hover:bg-bg-hover/50"
+                        }`}
+                        title="Palantir标准本体（ObjectType/LinkType/ActionType）"
                     >
-                        <RefreshCw size={14} />
+                        <Boxes size={14} />
+                        Palantir标准
                     </button>
                     <button
-                        onClick={() => setShowImport(true)}
-                        className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-accent hover:bg-bg-hover"
-                        title="导入本体 JSON"
+                        onClick={() => setOntologyTab("w3c")}
+                        className={`flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs transition ${
+                            ontologyTab === "w3c"
+                                ? "bg-bg-hover font-medium text-accent"
+                                : "text-fg-subtle hover:bg-bg-hover/50"
+                        }`}
+                        title="W3C 标准本体（RDF/OWL/SWRL，Turtle）"
                     >
-                        <Upload size={12} /> 导入
+                        <Network size={14} />
+                        W3C 标准
                     </button>
+                </div>
+                <div className="flex items-center gap-1">
+                    {ontologyTab === "palantir" && (
+                        <>
+                            <button
+                                onClick={() => refetch()}
+                                className="rounded-md p-1.5 text-fg-subtle hover:bg-bg-hover"
+                                title="刷新"
+                            >
+                                <RefreshCw size={14} />
+                            </button>
+                            <button
+                                onClick={() => setShowImport(true)}
+                                className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-accent hover:bg-bg-hover"
+                                title="导入本体 JSON"
+                            >
+                                <Upload size={12} /> 导入
+                            </button>
+                        </>
+                    )}
                     <button
                         onClick={() => setOntologyOpen(false)}
                         className="rounded-md p-1.5 text-fg-subtle hover:bg-bg-hover"
@@ -146,111 +174,120 @@ export function OntologyView() {
                 </div>
             </div>
 
-            <div className="flex min-h-0 flex-1">
-                {/* 左栏：本体列表 */}
-                <div
-                    className={`flex flex-col border-r border-border ${
-                        isMobile
-                            ? mobileShowDetail
-                                ? "hidden"
-                                : "w-full"
-                            : "w-64"
-                    }`}
-                >
-                    {isMobile && mobileShowDetail ? null : (
-                        <>
-                            <div className="px-3 py-2">
-                                <span className="text-xs font-medium uppercase tracking-wide text-fg-subtle">
-                                    本体
-                                </span>
-                            </div>
-                            <div className="flex-1 overflow-y-auto px-1">
-                                {isLoading ? (
-                                    <div className="flex justify-center py-8">
-                                        <Loader2
-                                            className="animate-spin text-fg-subtle"
-                                            size={16}
-                                        />
-                                    </div>
-                                ) : ontologies.length === 0 ? (
-                                    <div className="px-3 py-8 text-center text-xs text-fg-subtle">
-                                        暂无本体
-                                        <br />
-                                        <button
-                                            onClick={() => setShowImport(true)}
-                                            className="mt-2 text-accent hover:underline"
-                                        >
-                                            导入第一个本体
-                                        </button>
-                                    </div>
-                                ) : (
-                                    ontologies.map((o) => (
-                                        <OntologyListItem
-                                            key={o.api_name}
-                                            apiName={o.api_name}
-                                            displayName={o.display_name}
-                                            description={o.description}
-                                            active={
-                                                o.api_name === selectedApiName
-                                            }
-                                            deleting={
-                                                deleteMut.isPending &&
-                                                deleteMut.variables ===
-                                                    o.api_name
-                                            }
-                                            onClick={() =>
-                                                setSelectedApiName(o.api_name)
-                                            }
-                                            onDelete={() =>
-                                                handleDelete(
-                                                    o.api_name,
-                                                    o.display_name,
-                                                )
-                                            }
-                                        />
-                                    ))
-                                )}
-                            </div>
-                        </>
-                    )}
-                </div>
+            {ontologyTab === "w3c" ? (
+                <OntologyTtlView />
+            ) : (
+                <div className="flex min-h-0 flex-1">
+                    {/* 左栏：本体列表 */}
+                    <div
+                        className={`flex flex-col border-r border-border ${
+                            isMobile
+                                ? mobileShowDetail
+                                    ? "hidden"
+                                    : "w-full"
+                                : "w-64"
+                        }`}
+                    >
+                        {isMobile && mobileShowDetail ? null : (
+                            <>
+                                <div className="px-3 py-2">
+                                    <span className="text-xs font-medium uppercase tracking-wide text-fg-subtle">
+                                        本体
+                                    </span>
+                                </div>
+                                <div className="flex-1 overflow-y-auto px-1">
+                                    {isLoading ? (
+                                        <div className="flex justify-center py-8">
+                                            <Loader2
+                                                className="animate-spin text-fg-subtle"
+                                                size={16}
+                                            />
+                                        </div>
+                                    ) : ontologies.length === 0 ? (
+                                        <div className="px-3 py-8 text-center text-xs text-fg-subtle">
+                                            暂无本体
+                                            <br />
+                                            <button
+                                                onClick={() =>
+                                                    setShowImport(true)
+                                                }
+                                                className="mt-2 text-accent hover:underline"
+                                            >
+                                                导入第一个本体
+                                            </button>
+                                        </div>
+                                    ) : (
+                                        ontologies.map((o) => (
+                                            <OntologyListItem
+                                                key={o.api_name}
+                                                apiName={o.api_name}
+                                                displayName={o.display_name}
+                                                description={o.description}
+                                                active={
+                                                    o.api_name ===
+                                                    selectedApiName
+                                                }
+                                                deleting={
+                                                    deleteMut.isPending &&
+                                                    deleteMut.variables ===
+                                                        o.api_name
+                                                }
+                                                onClick={() =>
+                                                    setSelectedApiName(
+                                                        o.api_name,
+                                                    )
+                                                }
+                                                onDelete={() =>
+                                                    handleDelete(
+                                                        o.api_name,
+                                                        o.display_name,
+                                                    )
+                                                }
+                                            />
+                                        ))
+                                    )}
+                                </div>
+                            </>
+                        )}
+                    </div>
 
-                {/* 中栏：定义详情 */}
-                <div
-                    className={`flex min-w-0 flex-1 flex-col ${
-                        isMobile && !mobileShowDetail ? "hidden" : "flex"
-                    }`}
-                >
-                    {isMobile && mobileShowDetail && (
-                        <button
-                            onClick={() => setSelectedApiName(null)}
-                            className="flex items-center gap-1.5 border-b border-border px-3 py-2 text-xs text-fg-muted hover:bg-bg-hover"
-                        >
-                            <ArrowLeft size={14} />
-                            返回本体列表
-                        </button>
-                    )}
-                    {selected ? (
-                        <OntologyDetail
-                            apiName={selected.api_name}
-                            deleting={
-                                deleteMut.isPending &&
-                                deleteMut.variables === selected.api_name
-                            }
-                            onDelete={() =>
-                                handleDelete(
-                                    selected.api_name,
-                                    selected.display_name,
-                                )
-                            }
-                        />
-                    ) : !isMobile ? (
-                        <div className="flex h-full items-center justify-center text-sm text-fg-subtle">
-                            选择左侧本体查看定义
-                        </div>
-                    ) : null}
+                    {/* 中栏：定义详情 */}
+                    <div
+                        className={`flex min-w-0 flex-1 flex-col ${
+                            isMobile && !mobileShowDetail ? "hidden" : "flex"
+                        }`}
+                    >
+                        {isMobile && mobileShowDetail && (
+                            <button
+                                onClick={() => setSelectedApiName(null)}
+                                className="flex items-center gap-1.5 border-b border-border px-3 py-2 text-xs text-fg-muted hover:bg-bg-hover"
+                            >
+                                <ArrowLeft size={14} />
+                                返回本体列表
+                            </button>
+                        )}
+                        {selected ? (
+                            <OntologyDetail
+                                apiName={selected.api_name}
+                                deleting={
+                                    deleteMut.isPending &&
+                                    deleteMut.variables === selected.api_name
+                                }
+                                onDelete={() =>
+                                    handleDelete(
+                                        selected.api_name,
+                                        selected.display_name,
+                                    )
+                                }
+                            />
+                        ) : !isMobile ? (
+                            <div className="flex h-full items-center justify-center text-sm text-fg-subtle">
+                                选择左侧本体查看定义
+                            </div>
+                        ) : null}
+                    </div>
                 </div>
-            </div>
+            )}
 
             {/* 导入弹层 */}
             {showImport && (

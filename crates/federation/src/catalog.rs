@@ -200,7 +200,7 @@ fn ingest_excel_sheets(
     for (name, range) in sheets {
         let rows: Vec<Vec<String>> = range
             .rows()
-            .map(|r| r.iter().map(|d| cell_to_string(d)).collect())
+            .map(|r| r.iter().map(cell_to_string).collect())
             .collect();
         if rows.is_empty() {
             continue;

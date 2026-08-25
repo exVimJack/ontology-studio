@@ -34,6 +34,12 @@ pub enum StoreError {
     #[error("SQLite 错误: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+#[error("Turtle 语法错误: {0}")]
+    TurtleSyntax(String),
+
+    #[error("W3C 语义规范违反: {0}")]
+    SemanticRule(String),
+
     #[error("其他: {0}")]
     Other(#[from] anyhow::Error),
 }

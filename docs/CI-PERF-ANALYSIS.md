@@ -72,6 +72,7 @@ Top 25 里没有超过 5s 的普通 Rust crate——datafusion/arrow 全家桶�
 **实测结论：在 rig 0.41 + reqwest 0.13 生态下无法实现。**
 
 调查路径：
+
 1. reqwest 0.13.4 的 `rustls` feature 硬拉 `__rustls-aws-lc-rs` → `hyper-rustls/aws-lc-rs` → `rustls/aws_lc_rs` → `aws-lc-rs`
 2. reqwest 有 `rustls-no-provider` feature（不强制 provider），但 rustls/hyper-rustls 的 **default feature 仍含 aws-lc-rs**
 3. reqwest 0.13.4 **没有公开的 rustls-ring feature**（只有私有 `__rustls-ring`）

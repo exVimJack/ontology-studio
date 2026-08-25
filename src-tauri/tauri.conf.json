@@ -25,7 +25,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "dmg"],
+    "targets": "all",
     "resources": [
       "resources/pdfium",
       "resources/skills"

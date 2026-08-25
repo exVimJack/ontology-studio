@@ -65,8 +65,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # ⚠️ 实验性：切 nightly 验证打包时间（2026-02 临时，对比完成后回 stable）
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           targets: ${{ matrix.target }}
 

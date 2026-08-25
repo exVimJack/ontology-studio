@@ -68,15 +68,12 @@ default = []
 # 之前用 Cargo 默认 release profile（opt-level=3, lto=false, incremental=false）。
 # 优化（基于 cargo --timings 实测，见 docs/CI-PERF-ANALYSIS.md）：
 # - opt-level = 2：3 比 2 编译更慢，收益主要在数值计算密集场景；桌面应用 2 已足够。预计省 1-2m
-# - build-override：build.rs / proc-macro 不需要 release 级优化，降级零风险。预计省 30-60s
 # - 保留 strip=true 减小体积，panic=abort 去除 unwind 表
+#
+# ⚠️ build-override 已移除：实测 codegen-units=256 在 4CPU Windows runner 上
+#    造成严重调度开销，编译 11m→41m（慢 4 倍）。build.rs 降级零收益且高风险。
 [profile.release]
 opt-level = 2
 codegen-units = 16
 panic = "abort"
 strip = true
-
-[profile.release.build-override]
-opt-level = 0
-codegen-units = 256
-debug = false

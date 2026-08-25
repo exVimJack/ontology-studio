@@ -1,30 +1,39 @@
-# Windows CI 提速分析（基于 cargo --timings 实测数据）
+# Windows CI 提速分析（基于 cargo --timings 实测 + CI 日志时间线）
 
-> 基线：Windows 15m06s，macOS 5m52s。本地 macOS `cargo build --release --timings` 总耗时 297s。
+> 基线：Windows 15m06s（首版），优化后 11m18s。macOS 5m52s。
+> 本地 macOS `cargo build --release --timings` 总耗时 297s。
 
-## 核心发现：15 分钟耗在哪
+## 核心发现：Windows 11m18s 到底耗在哪
 
-### 1. PDFium 不是瓶颈（你的最大怀疑已排除）
+### 时间线精确拆解（来自 CI 日志时间戳）
 
-PDFium 是**预编译动态库**（`bblanchon/pdfium-binaries` 项目的 `.dll`/`.dylib`），随 Tauri `resources` 打包，运行时由 `pdfium-render` FFI 加载。**编译成本 = 0**，不存在"每次重新 C/C++ build PDFium"的问题。
+| 阶段 | 时间点 | 耗时 | 占比 |
+| --- | --- | --- | --- |
+| Build Tauri 步骤开始 | 23:49:16 | — | — |
+| **Rust 编译**（下载 118 crate + 编译 101 crate） | 23:49:16 → 23:56:53 | **7m 37s** | **68%** |
+| Finished release | 23:56:53 | — | — |
+| MSI bundling（WiX light） | 23:56:54 → 23:57:40 | 46s | 7% |
+| NSIS bundling（makensis） | 23:57:41 → 23:58:49 | 68s | 10% |
+| 前后置（checkout/install/npm/vite/upload） | — | ~1m41s | 15% |
 
-```
-src-tauri/resources/pdfium/win-x64/pdfium.dll     # 预编译，直接打包
-src-tauri/resources/pdfium/mac-arm64/libpdfium.dylib
-crates/ingest: pdfium-render = "0.9.3"              # 纯 FFI 绑定 crate，不编译 C++
-```
+**结论：Rust 编译仍是最大块（7m37s，68%），但 cache 已在命中（26s restore）。**
+仍有 118 个 crate 重新下载 + 101 个重新编译，说明 cache 未完全覆盖。
 
-### 2. 真正的瓶颈：C/C++ 编译的 `-sys` crate（本地 Top 耗时）
+### 1. PDFium 不是瓶颈（已排除）
 
-| 排名 | build-script | 本地耗时 | 引入路径 | Windows 预估 |
-| --- | --- | --- | --- | --- |
-| 1 | **aws-lc-sys** | **104s** | reqwest→rustls→aws-lc-rs | **可能 200-300s**（MSVC+Defender） |
-| 2 | zstd-sys | 46s | datafusion→parquet→zstd | ~100s |
-| 3 | libsqlite3-sys | 29s | rusqlite (bundled C 源码) | ~60s |
-| 4 | liblzma-sys | 14s | 压缩依赖 | ~30s |
-| 5 | ring | 7s | rustls-webpki（与 aws-lc 并存！） | ~15s |
+PDFium 是**预编译动态库**（`bblanchon/pdfium-binaries` 的 `.dll`/`.dylib`），随 Tauri `resources` 打包，运行时由 `pdfium-render` FFI 加载。**编译成本 = 0**，不存在"每次重新 C/C++ build PDFium"的问题。
 
-**aws-lc-sys 占本地编译的 1/3（104s/297s），是单一最大瓶颈。** 在 Windows 上 C 编译更慢，占比可能更高。
+### 2. 本地 cargo --timings 的瓶颈分布（macOS 297s）
+
+| 排名 | build-script | 本地耗时 | 引入路径 |
+| --- | --- | --- | --- |
+| 1 | **aws-lc-sys** | **104s** | reqwest→rustls→aws-lc-rs（C 编译 AWS crypto） |
+| 2 | zstd-sys | 46s | datafusion→parquet→zstd |
+| 3 | libsqlite3-sys | 29s | rusqlite (bundled C 源码) |
+| 4 | liblzma-sys | 14s | 压缩依赖 |
+| 5 | ring | 7s | rustls-webpki（与 aws-lc 并存） |
+
+**aws-lc-sys 占本地编译的 1/3（104s/297s），是单一最大瓶颈。**
 
 ### 3. 两个 crypto 后端重复编译
 
@@ -56,37 +65,26 @@ Top 25 里没有超过 5s 的普通 Rust crate——datafusion/arrow 全家桶�
 
 ### 第一批：确定值得试（高收益低风险）
 
-#### ✅ 实验 A：去 aws-lc-rs，统一用 ring 后端（预计省 100-200s）
+#### ✅ 实验 A：去 aws-lc-rs，统一用 ring 后端——⚠️ 已验证走不通
 
 **预计收益**：Windows 省 2-4 分钟（aws-lc-sys 是最大单一 C 编译）
 
-**做法**：reqwest 的 `rustls` feature 改为 `rustls-tls-webpki-roots`（强制 ring 后端）
+**实测结论：在 rig 0.41 + reqwest 0.13 生态下无法实现。**
 
-```toml
-# crates/agent-core/Cargo.toml
-reqwest = { version = "0.13", default-features = false, features = [
-    "rustls-tls-webpki-roots",  # 原 "rustls"（无 provider，默认拉 aws-lc-rs）
-    "json",
-    "stream",
-] }
-```
+调查路径：
+1. reqwest 0.13.4 的 `rustls` feature 硬拉 `__rustls-aws-lc-rs` → `hyper-rustls/aws-lc-rs` → `rustls/aws_lc_rs` → `aws-lc-rs`
+2. reqwest 有 `rustls-no-provider` feature（不强制 provider），但 rustls/hyper-rustls 的 **default feature 仍含 aws-lc-rs**
+3. reqwest 0.13.4 **没有公开的 rustls-ring feature**（只有私有 `__rustls-ring`）
+4. rig/rig-core 的 `rustls` feature **硬编码 `reqwest/rustls`**（带 aws-lc），无 no-provider 选项
 
-**风险**：低。ring 和 aws-lc-rs 都是 rustls 的 crypto provider，功能等价（TLS 加密）。ring 更轻量、更广泛使用。AGENTS.md 原则 1（禁 OpenSSL）不受影响——都是 rustls 栈。
+**唯一去除路径**：fork rig 改 feature，或等 rig 上游加 `rustls-ring` feature。风险高，CI 提速阶段不做。
 
-**验证**：改后跑 `cargo tree -i aws-lc-rs` 应无输出，`cargo tree -i ring` 仍存在。
+#### ✅ 实验 B：测 `lto = false`——⚠️ 已验证无意义
 
-#### ✅ 实验 B：测 `lto = false`（你点名要测的项）
-
-**预计收益**：Windows link 阶段省 1-2 分钟（thin LTO 增加 link time）
-
-**做法**：
-
-```toml
-[profile.release]
-lto = false  # 原 "thin"
-```
-
-**风险**：低-中。关 LTO 会轻微降低运行时性能（内联优化变少），但 Tauri 桌面应用非性能敏感，1-3% 下降可接受。可先测 `false`，再测 `thin` 对比。
+**实测发现**：src-tauri 被排除出 workspace（根 `Cargo.toml` 的 `exclude = ["src-tauri"]`），
+Tauri 构建用 **Cargo 默认 release profile**，其中 `lto` 本就是 `false`。
+根 Cargo.toml 的 `lto = "thin"` 只影响 `crates/*` 的独立编译（如 cargo test），
+不影响 Tauri 构建。所以测 lto=false 无意义——本来就关着。
 
 #### ✅ 实验 C：测 `opt-level = 2`
 

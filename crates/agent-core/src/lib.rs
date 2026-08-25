@@ -9,6 +9,12 @@
 //!
 //! 二期：MCP 工具系统（rmcp）、RAG、tool call 卡片。
 
+// datafusion `SessionContext::sql()` 返回的 async future 嵌套极深，
+// 经 federation_tools 的 Box::pin + 工具闭包组合后，auto-trait(Send) 递归深度
+// 超过默认 limit(128)，触发 rust-lang/rust#159228 的 future-incompatible lint
+// `recursion_depth_exceeding_limit`（未来将变硬错误）。256 是官方建议值。
+#![recursion_limit = "256"]
+
 pub mod chat;
 pub mod context_budget;
 pub mod context_window;

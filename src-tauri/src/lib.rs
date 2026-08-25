@@ -3,6 +3,11 @@
 //! 业务逻辑禁止放进这里（AGENTS.md 工程结构硬约束），仅做 #[tauri::command] 薄封装。
 //! 一期 MVP 落地内容见 §九。
 
+// datafusion async future 经 agent-core federation_tools 组合后 Send 递归深度超限，
+// 见 rust-lang/rust#159228（recursion_depth_exceeding_limit，未来变硬错误）。
+// 与 agent-core 保持一致：256 是官方建议值。
+#![recursion_limit = "256"]
+
 use commands::provider::restore_provider;
 use specta_typescript::Typescript;
 use tauri::{Emitter, Manager};

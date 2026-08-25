@@ -1,6 +1,6 @@
 [package]
 name = "ontology-studio"
-version = "0.1.0"
+version = "0.1.1"
 description = "跨端 Agent 应用 — Rig 驱动 + 多模态文件摄取"
 authors = ["ontology-studio"]
 license = "MIT OR Apache-2.0"

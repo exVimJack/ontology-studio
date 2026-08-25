@@ -66,6 +66,7 @@ jobs:
       - uses: actions/checkout@v5
 
       # ⚠️ 实验性：切 nightly 验证打包时间（2026-02 临时，对比完成后回 stable）
+      # 热缓存对照 run：nightly 依赖已入 cache，本次测热编译耗时
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:

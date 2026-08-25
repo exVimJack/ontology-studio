@@ -133,9 +133,14 @@ debug = false
 
 **风险**：中。需确认 federation 是否被 agent-core 强依赖。
 
-### 第三批：已验证不适用（勿重复尝试）
+### 第三批：曾在 CI 实测不适用，但已重新评估後重新启用
 
-- ❌ rust-lld：PDFium 原生库上链接卡死
+- ⚠️ rust-lld（Windows MSVC 链接器）：2026-08-24 在 CI 实测链接卡死（29min+，
+  link.exe 13m37s）曾回退；2026-08-25 本地端到端重测（全 workspace release 5m46s、
+  src-tauri exe 均链接成功）后重新启用，见根 `.cargo/config.toml`。
+  **若 CI 发版构建再出现链接卡死/超慢，优先回退 link.exe**。
+
+以下仍在已验证不适用列表（勿重复尝试）：
 - ❌ Dev Drive：CARGO_TARGET_DIR 重定向致 swatinem cache 失配，全量重编
 - ❌ sccache：不缓存 cdylib + 不缓存 incremental，与 Tauri 三重冲突
 - ❌ CARGO_TARGET_DIR 重定向：破坏 cache

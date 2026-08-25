@@ -1,6 +1,7 @@
 name: Build & Release to GitCode
 
-# 双平台 CI 提速优化验证中（Dev Drive + rust-lld + Defender + CARGO_INCREMENTAL=0）。
+# 双平台 CI 提速优化验证中（rust-lld[Windows MSVC] + Defender；Dev Drive / sccache 已实测不适用）。
+# Windows MSVC 链接器统一在根 .cargo/config.toml 配置 rust-lld（本地 + CI 共享），见下方 optim 注释。
 
 # ─────────────────────────────────────────────────────────────
 # 方案1（修正版）：GitHub 公有 runner 编译 Win/macOS 包，
@@ -74,9 +75,15 @@ jobs:
       #（github.com/andrewdavidmackenzie/flow/pull/2908 实测单此一项省 ~8%）。
       # 纯收益零风险，这是本项目唯一实测稳定的 Windows 提速措施。
       #
-      # ⚠️ 以下优化均实测不适用本项目（含 PDFium 原生库的 Tauri 项目），勿重复尝试：
-      # - rust-lld：链接阶段卡死/超慢（20min+ 未完成，cache 命中后仍卡），
-      #   rust-lld 对大型原生静态库兼容不佳，非环境问题（Defender 已排除）
+      # ⚠️ 设计说明：Windows MSVC 链接器已在根 .cargo/config.toml 统一切换为
+      #    rust-lld（本地 + CI 共享该 config），此处不再单独设置 linker。
+      #    历史教训（commit 3feb2c1 revert）：2026-08-24 曾实测 rust-lld 在本项目
+      #    完整 Tauri + PDFium 原生库上链接卡死（29min+ 未完成，link.exe 13m37s），
+      #    已回退。2026-08-25 本地端到端重测（全 workspace release 5m46s + src-tauri
+      #    exe 链接成功）后决定重新启用。若后续 CI 出现链接卡死/超慢，优先回退为
+      #    默认 link.exe（删 .cargo/config.toml 的 [target.x86_64-pc-windows-msvc]
+      #    linker 段），勿长期阻塞发版。
+      # 其他不适用于本项目的优化（勿重复尝试）：
       # - Dev Drive (samypr100/setup-dev-drive)：CARGO_TARGET_DIR 重定向到
       #   Dev Drive 后 swatinem cache 路径失配，每次全量重编，IO 优势抵不过
       #   全量重编代价；且 VHDX 默认 2GB 不足（需 14GB）

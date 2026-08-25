@@ -33,6 +33,12 @@ on:
       - "*.md"
       - "scripts/init-standalone-repo.sh"
 
+concurrency:
+  # 同一 ref（tag 或分支）同时只保留一个 run，新触发自动取消旧 run，
+  # 避免同一 commit 多次全量编译 + 重复传 GitCode 浪费 runner 分钟。
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write # 需写权限：在 GitHub 建 Release（原来只读因不发版）
 
@@ -63,7 +69,10 @@ jobs:
           # M1 的 50-60%，Rust 编译耗时翻倍（46m vs 20m）。Intel mac 用户可
           # 通过 Rosetta 运行 arm64 包，或后续按需重新启用。
     steps:
+      # Tauri 发版只需当前 commit 快照，不需要完整 git 历史，浅克隆省一点拉取时间
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
 
       # ⚠️ 实验性：切 nightly 验证打包时间（2026-02 临时，对比完成后回 stable）
       # 热缓存对照 run：nightly 依赖已入 cache，本次测热编译耗时
@@ -122,10 +131,13 @@ jobs:
       # 无需 CI 下载。版本固定 chromium/7881，升级时手动替换 + 改 scripts/fetch-pdfium.sh。
       # 详见 docs/RELEASE-GUIDE.md「PDFium 版本管理」。
 
-      # tauri-action 纯构建模式：不传 tagName/releaseName/releaseDraft，
-      # 只 build + 输出本地产物，不碰 GitHub Release
+      # tauri-action v1 纯构建模式（官方支持）：不传 tagName/releaseName/releaseDraft，
+      # 按官方文档「If you only want to build the app without having the action upload any
+      # assets, simply omit tagName」，仅执行 build + 输出本地产物，不碰 GitHub Release。
+      # Release 由后面的独立步骤（GitHub + GitCode）统一发布。
+      # （v1 相比 v0：node24 runtime 更新、输入集收敛，纯构建行为一致，已验证通过）
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -208,11 +220,22 @@ jobs:
           ## macOS 安装提示
           DMG 未签名，首次打开请右键 → 打开。"
           fi
-          # 上传所有资产到 GitHub Release
+          # 并行上传所有资产到 GitHub Release（与下方 GitCode 上传风格对齐，
+          # 大安装包并发 PUT 能显著缩短整体上传耗时）
+          pids=()
           for f in "${ASSETS[@]}"; do
             echo "上传 $(basename "$f")..."
-            gh release upload "$TAG" "$f" --repo "$REPO" --clobber
+            gh release upload "$TAG" "$f" --repo "$REPO" --clobber &
+            pids+=($!)
           done
+          fail=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || fail=1
+          done
+          if [ "$fail" = "1" ]; then
+            echo "❌ 有资产上传 GitHub Release 失败"
+            exit 1
+          fi
           echo "✅ GitHub Release $TAG 发布完成"
 
       # ── 创建/更新 GitCode Release ──

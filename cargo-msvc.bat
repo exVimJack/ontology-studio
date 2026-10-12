@@ -10,9 +10,10 @@ call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliar
 
 REM Copy WebView2Loader.dll into target deps if missing (webview2-com-sys ships it).
 REM The exact registry hash dir varies; glob-match the x64 dll.
+set "TARGET_DIR=%~dp0target"
 for /f "delims=" %%D in ('dir /b /s "%USERPROFILE%\.cargo\registry\src\webview2-com-sys*\x64\WebView2Loader.dll" 2^>nul') do (
-    if exist "C:\Users\think\AppData\Local\onto-studio-target\debug\deps" (
-        if not exist "C:\Users\think\AppData\Local\onto-studio-target\debug\deps\WebView2Loader.dll" copy "%%D" "C:\Users\think\AppData\Local\onto-studio-target\debug\deps\" >nul 2>&1
+    if exist "%TARGET_DIR%\debug\deps" (
+        if not exist "%TARGET_DIR%\debug\deps\WebView2Loader.dll" copy "%%D" "%TARGET_DIR%\debug\deps\" >nul 2>&1
     )
 )
 

@@ -3,16 +3,24 @@
 //! 业务逻辑禁止放进这里（AGENTS.md 工程结构硬约束），仅做 #[tauri::command] 薄封装。
 //! 一期 MVP 落地内容见 §九。
 
-use commands::provider::restore_provider;
+// datafusion async future 经 agent-core federation_tools 组合后 Send 递归深度超限，
+// 见 rust-lang/rust#159228（recursion_depth_exceeding_limit，未来变硬错误）。
+// 与 agent-core 保持一致：256 是官方建议值。
+#![recursion_limit = "256"]
+
 use specta_typescript::Typescript;
 use tauri::{Emitter, Manager};
-use tauri_specta::collect_commands;
 use tracing::{info, warn};
 
 pub mod commands;
 mod pdfium;
 mod skill;
 mod state;
+
+// 命令函数顶层导入（tauri_specta 的 #[specta::specta] 辅助宏要求命令在模块顶层
+// 可见）。commands/mod.rs 已 re-export 全部命令函数，此处 glob 导入。
+#[allow(unused_imports)]
+pub(crate) use commands::*;
 
 use state::AppState;
 
@@ -98,111 +106,10 @@ fn measure<T>(label: &str, f: impl FnOnce() -> T) -> T {
 /// `collect_commands!` 宏依赖同 crate 内 `#[specta::specta]` 生成的辅助宏，
 /// 必须在本 crate 内调用，故不能放到独立 example。
 pub fn gen_bindings(path: &str) -> std::result::Result<(), String> {
-    #[allow(unused_imports)]
-    use commands::{
-        cancel_ingest, create_conversation, delete_conversation, delete_message,
-        delete_message_and_after,
-        generate_conversation_title, get_mcp_servers, get_provider,
-        ingest_files, list_all_documents, list_conversations, list_messages, list_mcp_tools, list_mounted_documents,
-        mount_document, read_document, rename_conversation, send_message, set_conversation_pinned, set_mcp_servers,
-        set_message_status, set_provider, unmount_document, delete_document, cancel_stream,
-        register_data_source, test_data_source, deregister_data_source, list_data_sources,
-        get_data_source, browse_federation_schema, describe_federation_table,
-        execute_federation_query, explain_federation_query,
-        // 文件夹操作 + 会话激活集（CONVERSATION-SCOPE.md）
-        create_folder, list_folders, list_documents_by_folder, move_document, rename_folder, delete_folder,
-        get_active_scope, set_active_folders, set_active_sources, set_active_ontologies,
-        // Skill 系统（决策 20）
-        list_skills, import_skill_from_dir, import_skill_from_zip, uninstall_skill,
-        set_skill_conversation_enabled, set_skill_globally_disabled,
-        // 本体建模（三期：ontology-store IPC）
-        list_ontologies, export_ontology, preview_ontology_import, import_ontology,
-        delete_ontology,
-        list_ontology_changelog,
-        list_ontology_datasets, list_ontology_data_sources,
-        get_ontology_charter, set_ontology_charter,
-        // 本体建模 W3C（Turtle，对齐 skill ontology-modeling-w3c）
-        list_ontology_ttl, export_ontology_ttl, validate_ontology_ttl, import_ontology_ttl,
-        delete_ontology_ttl, query_ontology_sparql,
-        get_ontology_ttl_charter, set_ontology_ttl_charter,
-        list_ontology_ttl_changelog, commit_ontology_ttl_change,
-    };
-    let builder = tauri_specta::Builder::<tauri::Wry>::new().commands(collect_commands![
-        create_conversation,
-        list_conversations,
-        rename_conversation,
-        generate_conversation_title,
-        set_conversation_pinned,
-        delete_conversation,
-        list_messages,
-        delete_message,
-        set_message_status,
-        send_message,
-        cancel_stream,
-        set_provider,
-        get_provider,
-        set_mcp_servers,
-        get_mcp_servers,
-        list_mcp_tools,
-        ingest_files,
-        cancel_ingest,
-        mount_document,
-        unmount_document,
-        list_mounted_documents,
-        list_all_documents,
-        delete_document,
-        read_document,
-        register_data_source,
-        test_data_source,
-        deregister_data_source,
-        list_data_sources,
-        get_data_source,
-        browse_federation_schema,
-        describe_federation_table,
-        execute_federation_query,
-        explain_federation_query,
-        // 文件夹操作 + 会话激活集（CONVERSATION-SCOPE.md）
-        create_folder,
-        list_folders,
-        list_documents_by_folder,
-        move_document,
-        rename_folder,
-        delete_folder,
-        get_active_scope,
-        set_active_folders,
-        set_active_sources,
-        set_active_ontologies,
-        // Skill 系统（决策 20）
-        list_skills,
-        import_skill_from_dir,
-        import_skill_from_zip,
-        uninstall_skill,
-        set_skill_conversation_enabled,
-        set_skill_globally_disabled,
-        delete_message_and_after,
-        // 本体建模（三期：ontology-store IPC）
-        list_ontologies,
-        export_ontology,
-        preview_ontology_import,
-        import_ontology,
-        delete_ontology,
-        list_ontology_changelog,
-        list_ontology_datasets,
-        list_ontology_data_sources,
-        get_ontology_charter,
-        set_ontology_charter,
-        // 本体建模 W3C（Turtle）
-        list_ontology_ttl,
-        export_ontology_ttl,
-        validate_ontology_ttl,
-        import_ontology_ttl,
-        delete_ontology_ttl,
-        query_ontology_sparql,
-        get_ontology_ttl_charter,
-        set_ontology_ttl_charter,
-        list_ontology_ttl_changelog,
-        commit_ontology_ttl_change,
-    ]);
+    // 命令已由顶层 command_names!(use_commands) 导入，此处只收集注册
+    let builder = tauri_specta::Builder::<tauri::Wry>::new().commands(
+        crate::command_names!(collect_all),
+    );
     // 时间戳等 i64 字段已由 memory::Timestamp 包装（specta 导出为 number），
     // 故用默认 Typescript 配置即可。
     builder
@@ -212,111 +119,10 @@ pub fn gen_bindings(path: &str) -> std::result::Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-// 命令注册（与 gen_bindings 保持一致）
-use commands::{
-cancel_ingest, create_conversation, delete_conversation, delete_message,
-delete_message_and_after,
-generate_conversation_title, get_provider, get_mcp_servers,
-ingest_files, list_all_documents, list_conversations, list_messages, list_mcp_tools, list_mounted_documents,
-mount_document, read_document, rename_conversation, send_message, set_conversation_pinned, set_mcp_servers,
-set_message_status, set_provider, unmount_document, delete_document, cancel_stream,
-register_data_source, test_data_source, deregister_data_source, list_data_sources,
-get_data_source, browse_federation_schema, describe_federation_table,
-execute_federation_query, explain_federation_query,
-// 文件夹操作 + 会话激活集（CONVERSATION-SCOPE.md）
-create_folder, list_folders, list_documents_by_folder, move_document, rename_folder, delete_folder,
-get_active_scope, set_active_folders, set_active_sources, set_active_ontologies,
-// Skill 系统（决策 20）
-list_skills, import_skill_from_dir, import_skill_from_zip, uninstall_skill,
-set_skill_conversation_enabled, set_skill_globally_disabled,
-// 本体建模（三期：ontology-store IPC）
-list_ontologies, export_ontology, preview_ontology_import, import_ontology,
-delete_ontology,
-list_ontology_changelog,
-list_ontology_datasets, list_ontology_data_sources,
-get_ontology_charter, set_ontology_charter,
-// 本体建模 W3C（Turtle，对齐 skill ontology-modeling-w3c）
-list_ontology_ttl, export_ontology_ttl, validate_ontology_ttl, import_ontology_ttl,
-delete_ontology_ttl, query_ontology_sparql,
-get_ontology_ttl_charter, set_ontology_ttl_charter,
-list_ontology_ttl_changelog, commit_ontology_ttl_change,
-};
-    let builder = tauri_specta::Builder::<tauri::Wry>::new().commands(collect_commands![
-        create_conversation,
-        list_conversations,
-        rename_conversation,
-        generate_conversation_title,
-        set_conversation_pinned,
-        delete_conversation,
-        list_messages,
-        delete_message,
-        set_message_status,
-        send_message,
-        cancel_stream,
-        set_provider,
-        get_provider,
-        set_mcp_servers,
-        get_mcp_servers,
-        list_mcp_tools,
-        ingest_files,
-        cancel_ingest,
-        mount_document,
-        unmount_document,
-        list_mounted_documents,
-        list_all_documents,
-        delete_document,
-        read_document,
-        register_data_source,
-        test_data_source,
-        deregister_data_source,
-        list_data_sources,
-        get_data_source,
-        browse_federation_schema,
-        describe_federation_table,
-        execute_federation_query,
-        explain_federation_query,
-        // 文件夹操作 + 会话激活集（CONVERSATION-SCOPE.md）
-        create_folder,
-        list_folders,
-        list_documents_by_folder,
-        move_document,
-        rename_folder,
-        delete_folder,
-        get_active_scope,
-        set_active_folders,
-        set_active_sources,
-        set_active_ontologies,
-        // Skill 系统（决策 20）
-        list_skills,
-        import_skill_from_dir,
-        import_skill_from_zip,
-        uninstall_skill,
-        set_skill_conversation_enabled,
-        set_skill_globally_disabled,
-        delete_message_and_after,
-        // 本体建模（三期：ontology-store IPC）
-        list_ontologies,
-        export_ontology,
-        preview_ontology_import,
-        import_ontology,
-        delete_ontology,
-        list_ontology_changelog,
-        list_ontology_datasets,
-        list_ontology_data_sources,
-        get_ontology_charter,
-        set_ontology_charter,
-        // 本体建模 W3C（Turtle）
-        list_ontology_ttl,
-        export_ontology_ttl,
-        validate_ontology_ttl,
-        import_ontology_ttl,
-        delete_ontology_ttl,
-        query_ontology_sparql,
-        get_ontology_ttl_charter,
-        set_ontology_ttl_charter,
-        list_ontology_ttl_changelog,
-        commit_ontology_ttl_change,
-    ]);
+// 命令注册（与 gen_bindings 保持一致，命令已顶层导入）
+    let builder = tauri_specta::Builder::<tauri::Wry>::new().commands(
+        crate::command_names!(collect_all),
+    );
 
     // debug 模式下 dev 运行也刷新 bindings（CI/首次用 examples/gen_bindings）
     #[cfg(debug_assertions)]
@@ -359,6 +165,25 @@ list_ontology_ttl_changelog, commit_ontology_ttl_change,
 
             // 先 open memory（Arc 包装），供 AppState 与 SkillManager 共用同一连接。
             let memory = std::sync::Arc::new(measure("open memory db", || memory::Memory::open(&db_path))?);
+
+            // 历史数据修复：后台索引线程曾因 SQLITE_BUSY 大量失败（无 busy_timeout +
+            // 每资源一线程并发写），文档永久卡在 indexed_at=0（搜索永远 0 结果）。
+            // 启动时串行补索引（indexer 连接已设 busy_timeout，等锁而非瞬败）。
+            {
+                let mem = memory.clone();
+                std::thread::spawn(move || match mem.pending_index_ids() {
+                    Ok(ids) if !ids.is_empty() => {
+                        info!(count = ids.len(), "reindexing pending documents");
+                        for id in ids {
+                            if let Err(e) = mem.index_document(&id) {
+                                tracing::warn!(error = %e, "reindex failed");
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "list pending index failed"),
+                });
+            }
 
             // open ontology store（三期：本体建模作为 agent 工具）。独立 DB 文件
             // （ontology.db），与 onto-studio.db 职责正交——本体定义 vs 会话/文档。
@@ -425,6 +250,10 @@ list_ontology_ttl_changelog, commit_ontology_ttl_change,
             // 从 store 恢复 provider 配置
             if let Err(e) = restore_provider(app.handle(), &state) {
                 warn!(error = %e, "restore provider failed");
+            }
+            // 恢复校验者 B 独立配置（§4.4 独立性；B ChatService 首次调用时懒构建）
+            if let Err(e) = commands::provider::restore_verifier_provider(app.handle(), &state) {
+                warn!(error = %e, "restore verifier provider failed");
             }
 
             app.manage(state);

@@ -137,13 +137,13 @@ pub async fn get_mcp_servers(app: AppHandle) -> AppResult<Vec<McpServerConfig>> 
 pub async fn list_mcp_tools(state: State<'_, AppState>) -> AppResult<Vec<McpToolDef>> {
     let defs = state
         .tool_handle
-        .get_tool_defs(None)
+        .tool_defs(None) // 0.44：get_tool_defs 更名 tool_defs
         .await
         .map_err(|e| AppError::Provider(format!("list tools: {e}")))?;
     Ok(defs
         .into_iter()
         .map(|d| McpToolDef {
-            name: d.name,
+            name: d.name.to_string(),
             description: d.description,
             parameters: d.parameters.to_string(),
         })

@@ -10,7 +10,7 @@
 // 直接传原始 MessageRow[] 给 runtime，convertMessage 做 MessageRow→ThreadMessageLike。
 // toolCalls（运行时态，不落库）通过 ref 注入 convertMessage 闭包。
 
-import { useRef, type ReactNode } from "react"
+import { createContext, useContext, type ReactNode } from "react"
 import {
   AssistantRuntimeProvider,
   useExternalStoreRuntime,
@@ -19,39 +19,40 @@ import {
 } from "@assistant-ui/react"
 import { useMessages } from "@/hooks/useConversations"
 import { useChat } from "@/hooks/useChat"
-import type { MessageRow, ToolCallInfo } from "@/lib/domain"
+import { useRunStatusStore } from "@/stores/run-status-store"
+import type { MessageRow } from "@/lib/domain"
+import type { RunStatus } from "@/lib/chat-run-status"
+
+/** 长任务 liveness 状态下发：useChat 在 Composer（发送方）与 ChatRuntimeProvider
+ *  （渲染方）各持一个 hook 实例，状态互不可见，故 runStatus 走全局 zustand store
+ *  （run-status-store），此处直接读 store 并经 context 下发给 Thread 消息组件。 */
+interface ChatRunStatusValue {
+  runStatus: RunStatus
+  isRunning: boolean
+}
+
+const ChatRunStatusContext = createContext<ChatRunStatusValue | null>(null)
+
+/** Thread / 消息组件内读取本轮 turn 运行状态（phase / 工具名 / 最近 chunk 时间）。 */
+export function useChatRunStatus(): ChatRunStatusValue {
+  const v = useContext(ChatRunStatusContext)
+  if (!v) throw new Error("useChatRunStatus 必须在 ChatRuntimeProvider 内使用")
+  return v
+}
 
 /** MessageRow → assistant-ui ThreadMessageLike。
- *  content parts 顺序：reasoning（思考链）→ tool-call → text（正文）。 */
+ *  content parts 顺序：reasoning（思考链）→ text（正文）。
+ *  工具调用不产出 part（卡片已下线）——此前 tool-call part 恒插在 text 前，
+ *  多 turn 流（导语→工具→正文）中卡片出现瞬间导语从卡片上方跳到下方重新渲染，
+ *  视觉上等于已输出的文本被“重复输出一遍”。 */
 function convertMessage(
   msg: MessageRow,
-  toolCallsByMsg: Record<string, ToolCallInfo[]>,
 ): ThreadMessageLike {
   const parts: Exclude<ThreadMessageLike["content"], string>[number][] = []
 
   // reasoning（独立 part，assistant-ui 自动渲染为可折叠块）
   if (msg.reasoning && msg.reasoning.length > 0) {
     parts.push({ type: "reasoning", text: msg.reasoning })
-  }
-
-  // tool-call parts（运行时状态，不落库；按消息 id 查找）
-  const tcs = toolCallsByMsg[msg.id]
-  if (tcs && tcs.length > 0 && msg.role === "assistant") {
-    for (const tc of tcs) {
-      parts.push({
-        type: "tool-call",
-        toolCallId: tc.call_id,
-        toolName: tc.name,
-        argsText: tc.arguments,
-        result:
-          tc.result != null
-            ? tc.is_error
-              ? { type: "error", message: tc.result }
-              : tc.result
-            : undefined,
-        isError: tc.is_error || undefined,
-      })
-    }
   }
 
   // 正文
@@ -97,19 +98,14 @@ function extractTextFromParts(
 }
 
 /** 单会话的 assistant-ui runtime（仅渲染用）。
- *  useChat 提供消息、isSending、toolCallsByMsg；发送由 Composer 直接调 useChat。 */
+ *  useChat 提供消息、isSending；发送由 Composer 直接调 useChat。 */
 export function useChatRuntime(conversationId: string) {
   const { data: messages = [] } = useMessages(conversationId)
   const chat = useChat(conversationId)
 
-  // toolCallsByMsg 每次渲染可能变（state），用 ref 让 convertMessage 闭包始终读到最新值，
-  // 同时保持 convertMessage 引用稳定（避免 runtime 重建）。
-  const toolCallsRef = useRef(chat.toolCallsByMsg)
-  toolCallsRef.current = chat.toolCallsByMsg
-
   const runtime = useExternalStoreRuntime({
     messages,
-    convertMessage: (m: MessageRow) => convertMessage(m, toolCallsRef.current),
+    convertMessage: convertMessage,
     isRunning: chat.isSending,
     onNew: async () => {
       // 发送走 Composer → useChat.sendAsync，runtime 不主动调
@@ -141,10 +137,15 @@ export function ChatRuntimeProvider({
   conversationId: string
   children: ReactNode
 }) {
-  const { runtime } = useChatRuntime(conversationId)
+  const { runtime, chat } = useChatRuntime(conversationId)
+  const runStatus = useRunStatusStore((s) => s.runStatus)
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      {children}
+      <ChatRunStatusContext.Provider
+        value={{ runStatus, isRunning: chat.isSending }}
+      >
+        {children}
+      </ChatRunStatusContext.Provider>
     </AssistantRuntimeProvider>
   )
 }

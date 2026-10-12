@@ -2,7 +2,9 @@
 // 数据源注册/管理 + schema 浏览 + 只读 SQL 编辑器 + 结果表格。
 //
 // 布局：左栏数据源列表 + 中栏 SQL 编辑器/结果 + 右栏 schema 浏览。
-// 覆盖层模式（同 SettingsView），⌘Shift+F 或 Sidebar 底部入口打开。
+// 覆盖层模式（全屏 overlay），⌘Shift+F 或 Sidebar 底部入口打开。
+
+import { shortcut } from "@/lib/keyboard";
 
 import { useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
@@ -42,11 +44,11 @@ const KIND_META: Record<DataSourceKind, { label: string; color: string }> = {
   mysql: { label: "MySQL", color: "text-sky-500" },
   postgres: { label: "PostgreSQL", color: "text-blue-500" },
   csv: { label: "CSV", color: "text-emerald-500" },
-  excel: { label: "Excel", color: "text-green-500" },
+  excel: { label: "Excel", color: "text-success" },
 };
 
 export function FederationView() {
-  const setFederationOpen = useUiStore((s) => s.setFederationOpen);
+  const setActiveNav = useUiStore((s) => s.setActiveNav);
   const isMobile = useIsMobile();
   const { data: sources = [], isLoading, refetch } = useDataSources();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -57,7 +59,7 @@ export function FederationView() {
   const mobileShowWorkspace = isMobile && selected !== null;
 
   return (
-    <div className="fixed inset-0 z-40 flex flex-col bg-bg max-md:pt-[env(safe-area-inset-top)] max-md:pb-[env(safe-area-inset-bottom)]">
+    <div className="absolute inset-0 z-40 flex flex-col bg-bg max-md:pt-[env(safe-area-inset-top)] max-md:pb-[env(safe-area-inset-bottom)]">
       {/* 顶栏 */}
       <div className="flex items-center justify-between border-b border-border px-4 py-2">
         <div className="flex items-center gap-2">
@@ -74,7 +76,7 @@ export function FederationView() {
             <RefreshCw size={14} />
           </button>
           <button
-            onClick={() => setFederationOpen(false)}
+            onClick={() => setActiveNav("chat")}
             className="rounded-md p-1.5 text-fg-subtle hover:bg-bg-hover"
             title="关闭"
           >
@@ -242,8 +244,8 @@ function SqlWorkspace({ catalog }: { catalog: string }) {
                 run();
               }
             }}
-            placeholder="输入只读 SQL（⌘/Ctrl+Enter 执行）"
-            className="h-24 w-full resize-none rounded-md border border-border bg-bg p-2 font-mono text-xs outline-none focus:border-accent"
+            placeholder={`输入只读 SQL（${shortcut(["mod", "Enter"])} 执行）`}
+            className="h-24 w-full resize-none rounded-md border border-border bg-bg p-2 font-mono text-xs outline-none"
             spellCheck={false}
           />
           <div className="mt-1 flex items-center justify-between">
@@ -254,7 +256,7 @@ function SqlWorkspace({ catalog }: { catalog: string }) {
                   type="number"
                   value={limit}
                   onChange={(e) => setLimit(Number(e.target.value) || 200)}
-                  className="w-16 rounded border border-border bg-bg px-1 py-0.5 text-xs outline-none focus:border-accent"
+                  className="w-16 rounded border border-border bg-bg px-1 py-0.5 text-xs outline-none"
                 />
               </label>
             </div>
@@ -616,7 +618,7 @@ function RegisterDialog({ onClose }: { onClose: () => void }) {
                 <select
                   value={sslMode}
                   onChange={(e) => setSslMode(e.target.value)}
-                  className="w-full rounded-md border border-border bg-bg px-2 py-1 text-xs outline-none focus:border-accent"
+                  className="w-full rounded-md border border-border bg-bg px-2 py-1 text-xs outline-none"
                 >
                   <option value="disable">disable</option>
                   <option value="require">require</option>
@@ -751,7 +753,7 @@ function Input({
       value={value}
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
-      className="w-full rounded-md border border-border bg-bg px-2 py-1 text-xs outline-none focus:border-accent"
+      className="w-full rounded-md border border-border bg-bg px-2 py-1 text-xs outline-none"
     />
   );
 }

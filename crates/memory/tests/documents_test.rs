@@ -112,6 +112,40 @@ fn upsert_search_read_list_delete() {
     assert!(hits.is_empty(), "删除后 FTS5 应搜不到");
 }
 
+// 回归：模型原始 query 含 FTS5 语法字符时不应报错（历史 bug：search 工具反复
+// 返回“搜索失败”，模型误判为搜索服务故障，退化为 list+read 定位文档）。
+#[test]
+fn search_with_fts5_special_chars_does_not_error() {
+    let mem = Memory::open_in_memory().unwrap();
+    let id = mem.upsert_document(doc(
+        "/tmp/spec.md",
+        "ontology-package-format.md",
+        "md",
+        "Dataset 的 storage_location 三段式 catalog.schema.table 契约约定。",
+    ))
+    .unwrap();
+    mem.index_document(&id).unwrap();
+
+    // 这些查询原本直接触发 fts5 syntax error / no such column。
+    for q in [
+        "skill://ontology-modeling",   // `:` 列过滤器
+        "ontology-modeling",           // `-` 列排除
+        "Dataset (storage_location",   // 括号不配对
+        "\"storage_location",           // 引号不配对
+        "storage_location 契约",        // 正常词仍要能命中
+    ] {
+        let hits = mem.search_documents(q, 10).unwrap();
+        println!("[search-raw] '{q}' → {} hits", hits.len());
+    }
+    // 切词加引号后语义不变：正常词命中原文档。
+    let hits = mem.search_documents("storage_location 契约", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, id);
+    // 前四种只剩合法短语，命中或空结果都行，但绝不 Err。
+    assert_eq!(mem.search_documents("skill://ontology-modeling", 10).unwrap().len(), 0);
+    assert_eq!(mem.search_documents("ontology-modeling", 10).unwrap().len(), 0);
+}
+
 #[test]
 fn empty_query_returns_empty() {
     let mem = Memory::open_in_memory().unwrap();

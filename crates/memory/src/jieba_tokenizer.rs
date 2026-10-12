@@ -125,6 +125,7 @@ impl JiebaSentenceTokenizer {
     {
         let mut local = 0_usize;
         for word in JIEBA.cut(sent, true) {
+            let word = word.word; // jieba-rs 0.11：cut 返回 Token，取 .word 拿 &str
             let range = base + local..base + local + word.len();
             local += word.len();
             if is_space_or_ascii_punctuation_str(word) {

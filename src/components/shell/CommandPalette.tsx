@@ -1,6 +1,8 @@
 // UI 层：CommandPalette.tsx（§20.5 ⌘K）
-// 命令面板：导航 + 新建会话 + 打开设置 + 切换主题。
+// 命令面板：导航 + 新建会话 + 模型/MCP 设置快捷入口 + 会话切换。
 // 用 cmdk。
+
+import { shortcut } from "@/lib/keyboard";
 
 import { Command } from "cmdk";
 import { useEffect } from "react";
@@ -11,24 +13,20 @@ import {
   useConversations,
 } from "@/hooks/useConversations";
 import { useCurrentConversationId } from "@/hooks/useCurrentConversationId";
-import { applyTheme } from "@/stores/ui-store";
 import {
   Plus,
-  Settings,
-  Sun,
-  Moon,
+  Server,
   MessageSquare,
   Search,
   FolderOpen,
   Sparkles,
   Boxes,
+  Cpu,
 } from "lucide-react";
 
 export function CommandPalette() {
   const open = useUiStore((s) => s.commandPaletteOpen);
   const setOpen = useUiStore((s) => s.setCommandPaletteOpen);
-  const setTheme = useUiStore((s) => s.setTheme);
-  const setSettingsOpen = useUiStore((s) => s.setSettingsOpen);
   const { data: conversations = [] } = useConversations();
   const createConv = useCreateConversation();
   const currentId = useCurrentConversationId();
@@ -79,56 +77,45 @@ export function CommandPalette() {
                 icon={<Plus size={14} />}
               >
                 新建会话
-                <Kbd>⌘N</Kbd>
+                <Kbd>{shortcut(["mod", "N"])}</Kbd>
               </Item>
               <Item
-                onSelect={run(() => setSettingsOpen(true))}
-                icon={<Settings size={14} />}
+                onSelect={run(() => useUiStore.getState().setModelSettingsOpen(true))}
+                icon={<Cpu size={14} />}
               >
-                打开设置
-                <Kbd>⌘,</Kbd>
+                模型设置
+                <Kbd>{shortcut(["mod", "M"])}</Kbd>
               </Item>
               <Item
-                onSelect={run(() => navigate({ to: "/library" }))}
+                onSelect={run(() => useUiStore.getState().setMcpSettingsOpen(true))}
+                icon={<Server size={14} />}
+              >
+                工具服务器 (MCP)
+                <Kbd>{shortcut(["mod", "shift", "M"])}</Kbd>
+              </Item>
+              <Item
+                onSelect={run(() => {
+                  useUiStore.getState().setActiveNav("library");
+                  navigate({ to: "/library" });
+                })}
                 icon={<FolderOpen size={14} />}
               >
                 文件库
               </Item>
               <Item
-                onSelect={run(() => useUiStore.getState().setSkillsOpen(true))}
+                onSelect={run(() => useUiStore.getState().setActiveNav("skills"))}
                 icon={<Sparkles size={14} />}
               >
                 技能管理
               </Item>
               <Item
                 onSelect={run(() =>
-                  useUiStore.getState().setOntologyOpen(true),
+                  useUiStore.getState().setActiveNav("ontology"),
                 )}
                 icon={<Boxes size={14} />}
               >
                 本体
-                <Kbd>⌘⇧O</Kbd>
-              </Item>
-              <Item
-                onSelect={run(() => setTheme("light"))}
-                icon={<Sun size={14} />}
-              >
-                浅色主题
-              </Item>
-              <Item
-                onSelect={run(() => setTheme("dark"))}
-                icon={<Moon size={14} />}
-              >
-                深色主题
-              </Item>
-              <Item
-                onSelect={run(() => {
-                  setTheme("system");
-                  applyTheme("system");
-                })}
-                icon={<Sun size={14} />}
-              >
-                跟随系统主题
+                <Kbd>{shortcut(["mod", "shift", "O"])}</Kbd>
               </Item>
             </Command.Group>
 

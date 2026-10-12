@@ -3,17 +3,7 @@
 
 import { useMemo, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import {
-  Plus,
-  Search,
-  Pin,
-  Trash2,
-  MessageSquare,
-  Database,
-  FolderOpen,
-  Sparkles,
-  Boxes,
-} from "lucide-react";
+import { Plus, Search, Pin, Trash2, MessageSquare } from "lucide-react";
 import {
   useConversations,
   useCreateConversation,
@@ -22,7 +12,6 @@ import {
 } from "@/hooks/useConversations";
 import { useCurrentConversationId } from "@/hooks/useCurrentConversationId";
 import { DATE_GROUP_ORDER, dateGroup, relativeTime } from "@/lib/domain";
-import { useUiStore } from "@/stores/ui-store";
 import type { ConversationSummary } from "@/lib/domain";
 
 export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
@@ -83,43 +72,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="搜索会话…"
-            className="w-full rounded-md border border-border bg-bg py-1.5 pl-8 pr-2 text-sm outline-none focus:border-accent"
-          />
-        </div>
-
-        {/* 功能入口（与豆包同层级：知识库 / 数据源 / 技能 / 本体）*/}
-        <div className="grid grid-cols-4 gap-1">
-          <FeatureEntry
-            icon={<FolderOpen size={14} />}
-            label="知识库"
-            onClick={() => {
-              navigate({ to: "/library" });
-              onNavigate?.();
-            }}
-          />
-          <FeatureEntry
-            icon={<Database size={14} />}
-            label="数据源"
-            onClick={() => {
-              useUiStore.getState().setFederationOpen(true);
-              onNavigate?.();
-            }}
-          />
-          <FeatureEntry
-            icon={<Sparkles size={14} />}
-            label="技能"
-            onClick={() => {
-              useUiStore.getState().setSkillsOpen(true);
-              onNavigate?.();
-            }}
-          />
-          <FeatureEntry
-            icon={<Boxes size={14} />}
-            label="本体"
-            onClick={() => {
-              useUiStore.getState().setOntologyOpen(true);
-              onNavigate?.();
-            }}
+            className="w-full rounded-md border border-border bg-bg py-1.5 pl-8 pr-2 text-sm outline-none"
           />
         </div>
       </div>
@@ -173,26 +126,6 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
         )}
       </div>
     </div>
-  );
-}
-
-function FeatureEntry({
-  icon,
-  label,
-  onClick,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className="flex w-full items-center justify-center gap-1.5 rounded-md border border-border bg-bg px-1 py-1.5 text-[11px] text-fg hover:bg-bg-hover"
-    >
-      {icon}
-      {label}
-    </button>
   );
 }
 

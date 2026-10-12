@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 /// 当前实际分发的内置 skill 集合（目录名 = skill name）。
 /// 与 `src-tauri/resources/skills/` 下的子目录一一对应。
-const EXPECTED: &[&str] = &["ontology-modeling"];
+const EXPECTED: &[&str] = &["ontology-modeling", "ontology-modeling-w3c"];
 
 /// 定位内置 skill 目录（与 src-tauri/src/skill.rs 三层兜底一致）。
 fn builtin_skills_dir() -> PathBuf {

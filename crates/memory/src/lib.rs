@@ -83,6 +83,11 @@ impl Memory {
                 if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
                     tracing::warn!(error = %e, "indexer conn: set WAL failed");
                 }
+                // 等锁而非瞬败：历史 bug——无 busy_timeout 时多线程并发建索引
+                // 大面积 SQLITE_BUSY 失败，文档永久卡在未索引状态（搜索 0 结果）。
+                if let Err(e) = conn.busy_timeout(std::time::Duration::from_secs(10)) {
+                    tracing::warn!(error = %e, "indexer conn: set busy_timeout failed");
+                }
                 register_fts5_tokenizers(&conn);
                 Some(Ok(conn))
             }
@@ -92,7 +97,7 @@ impl Memory {
 
     fn init_schema(conn: &Connection) -> MemoryResult<()> {
         // 启用 WAL：并发读不阻塞写，桌面单进程多窗口更顺。
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
         conn.execute_batch(
             r#"
             -- 会话

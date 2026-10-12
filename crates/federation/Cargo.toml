@@ -8,15 +8,15 @@ authors.workspace = true
 
 [dependencies]
 # ── 联邦查询引擎（ARCHITECTURE.md 决策 9 / 三期 PHASE3-FEDERATION.md §2.2） ──
-# datafusion 54.0.0 自带 arrow 58.3 + sqlparser 0.62（docs.rs 源码实证），
+# datafusion 55.2.0 自带 arrow 59.2 + sqlparser 0.62（crates.io deps 实证），
 # unparser feature 默认启用（federation 生成方言 SQL 需要）。
 # 单进程内嵌，零 JVM，Apache-2.0。
-datafusion = "54"
+datafusion = "55"
 
 # ── 联邦下推（PHASE3-FEDERATION.md §2.4 方案 D） ──
-# 0.5.5 依赖 datafusion ^54（源码 Cargo.toml 实证），与 datafusion 54 兼容。
+# 0.5.7 依赖 datafusion ^55（crates.io deps 实证），与 datafusion 55 配套。
 # alpha 状态，三期单用户桌面可接受；兜底见 §八。
-datafusion-federation = { version = "0.5.5", features = ["sql"] }
+datafusion-federation = { version = "0.5.7", features = ["sql"] }
 
 # ── SQL 连接层（决策 12：sqlx 0.9 + rustls，禁 native-tls） ──
 # MySQL/PG 用强类型 MySqlPool/PgPool 按 kind 分发（不启用 any feature）。
@@ -30,8 +30,8 @@ sqlx = { version = "0.9", default-features = false, features = [
     "uuid",
 ] }
 
-# ── Arrow（与 datafusion 54 一致） ──
-arrow = "58"
+# ── Arrow（与 datafusion 55 自带版本一致） ──
+arrow = "59"
 
 # ── 时间类型（PG timestamp/date 读取，sqlx chrono feature 重导） ──
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

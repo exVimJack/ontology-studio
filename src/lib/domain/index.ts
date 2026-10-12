@@ -3,6 +3,7 @@
 
 import type { SkillDto, SkillSource } from "@/lib/ipc/bindings";
 import type { ProviderKind } from "@/lib/ipc/bindings";
+import type { ProviderConfig } from "@/lib/ipc/bindings";
 
 // FolderNodeDto / ActiveScopeDto：Rust 侧 `ingest.rs` 定义且 `derive(Type)`，
 // 但 `list_folders`/`get_active_scope` 命令未出现在 tauri-specta 生成的 bindings 中
@@ -66,6 +67,7 @@ export type {
   TtlImportResult,
   TtlCharter,
   TtlChangelog,
+  TtlPropertyEdit,
 } from "@/lib/ipc/bindings";
 
 /**
@@ -126,13 +128,13 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     label: "DeepSeek",
     kind: "deepseek",
     defaultBaseUrl: "",
-    models: ["deepseek-v4-pro", "deepseek-v4-flash"],
+    models: ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-0731"],
   },
   {
     label: "智谱 GLM (Zhipu)",
     kind: "zhipu",
     defaultBaseUrl: "",
-    models: ["glm-5.2", "glm-4.6"],
+    models: ["glm-5.3", "glm-5.2", "glm-4.7"],
     supportsImage: true,
   },
   {
@@ -178,6 +180,31 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 /** 按 kind 查找预设。 */
 export function presetForKind(kind: ProviderKind): ProviderPreset | undefined {
   return PROVIDER_PRESETS.find((p) => p.kind === kind);
+}
+
+/**
+ * 已保存的 provider → 预设下拉索引。
+ *
+ * 不能只用 kind 匹配：Qwen 与「自定义 (OpenAI 兼容)」都声明 `openai_compatible`，
+ * findIndex 恒返回第一个（Qwen），导致设置页回填永远显示 Qwen（bug 定位 2026-09）。
+ * 消除歧义规则（仅对 openai_compatible 生效）：
+ *   - base_url 非空且 ≠ dashscope → 自定义
+ *   - 其余（base_url 为空 或 = dashscope）→ Qwen
+ *     （base_url 为空是历史 Qwen 配置的签名：旧版 onPresetChange 会清空 base_url）
+ */
+export function presetIndexForProvider(
+  provider: Pick<ProviderConfig, "kind" | "base_url"> & { base_url?: string | null },
+): number {
+  const byKind = PROVIDER_PRESETS.findIndex((p) => p.kind === provider.kind);
+  if (byKind < 0) return PROVIDER_PRESETS.length - 1;
+  if (provider.kind !== "openai_compatible") return byKind;
+  const base = (provider.base_url ?? "").trim().replace(/\/+$/, "");
+  const qwenBase = DEFAULT_BASE_URLS.qwen.trim().replace(/\/+$/, "");
+  if (base && base !== qwenBase) {
+    // 自定义兼容端点（用户自填 base_url）
+    return PROVIDER_PRESETS.findIndex((p) => p.label === "自定义 (OpenAI 兼容)");
+  }
+  return PROVIDER_PRESETS.findIndex((p) => p.label === "通义千问 (Qwen)");
 }
 
 /** 时间戳（i64 毫秒）→ 相对时间描述。 */

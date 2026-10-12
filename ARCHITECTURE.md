@@ -163,7 +163,7 @@
 - **能力扩展**:Gemini(非 OpenAI 协议)首次可用;rig 原生支持 24+ provider,onto-studio 只用了 2 个。
 - **架构重构**:引入 `ProviderRuntime` trait 擦除 rig client 泛型类型(原 `DynClient` enum 的 8 处 `match &self.client` 分支全部消除),新增 provider 只需 ① `build_runtime` 加构造分支 ② 宏 `impl_provider_runtime!` 生成 trait impl。`ChatService` 持 `Arc<dyn ProviderRuntime>`。
 - **字段对齐 pi**:采样(temperature/max_tokens/top_p)、兼容性(supports_developer_role/supports_reasoning_effort,input_types)、增强(extra_headers/reasoning 4 级)。降低用户从 pi 迁移成本。
-- **OpenAI 官方走 Responses API**:`OpenAi` kind 用 rig 默认的 responses_api(),其余兼容端点走 completions_api()。`supports_developer_role=false` 调 `with_system_instructions_as_messages()`(rig 0.41 原生)。
+- **OpenAI 官方走 Responses API**:`OpenAi` kind 走 `.responses()`,其余兼容端点走 `.chat()`(Chat Completions)。`supports_developer_role=false` 调 `with_system_instructions_as_messages()`(0.44 在 OpenAIConfig 上,语义同前)。
 - **context_window 探测保留手写**:rig `ModelListingClient::list_models()` 的 `Model` struct 虽有 `context_length` 字段,但 Anthropic lister 丢弃了官方 `context_window`(只取 id/name),OpenAI 官方/DeepSeek 响应里本来就没有该字段——手写按 kind 分派(OpenAI 兼容 /models、Anthropic /v1/models、Gemini models.get、Ollama /api/show)反而覆盖更全。当前五层 fallback(用户配置 > 官方元数据探测 > Ollama /api/show > 内置已知模型表 > 默认 100K)已健壮,不为了用 rig 而用 rig。
 **落地**:`crates/agent-core/src/provider.rs`(ProviderKind 扩 13 种 + ProviderConfig 扩字段 + reasoning_to_params)、`chat.rs`(ProviderRuntime trait + helper 泛型函数 + build_runtime + 宏)、`src-tauri/commands/provider.rs`(SetProviderInput 扩字段)、前端 `domain/index.ts`(PROVIDER_PRESETS 13 个 + presetForKind)、`SettingsView.tsx`(高级设置折叠区)、`bindings.ts`(手动更新)。
 **否决项**:① 全部 provider 走 openai::Client 一刀切(丢失 capability,已废弃);② 用 rig ModelListingClient 替换手写 context_window 探测(收益不足);③ pi 的 7 级 thinkingLevelMap(onto-studio 非编码 agent,4 级够用,后续可扩)。
@@ -246,13 +246,13 @@
 
 ### 决策 14:MCP 工具系统——rmcp 1.x + 自实现 DynamicTool 桥接(二期 A3)
 
-**决策**:用 `rmcp ^1.8`(而非 3.0-beta)接 MCP server,自实现 rig 0.41 的 `DynamicTool` 适配器(0.41 取消了 `ToolDyn` trait,改用 `DynamicTool::new(name,desc,params,callback)`)把 MCP 工具注册到 Rig `ToolServerHandle`,不启用 rig 的 rmcp feature。
+**决策**:用 `rmcp ^1.8`(而非 3.0-beta)接 MCP server,自实现 `DynamicTool` 适配器(0.44 回调单参 `Fn(Value) -> Future<Result<ToolOutput, ToolExecutionError>>`,无 ToolContext 参)把 MCP 工具注册到 Rig `ToolServerHandle`,不启用 rig 的 rmcp feature(rig 0.44 的 rmcp 依赖是可选 feature,不启用则不进依赖树,与本项目直连的 rmcp 1.8 无共存冲突)。
 
 **理由**:
 
-- **版本锁定 1.x**:rig 0.41 依赖 `rmcp ^1.8`。若直接用 rmcp 3.0-beta 会与 rig 拉的 1.x 共存,且 rmcp 3.x 的 macros feature 依赖 pastey/darling,在当前 toolchain(rustc 1.97)+ cargo feature unification 下触发 cargo resolver panic(`did not find features for darling`)。保持 1.x 统一版本绕开。
+- **版本锁定 1.x**:rmcp 3.x 的 macros feature 依赖 pastey/darling,在当前 toolchain(rustc 1.97)+ cargo feature unification 下触发 cargo resolver panic(`did not find features for darling`)。保持 1.x;rig 0.44 自身的 rmcp 依赖是可选 feature(不启用),不构成版本共存。
 - **不启用 rig 的 rmcp feature**:rig 的 `tool::rmcp` 模块针对 rmcp 3.0-beta API,开启会拉 rmcp default features(macros/server)触发上述 resolver bug。自实现 `DynamicTool` 桥接只需 rmcp `client` + 两个 transport feature,无 macros。
-- **0.41 DynamicTool API**:rig 0.41 取消 `ToolDyn` trait,改用 `DynamicTool::new(name, description, parameters, callback)`,callback 签名 `Fn(&mut ToolContext, Value) -> Future<Result<ToolOutput, ToolExecutionError>>`。`ToolError` 被 `ToolExecutionError` 取代。`ToolServerHandle::add_dynamic_tool(DynamicTool)` 替代 `add_tool(impl ToolDyn)`。
+- **DynamicTool API**:0.41 取消 `ToolDyn` trait,改用 `DynamicTool::new(name, description, parameters, callback)`;0.44 起回调单参 `Fn(Value) -> Future<…>`(不再传 `&mut ToolContext`,需 context 用 `new_with_context`),name 为 `ToolName` newtype。`ToolError`/`ToolExecutionError` 同前;`ToolServerHandle::add_dynamic_tool(DynamicTool)` 保留(0.44 起同步,不再 async)。
 - **stdio transport 自实现**:不用 rmcp 的 `transport-child-process`(依赖 process-wrap 拉入 windows crate 重型包,当前 toolchain 编译失败),改用 `tokio::process::Command` spawn + rmcp 的 `(AsyncRead, AsyncWrite)` transport,零额外原生依赖(符合原则 1)。Windows 下设 `CREATE_NO_WINDOW` 避免弹控制台。
 - **HTTP transport**:rmcp `transport-streamable-http-client-reqwest`,复用 reqwest + rustls(原则 1)。
 - **静态工具模式**:连接时一次性 `list_all_tools` 注册到共享 `ToolServerHandle`,agent 构建时注入。工具列表变更通知(`on_tool_list_changed`)一期不处理。
@@ -293,7 +293,7 @@
   - **异步索引**(取代同步触发器):jieba 对大全文(1M+ 字符 PDF)分词建索引耗时 10 分钟+,同步触发器会阻塞 `ingest_files` 返回(前端表现为“解析完成后卡住”)。改为:upsert 只写主行(毫秒级,用旧值删旧 FTS5 索引保证一致性,置 indexed_at=0)→ `spawn_blocking` fire-and-forget 调 `index_document(id)` 在**独立连接**上建 FTS5 索引(WAL 模式下不抢主连接锁)→ indexed_at 置完成时间戳。search WHERE indexed_at>0 过滤未索引文档。大文档索引构建期间搜不到,其他功能不受影响。
   - external content 模式('delete' 需原文):upsert 更新时先用旧 SELECT 的旧值删旧 FTS5 索引,再更新主行;delete 同理。contentless 模式不支持 DELETE,不可用。detail=none 不支持 phrase 查询(中文多字词被 jieba 拆多 token 后报错),不可用——用默认 detail=full。
 - `crates/agent-core/src/document_tools.rs`:三个 `DynamicTool`(闭包捕获 `Arc<Memory>`)。`list_documents()` 列清单、`search_documents(query, limit?)` FTS5 MATCH + BM25 + snippet、`read_document(id, offset?, limit?)` 分页读全文。
-- 工具注入:`stream_with_memory` 复用 MCP `ToolServerHandle` + `add_dynamic_tool()`(rig 0.41 builder typestate 不允许同时 `dynamic_tools()` + `tool_server_handle()`,但 ToolServerHandle 运行时可动态加,同名替换幂等,MCP 工具与文件工具共存)。
+- 工具注入:`stream_with_memory` 复用 MCP `ToolServerHandle` + `add_dynamic_tool()`(0.44 builder typestate 不允许同时 `dynamic_tools()` + `tool_server_handle()`,但 ToolServerHandle 运行时可动态加,同名替换幂等,MCP 工具与文件工具共存)。
 - ChatService 加 `raw_memory: Option<Arc<Memory>>` 字段(set_memory 时保存原始句柄,供工具访问 documents 表;`self.memory` 是 `Arc<dyn ConversationMemory>` trait object,工具需具体类型)。
 - ingest 摄取成功后 `upsert_document` 持久化全文(同 path 幂等替换)。前端 `useIngest` 不再调 RAG 入库。
 - `@` 挂载语义(一期收尾后改为工具按需读,见决策 17):用户在消息中 `@fileName` 引用文档 → 文本原位保留 token(位置语义)→ 后端查 id+name 在 user message 尾部追加 `<mounted-documents>` 注脚 → 模型按需调 `read_document(id)` 取全文。不再整篇注入、不再发 Sources chunk。
@@ -309,13 +309,13 @@
 
 ---
 
-### 决策 16:上下文管理——rig 0.41 原生 ConversationMemory + CompactingMemory(二期 B1 + B2)
+### 决策 16:上下文管理——rig 0.44 原生 ConversationMemory + CompactingMemory(二期 B1 + B2)
 
-**决策**:直接复用 rig 0.41 的上下文管理基础设施,不手写 trim/compact。`crates/agent-core/memory_bridge.rs` 把项目 `Memory`(SQLite)适配为 rig `ConversationMemory`(newtype `SqliteMemory` 绕过孤儿规则),再挂 `CompactingMemory` 组合 `TokenWindowMemory` policy(超预算裁剪)+ 自实现 `LlmCompactor`(LLM 生成滚动摘要)。agent 构造 `.memory(CompactingMemory).conversation(id)`,load 时自动裁剪+压缩,turn 结束 rig 自动 append(我们的实现是 no-op,消息由 send_message 手动建)。
+**决策**:直接复用 rig 0.44 的上下文管理基础设施,不手写 trim/compact。`crates/agent-core/memory_bridge.rs` 把项目 `Memory`(SQLite)适配为 rig `ConversationMemory`(newtype `SqliteMemory` 绕过孤儿规则),再挂 `CompactingMemory` 组合 `TokenWindowMemory` policy(超预算裁剪)+ 自实现 `LlmCompactor`(LLM 生成滚动摘要)。agent 构造 `.memory(CompactingMemory).conversation(id)`(0.44 conversation 从 prompt 调用上移到 builder),load 时自动裁剪+压缩,turn 结束 rig 自动 append(我们的实现是 no-op,消息由 send_message 手动建)。
 
 **理由**:
 
-- **不重复造轮**:rig 0.41 + rig-memory 0.41 提供完整上下文管理(`ConversationMemory` trait + `Compactor` trait + `CompactingMemory`/`TokenWindowMemory`/`HeuristicTokenCounter`)。手写 trim/compact 是重复实现已有能力,且 rig 的实现更完备(in-flight 防并发、watermark 去重、carry_over 滚动摘要)。
+- **不重复造轮**:rig 0.44 + rig-memory 0.44 提供完整上下文管理(`ConversationMemory` trait + `Compactor` trait + `CompactingMemory`/`TokenWindowMemory`/`HeuristicTokenCounter`)。手写 trim/compact 是重复实现已有能力,且 rig 的实现更完备(in-flight 防并发、watermark 去重、carry_over 滚动摘要)。
 - **不引入 tokenizer**(原则 2 轻量化)。`HeuristicTokenCounter::openai()` = chars/4 + per_message_overhead,与原手写 `estimate_tokens` 同语义,偏松安全侧。
 - **模型上下文窗口动态获取**:替代硬编码 100K,`context_window.rs` 五层 fallback(用户配置 > 官方元数据探测(按 kind 分派:OpenAI 兼容 /models 读 context_length、Anthropic /v1/models 读 context_window、Gemini models.get 读 inputTokenLimit、Ollama /api/show 读 GGUF) > 内置已知模型表(DeepSeek V4 1M 等无官方元数据的模型,按 kind+模型名前缀匹配) > 默认 100K),作为 `TokenWindowMemory` 的预算参数。探测全程超时+错误保护,1h 缓存,配置变更 `invalidate_cache()` 清空。
 - **真实 usage 落库**:rig 流式上报 `CompletionCall`(含 `Usage`),`has_values()` 过滤全 0 哨兵后落库到 assistant 消息(prompt_tokens/completion_tokens/total_tokens 三列,幂等迁移)。供下次 context_window 判定参考。
@@ -399,6 +399,18 @@ prompt caching 是 prefix match——前缀任意一字节变化,后面全失效
 - OpenAI 式自动注入「用户上传了文件」提示——被业界吐槽为 bad pattern,过度触发工具
 - 强制 `[n]` Citation 角标——agentic search 下工具检索的文档无编号,强制 `[n]` 会让模型困惑;改为自然语言引用文档名
 
+**修订(2026-09-22):@ token 携带知识库路径 + 注脚补 path + 幂等补挂载**
+
+背景:决策 17 初版下 `@` token 只带文件名(`@fileName`),同名文件(不同文件夹)无法区分;用户复制指令跨会话重放时,原会话挂载关系不在新会话,且注脚只有 `id+name`,模型无法反查 path → 建模工具反馈「知识库中没有检索到这个附件」。
+
+三项变更:
+
+1. **token 携带 KB 路径**:新增 `docMentionToken(name, folder_path)` 纯函数(单一来源),MentionMenu 插入与 `resolveMentionedPaths` 解析共用。非根目录文件 token 为 `@<folder_path>/<name>`(如 `@知识库/试驾/报告.pdf`),根目录/无 folder_path 回退 `@<name>`。正则 `/@([^\s@]+)/g` 的 `[^\s@]` 天然含 `/`,路径 token 整体捕获,无需改正则。
+2. **解析改全库 + 优先级链**:`resolveMentionedPaths(text, allDocs, skills)` 改收 `list_all_documents` 全库清单(不再要求先挂载)。优先级:`完整路径 token 精确匹配 > 纯 name 兜底 > skill name`,重名文件由路径 token 天然区分;skill-md 文档过滤(走 skill 解析,避免与 skill name 冲突)。
+3. **后端幂等补挂载 + 注脚补 path**:`send_message` 中 `mounted_refs` 变 `(id, name, path)` 三元组;库内文件即使未挂载也 `mount_document`(`INSERT OR IGNORE` 幂等)补挂载——跨会话重放不再丢挂载,失败仅 warn 不阻断发送。注脚每行输出 `- id: ..., name: ..., path: ...`,模型可反查 path。
+
+落地:`src/lib/mention.ts`(docMentionToken + 双 map 解析)、`src/components/chat/MentionMenu.tsx`(candidateToken 用 docMentionToken + 菜单项路径副行)、`src/components/chat/Composer.tsx`(useAllDocuments 全库清单)、`src-tauri/src/commands/chat.rs`(三元组 + 补挂载 + 注脚补 path)。
+
 ### 决策 18:IPC 边界 BigInt 公约——`#[specta(type = specta_typescript::Number)]` 逐字段注解(三期)
 
 **决策**:`#[derive(specta::Type)]` 的 struct/enum 字段含 `u64/i64/usize/isize/i128/u128/f128` 时,逐字段加 `#[specta(type = specta_typescript::Number)]` 注解导出为 TS `number`,不手写 newtype 绕行(除非该 newtype 有独立领域语义,如 `memory::Timestamp`)。
@@ -478,7 +490,7 @@ prompt caching 是 prefix match——前缀任意一字节变化,后面全失效
 │                                                         │
 │  agent-core MCP(二期 A3)                                │
 │    ├─ McpManager(rmcp 1.x client + 连接管理)           │
-│    ├─ build_dynamic_tool(自实现 rig 0.41 DynamicTool 桥接)          │
+│    ├─ build_dynamic_tool(自实现 DynamicTool 桥接)          │
 │    └─ memory_bridge(ConversationMemory + CompactingMemory 自动压缩)│
 │                                                         │
 │  ontology/  (本体建模 + 元数据,三期)                    │
@@ -506,13 +518,13 @@ prompt caching 是 prefix match——前缀任意一字节变化,后面全失效
 
 ## 五、最终依赖清单
 
-> 版本号经 crates.io 实时核实(2026-07),`^` 锁主版本区间。`rig 0.41` 发布节奏快(约每月 2 个 minor),第三节 ADR 中涉及 rig-core 的具体 API 名称(如 `UserContent::Image`、loaders feature 等)落地时以 0.41 官方文档为准核对。
+> 版本号经 crates.io 实时核实(2026-10 已随 rig 0.44 迁移复核),`^` 锁主版本区间。`rig 0.44` 发布节奏快(约每月 2 个 minor),第三节 ADR 中涉及 rig-core 的具体 API 名称(如 `Message::User.content: Vec<UserContent>`、`DynModel<Completion>` 等)落地时以 0.44 官方文档为准核对。
 
 ```toml
 # crates/agent-core
 [dependencies]
-rig = { version = "0.41", default-features = false, features = ["reqwest","derive","rustls","memory","agent"] }  # agent 框架(启用 agent+memory feature)
-rig-memory = { version = "0.41", default-features = false }  # 上下文管理策略(SlidingWindow/TokenWindow/CompactingMemory,见决策 16)
+rig = { version = "0.44", default-features = false, features = ["reqwest","derive","rustls","memory","agent"] }  # agent 框架(启用 agent+memory feature)
+rig-memory = { version = "0.44", default-features = false }  # 上下文管理策略(SlidingWindow/TokenWindow/CompactingMemory,见决策 16)
 rmcp = "1.8"                # MCP client(锁定 1.x;见决策 14,不用 3.0-beta)
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-tls", "json", "stream"] }
@@ -682,7 +694,7 @@ onto-studio/
 ## 九、落地路线
 
 1. **一期 MVP**:脚手架 → Rig 接云端多模态 provider → 基础对话+流式 → ingest 核心 parser(PDF/Office/文本)→ 图片输入 → SQLite 会话
-2. **二期**:~~VLM 增强解析(复杂度检测+扫描件)~~ → ~~向量检索 RAG(已砍,改文件工具+FTS5,见决策 15)~~ → ✅ MCP 工具系统(决策 14) → ✅ 上下文管理(rig 0.41 原生 ConversationMemory+CompactingMemory,决策 16) → ✅ 文件检索工具(决策 15,jieba FTS5 + agent 工具)
+2. **二期**:~~VLM 增强解析(复杂度检测+扫描件)~~ → ~~向量检索 RAG(已砍,改文件工具+FTS5,见决策 15)~~ → ✅ MCP 工具系统(决策 14) → ✅ 上下文管理(rig 0.44 原生 ConversationMemory+CompactingMemory,决策 16) → ✅ 文件检索工具(决策 15,jieba FTS5 + agent 工具)
    - VLM 增强解析(A1)暂缓:无可用 VLM 模型,待四期 Ollama 本地 VLM 或接 GPT-4o 后再启
    - 向量 RAG(A2)砍掉:一期改用文件工具 + FTS5(agentic search),向量检索留四期
    - 实际落地顺序:A3 MCP → ~~A2 RAG~~ → B1 token 预算 → B2 自动压缩 → 文件工具(见 PROGRESS.md)
@@ -1405,7 +1417,7 @@ specta-typescript = "0.0.12"  # 禁止 64 位整数导出;逐字段 #[specta(typ
 tauri-specta = "2.0.0-rc.25"  # rc 版,API 已变(与 1.x 不兼容)
 
 # 业务 crates(workspace 成员)
-agent-core = { path = "../crates/agent-core" }   # 含 rig 0.41 agent + memory_bridge + rmcp 1.x(二期)
+agent-core = { path = "../crates/agent-core" }   # 含 rig 0.44 agent + memory_bridge + rmcp 1.x(二期)
 federation = { path = "../crates/federation" }  # 三期联邦查询(DataFusion 54 + sqlx 0.9)
 ingest = { path = "../crates/ingest" }
 memory = { path = "../crates/memory" }           # jieba FTS5,无 sqlite-vec
@@ -1905,7 +1917,7 @@ CREATE TABLE IF NOT EXISTS ontology_charter (
 **关键设计决策**：
 
 - **1:1 用 api_name 而非 ontology_id 作主键**：ontology 行被 delete+recreate 时 id 会变（`new_id()`），但 api_name 稳定——charter 跟着 api_name 走不丢
-- **四字段拆分而非一坨 markdown**：`business_scenario`（场景）/`business_essence`（本质）/`design_intent`（意图）/`invariants`（补充说明，自由文本非数组）——让 agent 读取时能结构化理解「场景-本质-意图-约束」四元组
+- **四字段拆分而非一坨 markdown**：`business_scenario`（场景）/`business_essence`（本质）/`design_intent`（意图）/`invariants`（补充说明）——让 agent 读取时能结构化理解（**后续修订**：决策 24 补充——2026-09 用户决策收敛为业务场景/业务本质两字段，后两字段废弃不下发，结构保留兼容存量）
 - **不在 `OntologyPayload` 里**：payload 是 Gaia 对齐的 write-view，charter 是 onto-studio 本地的「说明层」。export 不带 charter（保持 Gaia 兼容），import 不从 payload 读 charter（避免覆盖）
 - **`upsert_ontology` 去掉 description 覆盖**：增量 import 的 UPDATE 分支只改 `display_name + updated_at`，description 不再被覆盖——description 归 charter 管理域。新建本体首导时仍用 payload.description 作初始值
 - **invariants 用 text 不用数组**：自由文本存储补充内容，比 JSON 数组更灵活（可写自然语言约束、边界条件、多段说明）
@@ -1939,3 +1951,78 @@ CREATE TABLE IF NOT EXISTS ontology_charter (
 - 复用决策 18 BigInt 公约（`updated_at` 用 Number 注解）
 - 复用 Gaia 对齐原则——charter 不进 `OntologyPayload`，保持 export/import 对称
 - 不引入新原生依赖（纯 SQL + 现有 rusqlite，符合原则 1/3）
+
+### 决策 23：设计宪章用户主权——AI 永不写宪章（2026-09，MR #541/#542/#547）
+
+**背景**：决策 22 落地后实测发现，charter 的「不随历史变化」仅靠 tool 描述软约束（"只有用户明确要求时才调用"）——LLM 可绕过，且实测中 AI 会主动规划借 `import_ontology_ttl(overwrite=true)` 改写整个 TTL 头部内嵌宪章（侧门）。宪章是不变点，修改属用户设计决策，必须架构级堵死。
+
+**约束（红线）**：宪章写入路径唯一——用户在 CharterPanel 点「保存」。AI 在任何情况下不得写宪章，包括用户明确授权（守卫在 Rust 工具层，非提示词层）。
+
+**实现三层**：
+1. **agent 工具移除**：`set_ontology_ttl_charter` / `set_ontology_charter` 从工具组删除（TTL 8→7、Palantir 4→3，反向断言防回加）；前端 IPC 通道保留——CharterPanel「保存」与 AI 建议采纳落库的唯一路径
+2. **import 侧门守卫**：agent 的 import 工具在「同 IRI + overwrite=true + owl:Ontology 头部宪章四谓词与库内原文不一致」时拒绝（`extract_charter_predicates` + `charter_guard`）；新本体首导/未动宪章/overwrite=false 放行，AI 建模能力完好；前端 IPC 手动导入不设限
+3. **AI 建议纯前端**：四模式（起草/补全/完善/查漏）建议卡片，逐字段采纳进草稿，永不自动落库；AI 不虚构业务事实（缺失→null + 提问）
+
+**配套**：charter 表为空时前端回退解析 TTL 头部内嵌宪章显示（`src/lib/ttl-charter.ts`）；用户保存后以表为准。
+
+**实测验证**：对话要求 AI 改宪章，AI 尝试 SPARQL UPDATE（只读端点不通）→ 读到守卫语义主动放弃 import → 给出面板手工修改指引 + 语义影响提醒。用户授权无法突破（架构级）。
+
+**详细设计/威胁模型/测试清单**：见 `docs/CHARTER-SOVEREIGNTY.md`。**改动宪章相关代码前必读该文档第五节（写入路径全景）**。
+### 决策 24：宪章先行——本体创建 = 用户确认宪章（2026-09）
+
+**背景**：宪章是本体建模的前提（不变点基线），但此前「新建本体」只能经 agent 的
+import 工具从 0 创建，宪章事后补——顺序颠倒，AI 建模时没有业务基线可依。
+
+**约束**：本体不存在时，agent 的 `import_ontology` / `import_ontology_ttl` 一律拒绝
+（`new_ontology_gate_palantir` / `new_ontology_gate_ttl`，Rust 工具层硬闸门）。
+本体创建的唯一合法路径 = 用户在「新建本体」宪章向导确认宪章并保存
+（前端 IPC `create_ontology_with_charter` / `create_ontology_ttl_with_charter`，
+Rust 工具层无对应路径，AI 不可达）。存量本体放行（不搞迁移）。
+
+**冷启动新流程**：用户给文档 → agent 输出建模思路 + 宪章两字段要点草稿（业务场景/业务本质，2026-09 用户决策：宪章仅两字段，design_intent/invariants 废弃不下发，结构保留兼容存量） →
+指引用户完成向导（AI 起草建议可预填，用户采纳/修改后保存）→ 本体建立 →
+agent 增量导入建模成果。对话内 AI 不再尝试导入未建立的本体。
+
+**配套**：向导组件 `src/components/ontology/CreateOntologyWizard.tsx`
+（ttl/palantir 双形态，AI 起草复用 `charter-suggest.ts`）；
+TTL 骨架含 owl:Ontology 头部 + 宪章四谓词（`TtlStore::create_with_charter`，
+双载体一致）；SKILL 冷启动指引同步重写（删除过时的 set_ontology_charter 调用指引）。
+
+### 决策 24：跨标准能力复用——W3C 与 Palantir 双标准的能力打通（2026-09，MR #533/#543）
+
+**背景**：onto-studio 支持两种本体标准，能力发展不均衡——
+
+| 能力 | W3C（Turtle） | Palantir（OntologyPayload） |
+|---|---|---|
+| 概念图谱可视化 | ✅ ConceptGraph（G6 v5，重写后：5 布局/minimap/搜索/位置持久化） | ❌ 仅表格卡片 |
+| 结构化建模编辑 | ✅ PropertiesPanel（属性/关系增删改 + ttl_edit 文本手术 + surgery_import 闸门） | ❌ 仅整包 JSON 导入（冷启动）+ 删除，导入后不可改 |
+
+标准间语义存在稳定映射（`owl:Class ↔ ObjectType`、`owl:DatatypeProperty ↔ PropertyDef`、`owl:ObjectProperty ↔ LinkDef`），重复实现两套交互既浪费也让两条路径的体验漂移。
+
+**决策**：能力按「纯逻辑转换层 + 复用现有交互组件」的方式跨标准复用，**不为第二条标准重写交互、不新增后端命令**（现有写入/读取通道已全备）。
+
+**落地一：概念图谱复用**（`src/lib/palantir-graph.ts`）
+
+- `OntologyPayload → ConceptNode/ConceptEdge` 纯函数转换，渲染直接复用 ConceptGraph 全部交互（布局/minimap/搜索/☑属性开关）
+- 语义映射：`ObjectTypeDef → class 节点`、`PropertyDef → datatype 节点（dt: 前缀防撞名，iri 位存 data_type）`、`LinkDef → object 边`；悬空引用边保留、节点不伪造
+- datatype 边 id 格式对齐 `ontology-graph.ts`（`d-{属性}-{domain}`），保两侧行为一致
+- OntologyView Palantir 详情新增「概念图谱」Tab；`onJumpToSource` 语义适配为弹出对象类型定义摘要（Palantir 无 Turtle 源码）
+
+**落地二：结构化建模编辑复用**（`src/lib/palantir-modeling.ts`）
+
+- 属性/关系的编辑交互对齐 W3C PropertiesPanel（api_name 编辑态锁定=身份、命名预检、data_type/cardinality 枚举下拉、PK/T/可搜索勾选）
+- 纯逻辑层可单测：`PropertyDraft`/`LinkDraft` 双向投影、`upsertProperty`/`removeProperty`/`upsertLink`/`removeLink` 不可变 payload 变换、PascalCase/camelCase 预检（对齐 `naming.rs`）与 `DATA_TYPES` 枚举校验（对齐 `data_type.rs`）
+- **落库走 Palantir 既有通道（零后端改动）**：本地改 payload → `preview_ontology_import` 预演（**errors 非空阻断**，语义对齐 W3C `surgery_import` 的校验闸门）→ `import_ontology(overwrite=[被编辑 OT])` → refetch
+- overwrite 安全性：只覆盖被编辑的 OT（`overwriteFor`），其余同名 OT 走 skip 保护；overwrite = 删旧 OT（级联 properties）重建，links 随 payload 一起带不丢失
+
+**禁止的做法**：
+
+- ❌ 为第二条标准复制粘贴一份交互组件（渲染组件保持单实现，数据层做适配）
+- ❌ 绕过 preview 预演直接 import（W3C 侧 surgery 的「校验失败不落库」闸门语义必须保持）
+- ❌ 用整包 import 覆盖全本体来实现单属性修改（范围失控，会静默丢弃其他 OT 的并发修改）
+- ❌ 在 Palantir 侧伪造 W3C 语义（如无中生有 subClassOf 层级边、给 LinkDef 编造 IRI）
+
+**与现有决策的关系**：
+
+- 复用决策 10（本体存储）、决策 22（charter 不进 payload——本决策的两条复用路径均不触碰 charter）- 渲染层复用决策 12 前端约束（组件不直接 invoke，数据变换全部在 lib 纯函数层，可单测）
+- 不引入新依赖（G6/preview/import 均为既有能力，符合原则 1/2/3）

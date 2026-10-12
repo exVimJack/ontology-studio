@@ -1,6 +1,8 @@
 // UI 层：ChatEmptyState.tsx
 // 无选中会话时的引导态。
 
+import { shortcut } from "@/lib/keyboard";
+
 import { Plus } from "lucide-react"
 import { useCreateConversation } from "@/hooks/useConversations"
 import { useProvider } from "@/hooks/useProvider"
@@ -30,7 +32,7 @@ export function ChatEmptyState() {
               </li>
             ))}
           </ul>
-          <div className="mt-2 text-xs text-fg-subtle">按 ⌘K 打开命令面板 → 设置</div>
+          <div className="mt-2 text-xs text-fg-subtle">按 {shortcut(["mod", "K"])} 打开命令面板 → 设置</div>
         </div>
       )}
 

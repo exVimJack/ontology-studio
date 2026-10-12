@@ -1,11 +1,16 @@
 # Cargo 本地配置
 #
-# 原为 Windows 环境配置（target-dir 指向 C:/Users/think/AppData/Local/...，
-# 规避 WDAC/Smart App Control）。同步到 macOS 后该 Windows 路径会导致
-# cargo join fallback library path 时把 `:` 当分隔符而报错
-# ("path segment contains separator `:`")，故改为 macOS 本地路径。
-#
-# 切回 Windows 时需恢复为：
-#   target-dir = "C:/Users/think/AppData/Local/onto-studio-target"
+# target-dir 使用项目本地 `target`（workspace 根，即 D:/Code/ontology-studio/target）。
+# 此前 Windows 曾重定向到 C:/Users/think/AppData/Local/onto-studio-target（115GB 旧缓存），
+# 同步到 macOS 时该绝对路径无法复用，故改为项目本地 `target`。此改动在 Windows/macOS 均有效，
+# 保持新版本，不再恢复旧路径。旧 `C:/Users/think/AppData/Local/onto-studio-target` 已作废，
+# 如需清理磁盘可手动删除。
 [build]
 target-dir = "target"
+
+# Windows MSVC 链接器：用 rustup 自带的 rust-lld（LLVM lld 的 MSVC 版驱动，lld-link 同款），
+# 无需手动安装 LLVM。相比默认 link.exe 显著缩短链接时间，尤其利于 Tauri 这种巨型依赖图。
+# 说明：rust-lld 随 toolchain 提供（lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe），
+# rustc 会按其 lld 驱动名自动传正确 flavor。已通过 rustc -C linker=rust-lld 实测（自包含 CRT）。
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

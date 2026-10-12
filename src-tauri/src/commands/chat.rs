@@ -76,13 +76,17 @@ pub struct SendMessageInput {
 
     pub content: String,
 
-    /// 本次携带的挂载文档路径列表（用户在消息中 `@fileName` 引用的文档）。
+    /// 本次携带的挂载文档路径列表（用户在消息中 `@token` 引用的文档）。
 
-    /// 后端不从这些文档读全文注入 prompt——而是查得每篇的 id+name，
+    /// token 形态：`@文件夹/文件名`（知识库路径，决策 17 修订）/ `@文件名`（旧消息兜底）
 
-    /// 在 user message 尾部追加 `<mounted-documents>` 注脚，模型按需调
+    /// / `@skillName`。后端不从这些文档读全文注入 prompt——而是查得每篇的 id+name+path，
 
-    /// `read_document(id)` 工具取全文（agentic search，cache 友好）。
+    /// 在 user message 尾部追加 `<conversation-scope>` 注脚，模型按需调
+
+    /// `read_document(id)` 工具取全文（agentic search，cache 友好）；同时对库内文件
+
+    /// 幂等补挂载（复制指令到新会话重放时文件未挂载的场景）。
 
     #[serde(default)]
 
@@ -198,23 +202,54 @@ pub async fn send_message(
     let user_id = uuid::Uuid::new_v4().to_string();
     let assistant_id = uuid::Uuid::new_v4().to_string();
 
-    // 1. 查挂载文档的 id + name（不读全文），在 user message 尾部追加注脚。
-    //    模型看到 `@fileName` / `@skillName` 文本（位置语义保留）+ 注脚里的 id，
-    //    可按需调 read_document(id) 取全文。注脚在 user message（动态尾部），
-    //    不破坏 system prompt prefix cache。
-    //    skill path（`skill://<name>`）与文件 path 统一走 read_document_by_path，
-    //    注脚分两组呈现（[技能] / [挂载文档]），语义更清晰。
-    let mut mounted_refs: Vec<(String, String)> = Vec::new(); // (id, name) 文件
+    // 1. 解析 mounted_paths：查得 id + name + path，并对库内文件幂等补挂载。
+
+    //    - 幂等补挂载（mount_document INSERT OR IGNORE）：指令复制到新会话重放时
+
+    //      文件未挂载，补上后进入激活集（resolve_active_doc_paths），
+
+    //      search_documents / ScopeChip 均可见——修复「知识库中没有检索到这个附件」。
+
+    //    - 模型看到 `@文件夹/文件名` / `@skillName` 文本（位置语义保留）+ 注脚里的 id+path，
+
+    //      可按需调 read_document(id) 取全文。注脚在 user message（动态尾部），
+
+    //      不破坏 system prompt prefix cache。
+
+    //    - skill path（`skill://<name>`）与文件 path 统一走 read_document_by_path，
+
+    //      注脚分两组呈现（[技能] / [挂载文档]），语义更清晰。
+
+    let mut mounted_refs: Vec<(String, String, String)> = Vec::new(); // (id, name, path) 文件
+
     let mut skill_refs: Vec<(String, String)> = Vec::new(); // (id, name) skill
+
     for raw_path in &input.mounted_paths {
+
         let path = memory::canonicalize_path(raw_path);
+
         match state.memory.read_document_by_path(&path) {
+
             Ok(Some((id, name, format, _text, _char_count))) => {
+
                 if format == "skill-md" {
+
                     skill_refs.push((id, name));
+
                 } else {
-                    mounted_refs.push((id, name));
+
+                    // 幂等补挂载（已挂载则 no-op）；失败不阻断发送（注脚仍给 id+path）
+
+                    if let Err(e) = state.memory.mount_document(conv_id, &path) {
+
+                        tracing::warn!(path = %path, error = %e, "send_message: auto mount failed");
+
+                    }
+
+                    mounted_refs.push((id, name, path));
+
                 }
+
             }
             Ok(None) => {
                 tracing::warn!(path = %path, "send_message: mounted doc not found in documents table");
@@ -261,75 +296,38 @@ pub async fn send_message(
     let user_text = if !has_scope {
         input.content.clone()
     } else {
+        // charter 查询以闭包注入（Palantir / W3C 两套 store 同形，映射统一摘要结构），
+        // 注脚渲染抽为纯函数 render_conversation_scope（无状态、可单测）。
+        let palantir_charter = |ont: &str| {
+            state
+                .ontology_store
+                .get_charter(ont)
+                .ok()
+                .map(|c| CharterSummary {
+                    business_scenario: c.business_scenario.clone(),
+                    business_essence: c.business_essence.clone(),
+                })
+        };
+        let ttl_charter = |iri: &str| {
+            state
+                .ttl_store
+                .get_charter(iri)
+                .ok()
+                .map(|c| CharterSummary {
+                    business_scenario: c.business_scenario.clone(),
+                    business_essence: c.business_essence.clone(),
+                })
+        };
         let mut buf = input.content.clone();
-        buf.push_str("\n\n<conversation-scope>\n");
-        buf.push_str("以下是本会话激活的知识范围（`@xxx` token 指向这些资源）。用对应工具按需检索，不必全部读取：\n");
-        // 激活数据源 + 表清单
-        if !source_tables.is_empty() {
-            buf.push_str("\n[数据源] 可用 execute_sql 工具查询（表名用三段式 `source.schema.table`）：\n");
-            for (name, tables) in &source_tables {
-                if tables.is_empty() {
-                    buf.push_str(&format!("- {name}（表清单待 list_data_sources 工具获取）\n"));
-                } else {
-                    buf.push_str(&format!("- {name}：{} 张表 — {}\n", tables.len(), tables.join(", ")));
-                }
-            }
-        }
-        // 激活文件夹（范围标记，模型用 search_documents 在该范围检索）
-        if !active_folders.is_empty() {
-            buf.push_str("\n[文件夹] 可用 search_documents 工具在这些目录下检索文档：\n");
-            for f in &active_folders {
-                buf.push_str(&format!("- {f}\n"));
-            }
-        }
-        // 技能（@skillName 引用，skill body 入库 documents，统一 read_document 路径）
-        if !skill_refs.is_empty() {
-            buf.push_str("\n[技能] 可用 read_document 工具按 id 读取技能全文（SKILL.md body）：\n");
-            for (id, name) in &skill_refs {
-                buf.push_str(&format!("- id: {id}, name: {name}\n"));
-            }
-        }
-        // 挂载文档（可用 read_document 工具按 id 取全文）
-        if !mounted_refs.is_empty() {
-            buf.push_str("\n[挂载文档] 可用 read_document 工具按 id 读取全文：\n");
-            for (id, name) in &mounted_refs {
-                buf.push_str(&format!("- id: {id}, name: {name}\n"));
-            }
-        }
-        // 本体引用（混存两种：Palantir api_name 或 W3C 本体 IRI，二者不冲突）。
-        //  - W3C：IRI 含 `://`（如 https://...#Ont），用 export_ontology_ttl / query_ontology_sparql 钻取
-        //  - Palantir：PascalCase api_name，用 describe_ontology / describe_object_type 钻取
-        // 注脚附 charter 摘要（业务本质 + 补充说明前 200 字）——让 AI 无需调工具
-        // 就知道本体是干什么的、有哪些红线（决策：本体不变点，向 AI 说明业务本质）。
-        if !active_ontologies.is_empty() {
-            let (mut ttl_refs, mut palantir_refs) = (Vec::new(), Vec::new());
-            for ont in &active_ontologies {
-                if ont.contains("://") {
-                    ttl_refs.push(ont);
-                } else {
-                    palantir_refs.push(ont);
-                }
-            }
-            if !palantir_refs.is_empty() {
-                buf.push_str("\n[本体·平台私有] 可用 describe_ontology 工具获取 OT 目录，describe_object_type 看单个 OT 详情，list_link_types/describe_link_type 看关系：\n");
-                for ont in &palantir_refs {
-                    buf.push_str(&format!("- {ont}\n"));
-                    if let Ok(charter) = state.ontology_store.get_charter(ont) {
-                        append_charter_summary(&mut buf, &charter.business_essence, &charter.design_intent, &charter.invariants);
-                    }
-                }
-            }
-            if !ttl_refs.is_empty() {
-                buf.push_str("\n[本体·W3C 标准] 可用 export_ontology_ttl(ontology_iri) 取 Turtle 全文，query_ontology_sparql(ontology_iri, sparql) 跑 SPARQL 查询（类/属性/规则/实例）：\n");
-                for iri in &ttl_refs {
-                    buf.push_str(&format!("- {iri}\n"));
-                    if let Ok(charter) = state.ttl_store.get_charter(iri) {
-                        append_charter_summary(&mut buf, &charter.business_essence, &charter.design_intent, &charter.invariants);
-                    }
-                }
-            }
-        }
-        buf.push_str("</conversation-scope>");
+        buf.push_str(&render_conversation_scope(
+            &source_tables,
+            &active_folders,
+            &skill_refs,
+            &mounted_refs,
+            &active_ontologies,
+            &palantir_charter,
+            &ttl_charter,
+        ));
         buf
     };
 
@@ -667,29 +665,279 @@ pub async fn cancel_stream(
 
 /// 把本体设计宪章（不变点）摘要追加到 conversation-scope 注脚。
 ///
-/// Palantir `OntologyCharter` 与 W3C `TtlCharter` 字段完全一致（业务场景/本质/
-/// 设计意图/补充说明），调用方取其四字段 String 传入即可，避免泛型/重复代码。
-/// 补充说明超过 200 字截断（避免注脚膨胀）。完整 charter 走只读工具获取。
-fn append_charter_summary(
-    buf: &mut String,
-    business_essence: &str,
-    design_intent: &str,
-    invariants: &str,
-) {
+/// Palantir `OntologyCharter` 与 W3C `TtlCharter` 字段一致（业务场景/业务本质），
+/// 调用方取其字段 String 传入即可，避免泛型/重复代码。
+/// 完整 charter 走只读工具获取。
+/// 宪章两字段全空 = 未填写（手工导入的本体常见）
+fn charter_is_empty(c: &impl CharterFields) -> bool {
+    c.business_scenario().trim().is_empty()
+        && c.business_essence().trim().is_empty()
+
+}
+
+/// 两套 charter 结构字段同形，trait 统一访问（避免依赖 ontology-store 具体类型路径）
+trait CharterFields {
+    fn business_scenario(&self) -> &str;
+    fn business_essence(&self) -> &str;
+}
+impl CharterFields for ontology_store::ttl::TtlCharter {
+    fn business_scenario(&self) -> &str { &self.business_scenario }
+    fn business_essence(&self) -> &str { &self.business_essence }
+}
+impl CharterFields for ontology_store::payload::OntologyCharter {
+    fn business_scenario(&self) -> &str { &self.business_scenario }
+    fn business_essence(&self) -> &str { &self.business_essence }
+}
+
+/// 宪章缺失注入：agent 第一轮就看到，直接知会用户补全，避免做完分析才在
+/// import 撞宪章空检测闸门（白白浪费十几分钟工作）
+fn append_charter_missing_notice(buf: &mut String) {
+    buf.push_str("  ⚠️ 该本体的设计宪章为空（多为此前手工导入）。设计宪章是建模的业务意图基线：\n");
+    buf.push_str("  **若本轮任务涉及修改/迭代该本体，请先知会用户在「设计宪章」面板补全业务场景/业务本质两字段\n");
+    buf.push_str("  （可起草建议稿供用户修改确认，写入由用户操作），不要开始建模工作。**\n");
+    buf.push_str("  （import 时宪章空检测闸门会拒绝导入。）\n");
+}
+
+fn append_charter_summary(buf: &mut String, business_essence: &str) {
     if !business_essence.is_empty() {
-        buf.push_str(&format!("  业务本质：{business_essence}\n"));
+        buf.push_str(&format!("  业务本质：{business_essence}
+"));
     }
-    if !design_intent.is_empty() {
-        buf.push_str(&format!("  设计意图：{design_intent}\n"));
+}
+
+/// charter 统一摘要：Palantir `OntologyCharter` / W3C `TtlCharter` 同形字段映射，
+/// `render_conversation_scope` 不依赖两套具体 charter 类型。
+struct CharterSummary {
+    business_scenario: String,
+    business_essence: String,
+}
+
+impl CharterFields for CharterSummary {
+    fn business_scenario(&self) -> &str { &self.business_scenario }
+    fn business_essence(&self) -> &str { &self.business_essence }
+}
+
+/// 构造 `<conversation-scope>` 注脚（纯函数，可单测）。
+///
+/// 输入为本轮解析出的全部激活范围数据。决策 17：注脚只给最小元信息（不给全文/摘要），
+/// 模型按需调工具检索；挂载文档每行带 path（决策 17 修订：模型可反查知识库定位，
+/// 重名文件靠路径区分）。charter 查询以闭包注入（Palantir / W3C 两套 store 同形），
+/// 保持本函数无状态可测。语义约定（与 send_message 调用点一致）：
+/// - charter 闭包返回 None = store 查询 Err（不追加任何内容）
+/// - 返回 Some 且两字段全空白 = 宪章未填写（追加缺失知会）
+/// - 返回 Some 且 business_essence 非空 = 追加业务本质摘要
+fn render_conversation_scope(
+    source_tables: &[(String, Vec<String>)],
+    active_folders: &[String],
+    skill_refs: &[(String, String)],
+    mounted_refs: &[(String, String, String)],
+    active_ontologies: &[String],
+    palantir_charter: &dyn Fn(&str) -> Option<CharterSummary>,
+    ttl_charter: &dyn Fn(&str) -> Option<CharterSummary>,
+) -> String {
+    let mut buf = String::new();
+    buf.push_str("\n\n<conversation-scope>\n");
+    buf.push_str("以下是本会话激活的知识范围（`@xxx` token 指向这些资源）。用对应工具按需检索，不必全部读取：\n");
+    // 激活数据源 + 表清单
+    if !source_tables.is_empty() {
+        buf.push_str("\n[数据源] 可用 execute_sql 工具查询（表名用三段式 `source.schema.table`）：\n");
+        for (name, tables) in source_tables {
+            if tables.is_empty() {
+                buf.push_str(&format!("- {name}（表清单待 list_data_sources 工具获取）\n"));
+            } else {
+                buf.push_str(&format!("- {name}：{} 张表 — {}\n", tables.len(), tables.join(", ")));
+            }
+        }
     }
-    if !invariants.is_empty() {
-        let inv = if invariants.chars().count() > 200 {
-            let cut: String = invariants.chars().take(200).collect();
-            format!("{cut}…")
-        } else {
-            invariants.to_string()
+    // 激活文件夹（范围标记，模型用 search_documents 在该范围检索）
+    if !active_folders.is_empty() {
+        buf.push_str("\n[文件夹] 可用 search_documents 工具在这些目录下检索文档：\n");
+        for f in active_folders {
+            buf.push_str(&format!("- {f}\n"));
+        }
+    }
+    // 技能（@skillName 引用，skill body 入库 documents，统一 read_document 路径）
+    if !skill_refs.is_empty() {
+        buf.push_str("\n[技能] 可用 read_document 工具按 id 读取技能全文（SKILL.md body）：\n");
+        for (id, name) in skill_refs {
+            buf.push_str(&format!("- id: {id}, name: {name}\n"));
+        }
+    }
+    // 挂载文档（可用 read_document 工具按 id 取全文；path 供模型反查知识库定位）
+    if !mounted_refs.is_empty() {
+        buf.push_str("\n[挂载文档] 可用 read_document 工具按 id 读取全文：\n");
+        for (id, name, path) in mounted_refs {
+            buf.push_str(&format!("- id: {id}, name: {name}, path: {path}\n"));
+        }
+    }
+    // 本体引用（混存两种：Palantir api_name 或 W3C 本体 IRI，二者不冲突）。
+    //  - W3C：IRI 含 `://`（如 https://...#Ont），用 export_ontology_ttl / query_ontology_sparql 钻取
+    //  - Palantir：PascalCase api_name，用 describe_ontology / describe_object_type 钻取
+    // 注脚附 charter 摘要（业务本质）——让 AI 无需调工具
+    // 就知道本体是干什么的、有哪些红线（决策：本体不变点，向 AI 说明业务本质）。
+    if !active_ontologies.is_empty() {
+        let (mut ttl_refs, mut palantir_refs) = (Vec::new(), Vec::new());
+        for ont in active_ontologies {
+            if ont.contains("://") {
+                ttl_refs.push(ont);
+            } else {
+                palantir_refs.push(ont);
+            }
+        }
+        if !palantir_refs.is_empty() {
+            buf.push_str("\n[本体·平台私有] 可用 describe_ontology 工具获取 OT 目录，describe_object_type 看单个 OT 详情，list_link_types/describe_link_type 看关系：\n");
+            for ont in palantir_refs {
+                buf.push_str(&format!("- {ont}\n"));
+                match palantir_charter(ont) {
+                    Some(c) if charter_is_empty(&c) => append_charter_missing_notice(&mut buf),
+                    Some(c) => append_charter_summary(&mut buf, &c.business_essence),
+                    None => {}
+                }
+            }
+        }
+        if !ttl_refs.is_empty() {
+            buf.push_str("\n[本体·W3C 标准] 可用 export_ontology_ttl(ontology_iri) 取 Turtle 全文，query_ontology_sparql(ontology_iri, sparql) 跑 SPARQL 查询（类/属性/规则/实例）：\n");
+            for iri in ttl_refs {
+                buf.push_str(&format!("- {iri}\n"));
+                match ttl_charter(iri) {
+                    Some(c) if charter_is_empty(&c) => append_charter_missing_notice(&mut buf),
+                    Some(c) => append_charter_summary(&mut buf, &c.business_essence),
+                    None => {}
+                }
+            }
+        }
+    }
+    buf.push_str("</conversation-scope>");
+    buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 无 charter 的空查询闭包（多数用例用不到本体注脚）。
+    fn no_charter(_: &str) -> Option<CharterSummary> {
+        None
+    }
+
+    #[test]
+    fn scope_footer_mounted_doc_line_includes_path() {
+        // 决策 17 修订核心断言：挂载文档注脚每行带 path（模型可反查知识库定位）
+        let mounted = &[(
+            "doc_1".to_string(),
+            "报告.pdf".to_string(),
+            "/kb/试驾/报告.pdf".to_string(),
+        )];
+        let out = render_conversation_scope(
+            &[], &[], &[], mounted, &[],
+            &no_charter, &no_charter,
+        );
+        assert!(out.starts_with("\n\n<conversation-scope>\n"));
+        assert!(out.contains("\n[挂载文档] 可用 read_document 工具按 id 读取全文：\n"));
+        assert!(out.contains("- id: doc_1, name: 报告.pdf, path: /kb/试驾/报告.pdf\n"));
+        assert!(out.ends_with("</conversation-scope>"));
+    }
+
+    #[test]
+    fn scope_footer_mounted_doc_paths_distinguish_same_name() {
+        // 重名文件（不同文件夹）：path 原样输出，模型可区分
+        let mounted = &[
+            ("doc_1".to_string(), "a.md".to_string(), "/kb/A/a.md".to_string()),
+            ("doc_2".to_string(), "a.md".to_string(), "/kb/B/a.md".to_string()),
+        ];
+        let out = render_conversation_scope(
+            &[], &[], &[], mounted, &[],
+            &no_charter, &no_charter,
+        );
+        assert!(out.contains("path: /kb/A/a.md"));
+        assert!(out.contains("path: /kb/B/a.md"));
+    }
+
+    #[test]
+    fn scope_footer_renders_sources_folders_skills() {
+        let sources = &[("ds1".to_string(), vec!["t1".to_string(), "t2".to_string()])];
+        let folders = &["/曾国藩专题".to_string()];
+        let skills = &[("sk_1".to_string(), "建模助手".to_string())];
+        let out = render_conversation_scope(
+            sources, folders, skills, &[], &[],
+            &no_charter, &no_charter,
+        );
+        assert!(out.contains("\n[数据源]"));
+        assert!(out.contains("- ds1：2 张表 — t1, t2\n"));
+        assert!(out.contains("\n[文件夹]"));
+        assert!(out.contains("- /曾国藩专题\n"));
+        assert!(out.contains("\n[技能]"));
+        assert!(out.contains("- id: sk_1, name: 建模助手\n"));
+        // 未挂载文档时不输出 [挂载文档] 段
+        assert!(!out.contains("[挂载文档]"));
+    }
+
+    #[test]
+    fn scope_footer_no_scope_data_renders_header_only() {
+        let out = render_conversation_scope(
+            &[], &[], &[], &[], &[],
+            &no_charter, &no_charter,
+        );
+        assert!(out.contains("<conversation-scope>"));
+        assert!(!out.contains("[数据源]"));
+        assert!(!out.contains("[文件夹]"));
+        assert!(!out.contains("[技能]"));
+        assert!(!out.contains("[挂载文档]"));
+        assert!(!out.contains("[本体"));
+    }
+
+    #[test]
+    fn scope_footer_ontologies_split_by_scheme_with_charter_summary() {
+        // Palantir api_name（无 ://）与 W3C IRI（含 ://）分组；charter 有值时附业务本质
+        let with_charter = |ont: &str| {
+            let _ = ont;
+            Some(CharterSummary {
+                business_scenario: "二手车试驾场景".to_string(),
+                business_essence: "成交意愿的结构化表达".to_string(),
+            })
         };
-        buf.push_str(&format!("  业务约束：{inv}\n"));
+        let out = render_conversation_scope(
+            &[], &[], &[], &[],
+            &["CarOntology".to_string(), "https://example.com#Ont".to_string()],
+            &with_charter, &no_charter,
+        );
+        assert!(out.contains("\n[本体·平台私有]"));
+        assert!(out.contains("- CarOntology\n"));
+        assert!(out.contains("  业务本质：成交意愿的结构化表达\n"));
+        assert!(out.contains("\n[本体·W3C 标准]"));
+        assert!(out.contains("- https://example.com#Ont\n"));
+    }
+
+    #[test]
+    fn scope_footer_empty_charter_appends_missing_notice() {
+        // 宪章两字段全空白 = 未填写 → 追加缺失知会（不追加业务本质行）
+        let empty_charter = |ont: &str| {
+            let _ = ont;
+            Some(CharterSummary {
+                business_scenario: "  ".to_string(),
+                business_essence: String::new(),
+            })
+        };
+        let out = render_conversation_scope(
+            &[], &[], &[], &[],
+            &["Ont".to_string()],
+            &empty_charter, &no_charter,
+        );
+        assert!(out.contains("设计宪章为空"));
+        assert!(!out.contains("业务本质："));
+    }
+
+    #[test]
+    fn scope_footer_charter_lookup_error_renders_nothing_extra() {
+        // 闭包返回 None（对应 store 查询 Err）：不追加 charter 内容
+        let out = render_conversation_scope(
+            &[], &[], &[], &[],
+            &["Ont".to_string()],
+            &no_charter, &no_charter,
+        );
+        assert!(out.contains("- Ont\n"));
+        assert!(!out.contains("设计宪章为空"));
+        assert!(!out.contains("业务本质："));
     }
 }
 

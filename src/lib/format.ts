@@ -70,6 +70,25 @@ export function progressPercent(
 }
 
 /**
+ * 会话消息时间戳格式化：同日仅 HH:mm，跨日补 MM-DD 前缀。
+ *
+ * 会话内消息时间跨度通常在数天内，同日省略日期降低视觉噪声；
+ * 跨日消息（昨晚/上周的会话）补 MM-DD 才能区分先后。
+ *
+ * @example formatMessageTime(new Date("2026-08-26T09:05:00"))            → "09:05"（同日）
+ * @example formatMessageTime(new Date("2026-08-25T22:30:00"))           → "08-25 22:30"（跨日）
+ */
+export function formatMessageTime(d: Date, now: Date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, "0")
+  const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate()
+  return sameDay ? hm : `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`
+}
+
+/**
  * 摄入任务的状态优先级（值越小越靠前展示）。
  *
  * 排序策略（活动置顶，业界最佳实践，参考 Nexus Mods 下载器、UploadKit）：

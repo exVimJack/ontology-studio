@@ -4,7 +4,9 @@
 // 语义（决策 17 + CONVERSATION-SCOPE §2.3）：
 //   `@` = 在当前消息文本里插入引用 token（位置语义）。
 //   - @文件夹 → 插入 `@folderName`，加入 active_folders（范围标记，模型用工具按需检索）
-//   - @文件   → 插入 `@fileName`，mount 到会话
+//   - @文件   → 插入 `@文件夹/文件名`（根目录 `@文件名`），mount 到会话 —— token 携带
+//              知识库路径，复制指令到新会话重放仍能定位文件（决策 17 修订，
+//              token 格式单一来源 docMentionToken）
 //   - @数据源  → 插入 `@sourceName`，加入 active_sources
 //   - @数据源表 → 插入 `@sourceName.tableName`，加入 active_sources
 //
@@ -57,6 +59,7 @@ import { useOntologies } from "@/hooks/useOntology";
 import { useOntologyTtls } from "@/hooks/useOntologyTtl";
 import { useFolders } from "@/hooks/useFolders";
 import { getFileIcon } from "@/lib/file-icons";
+import { docMentionToken } from "@/lib/mention";
 import { isSkillActive } from "@/lib/domain";
 
 interface MentionMenuProps {
@@ -91,7 +94,9 @@ function candidateToken(c: Candidate): string {
     case "folder":
       return `@${c.name}`;
     case "doc":
-      return `@${c.doc.name}`;
+      // token 携带知识库路径（`@文件夹/文件名`），复制指令跨会话重放仍能定位；
+      // 根目录散文件保持 `@文件名`。格式与 resolveMentionedPaths 共用 docMentionToken。
+      return `@${docMentionToken(c.doc.name, c.doc.folder_path)}`;
     case "source":
       return `@${c.name}`;
     case "table":
@@ -488,22 +493,25 @@ export function MentionMenu({
       ref={menuRef}
       className="absolute bottom-full left-0 z-50 mb-1 max-h-72 w-80 max-w-[calc(100vw-1.5rem)] overflow-auto rounded-md border border-border bg-bg-elevated py-1 shadow-lg"
     >
-      {/* 层级标题（面包屑） */}
-      <div className="border-b border-border px-3 py-1 text-[10px] font-medium uppercase tracking-wide text-fg-subtle">
+      {/* 层级标题（面包屑）：左侧层级名，右侧操作提示（右对齐，醒目） */}
+      <div className="flex items-center gap-1 border-b border-border px-3 py-1 text-[10px] font-medium uppercase tracking-wide text-fg-subtle">
         {nav.mode === "folder" && (
-          <FolderIcon size={10} className="mr-1 inline" />
+          <FolderIcon size={10} className="shrink-0" />
         )}
         {nav.mode === "source" && (
-          <Database size={10} className="mr-1 inline" />
+          <Database size={10} className="shrink-0" />
         )}
-        {nav.mode === "root" && <FileText size={10} className="mr-1 inline" />}
-        {header}
-        {nav.mode === "folder" && (
-          <span className="ml-1 text-fg-muted">（输入 / 进入子目录）</span>
-        )}
-        {nav.mode === "source" && (
-          <span className="ml-1 text-fg-muted">（输入 . 选表）</span>
-        )}
+        {nav.mode === "root" && <FileText size={10} className="shrink-0" />}
+        <span className="truncate">{header}</span>
+        {nav.mode === "source" ? (
+          <span className="ml-auto shrink-0 pl-2 font-normal normal-case text-fg-muted">
+            输入 . 选表
+          </span>
+        ) : (nav.mode === "folder" ? currentFolderChildren.length > 0 : folderTree.length > 0) ? (
+          <span className="ml-auto shrink-0 pl-2 font-normal normal-case text-fg-muted">
+            输入 / 进入子目录
+          </span>
+        ) : null}
       </div>
 
       {candidates.length === 0 ? (
@@ -588,9 +596,15 @@ export function MentionMenu({
                         <Icon size={14} className={`shrink-0 ${iconCls}`} />
                       );
                     })()}
-                    <span className="min-w-0 flex-1 truncate">
-                      {c.doc.name}
-                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate">{c.doc.name}</div>
+                      {/* 非根目录文件显示所属 KB 路径（与插入 token 一致），重名文件可分辨 */}
+                      {c.doc.folder_path && c.doc.folder_path !== "/" && (
+                        <div className="truncate text-[10px] text-fg-subtle">
+                          {c.doc.folder_path}
+                        </div>
+                      )}
+                    </div>
                     {c.doc.char_count > 0 && (
                       <span className="shrink-0 text-[10px] text-fg-subtle">
                         {c.doc.char_count > 1000
@@ -673,14 +687,14 @@ export function MentionMenu({
                 )}
                 {c.kind === "skill" && (
                   <>
-                    <Zap size={14} className="shrink-0 text-amber-500" />
+                    <Zap size={14} className="shrink-0 text-warning" />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-1">
                         <span className="truncate text-fg">{c.skill.name}</span>
                         {c.skill.disable_model_invocation && (
                           <Shield
                             size={9}
-                            className="shrink-0 text-amber-500"
+                            className="shrink-0 text-warning"
                             aria-label="需 @ 手动激活"
                           />
                         )}

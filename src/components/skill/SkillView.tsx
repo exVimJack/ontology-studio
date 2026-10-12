@@ -58,7 +58,7 @@ const FILTER_TABS: { key: FilterTab; label: string }[] = [
 ];
 
 export function SkillView() {
-  const setSkillsOpen = useUiStore((s) => s.setSkillsOpen);
+  const setActiveNav = useUiStore((s) => s.setActiveNav);
   const {
     data: skills = [],
     isLoading,
@@ -139,7 +139,7 @@ export function SkillView() {
   };
 
   return (
-    <div className="fixed inset-0 z-40 flex flex-col bg-bg max-md:pt-[env(safe-area-inset-top)] max-md:pb-[env(safe-area-inset-bottom)]">
+    <div className="absolute inset-0 z-40 flex flex-col bg-bg max-md:pt-[env(safe-area-inset-top)] max-md:pb-[env(safe-area-inset-bottom)]">
       {/* 顶栏 */}
       <div className="flex items-center justify-between border-b border-border px-4 py-2">
         <div className="flex items-center gap-2">
@@ -156,7 +156,7 @@ export function SkillView() {
             <RefreshCw size={14} />
           </button>
           <button
-            onClick={() => setSkillsOpen(false)}
+            onClick={() => setActiveNav("chat")}
             className="rounded-md p-1.5 text-fg-subtle hover:bg-bg-hover"
             title="关闭"
           >
@@ -196,7 +196,7 @@ export function SkillView() {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="搜索技能…"
-            className="w-full rounded-md border border-border bg-bg-elevated py-1 pl-2 pr-2 text-xs outline-none focus:border-accent"
+            className="w-full rounded-md border border-border bg-bg-elevated py-1 pl-2 pr-2 text-xs outline-none"
           />
         </div>
 
@@ -352,7 +352,7 @@ function SkillCard({
               {s.disable_model_invocation && (
                 <Shield
                   size={12}
-                  className="shrink-0 text-amber-500"
+                  className="shrink-0 text-warning"
                   aria-label="需手动召唤的技能"
                 />
               )}
@@ -400,7 +400,7 @@ function SkillCard({
               </div>
             )}
             {s.disable_model_invocation && (
-              <div className="rounded bg-amber-500/10 px-1.5 py-1 text-amber-600 dark:text-amber-400">
+              <div className="rounded bg-warning-bg px-1.5 py-1 text-warning-text">
                 <Shield size={10} className="mr-1 inline" />
                 助手不会自动使用此技能。需要时在对话中输入{" "}
                 <code className="font-mono">@{s.name}</code> 手动召唤。

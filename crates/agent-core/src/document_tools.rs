@@ -31,7 +31,7 @@ pub fn document_tools(memory: Arc<Memory>, allowed_paths: Arc<std::collections::
 
 /// `list_documents()`：列出已入库文档（id/name/format/char_count）。
 fn list_documents_tool(memory: Arc<Memory>, allowed_paths: Arc<std::collections::HashSet<String>>) -> DynamicTool {
-    DynamicTool::new(
+    crate::dynamic_tool(
         "list_documents",
         "列出知识库中所有已入库的文档。返回每篇文档的 id、文件名、格式、字符数。\
          当用户提到「我上传的文件」「知识库里有什么」「之前那个文档」等，先调用此工具了解可用文档，\
@@ -41,7 +41,7 @@ fn list_documents_tool(memory: Arc<Memory>, allowed_paths: Arc<std::collections:
             "properties": {},
             "additionalProperties": false,
         }),
-        move |_ctx, _args| {
+        move |_args| {
             let mem = memory.clone();
             let allowed = allowed_paths.clone();
             Box::pin(async move {
@@ -74,7 +74,7 @@ fn list_documents_tool(memory: Arc<Memory>, allowed_paths: Arc<std::collections:
 
 /// `search_documents(query, limit?)`：FTS5 关键词搜索。
 fn search_documents_tool(memory: Arc<Memory>, allowed_paths: Arc<std::collections::HashSet<String>>) -> DynamicTool {
-    DynamicTool::new(
+    crate::dynamic_tool(
         "search_documents",
         "在知识库文档中全文搜索。输入搜索关键词（中文词语，如「向量数据库」「知识图谱」），\
          返回匹配文档的 id、文件名、格式、高亮摘要片段、相关度排名。\
@@ -97,7 +97,7 @@ fn search_documents_tool(memory: Arc<Memory>, allowed_paths: Arc<std::collection
             "required": ["query"],
             "additionalProperties": false,
         }),
-        move |_ctx, args| {
+        move |args| {
             let mem = memory.clone();
             let allowed = allowed_paths.clone();
             Box::pin(async move {
@@ -141,7 +141,7 @@ fn search_documents_tool(memory: Arc<Memory>, allowed_paths: Arc<std::collection
 
 /// `read_document(id, offset?, limit?)`：按 id 分页读全文。
 fn read_document_tool(memory: Arc<Memory>, allowed_paths: Arc<std::collections::HashSet<String>>) -> DynamicTool {
-    DynamicTool::new(
+    crate::dynamic_tool(
         "read_document",
         "按 id 读取文档全文（可分页）。先用 list_documents 或 search_documents 拿到文档 id，\
          再用此工具读全文内容。offset/limit 按字符数（非字节），用于读取长文档的指定部分。\
@@ -166,7 +166,7 @@ fn read_document_tool(memory: Arc<Memory>, allowed_paths: Arc<std::collections::
             "required": ["id"],
             "additionalProperties": false,
         }),
-        move |_ctx, args| {
+        move |args| {
             let mem = memory.clone();
             let allowed = allowed_paths.clone();
             Box::pin(async move {

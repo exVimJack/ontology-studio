@@ -8,8 +8,8 @@
 //!   - Anthropic —— 原生多模态强，作为默认 VLM 候选（决策 7）
 //!   - Gemini —— Google Generative AI 协议（非 OpenAI 兼容，2026-08 补全）
 //!
-//! 构造方式统一：`provider::Client::builder().api_key(k).base_url(u).build()`
-//! （Rig 0.41 所有 provider 共用 client::Client 泛型壳，见 client/mod.rs）
+//! 构造方式统一：OpenAI 形协议经 `OpenAIConfig::with_key(dialect, key).connect(http)`，
+//! 原生协议（Anthropic/Gemini/Cohere/Ollama）各自 Config + connect（Rig 0.44）
 //!
 //! 配置字段对齐 pi-coding-agent 的 models.json schema（api/compat/input/maxTokens/
 //! headers/reasoning），降低用户迁移成本。reasoning 支持 4 级（Off/Low/Medium/High）。
@@ -314,8 +314,8 @@ impl ProviderConfig {
 /// - Gemini：`{ "generation_config": { "thinking_config": { "thinking_budget": 0|8192|24576 } } }`
 /// - 不支持 reasoning 的 provider / Off：返回 None
 ///
-/// 注：rig 0.41 未在 agent builder 暴露 reasoning 选项，`additional_params`
-/// 是官方留的 provider 透传口子（见 rig-agent builder.rs:274）。
+/// 注：0.44 builder 已有原生 `.reasoning()`（Reasoning enum），当前仍走
+/// `additional_params` 透传（行为等价，后续可切原生）。
 pub fn reasoning_to_params(
     kind: ProviderKind,
     level: ReasoningLevel,

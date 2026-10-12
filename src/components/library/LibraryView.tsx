@@ -26,8 +26,9 @@ import {
   ChevronRight,
   Plus,
   CheckSquare,
+  Upload,
 } from "lucide-react";
-import { confirm, message } from "@tauri-apps/plugin-dialog";
+import { confirm, message, open } from "@tauri-apps/plugin-dialog";
 import type { DocumentSummaryDto } from "@/lib/domain";
 import { useCurrentConversationId } from "@/hooks/useCurrentConversationId";
 import { useIsMobile } from "@/hooks/useIsMobile";
@@ -46,6 +47,8 @@ import {
   useRenameFolder,
   useDeleteFolder,
 } from "@/hooks/useFolders";
+import { useIngest } from "@/hooks/useIngest";
+import { ALL_EXTENSIONS } from "@/lib/file-extensions";
 import { getFileIcon } from "@/lib/file-icons";
 import { formatCharCount } from "@/lib/format";
 import { IngestStatusBoard } from "@/components/library/IngestStatusBoard";
@@ -104,6 +107,7 @@ export function LibraryView() {
   const renameFld = useRenameFolder();
   const deleteFld = useDeleteFolder();
   const currentConvId = useCurrentConversationId();
+  const ingest = useIngest(currentConvId);
   const { data: mountedDocs = [] } = useMountedDocuments(currentConvId);
   const isMobile = useIsMobile();
 
@@ -261,6 +265,24 @@ export function LibraryView() {
     });
   };
 
+  /** 知识库直传：文件对话框选择 → ingest 到当前选中文件夹（null=根目录），不挂载会话。 */
+  const handleAddFiles = async () => {
+    let selected: string | string[] | null = null;
+    try {
+      selected = await open({
+        multiple: true,
+        filters: [{ name: "文档与图片", extensions: ALL_EXTENSIONS }],
+      });
+    } catch (e) {
+      console.error("[LibraryView] 添加文件失败:", e);
+      return;
+    }
+    if (!selected) return;
+    const paths = Array.isArray(selected) ? selected : [selected];
+    if (paths.length === 0) return;
+    ingest.mutate({ paths, folderPath: selectedFolder });
+  };
+
   return (
     <div className="flex h-full flex-col bg-bg">
       <IngestStatusBoard />
@@ -307,7 +329,7 @@ export function LibraryView() {
                     setCreating(false);
                   }
                 }}
-                className="flex-1 rounded border border-border bg-bg-elevated px-2 py-1 text-xs outline-none focus:border-accent"
+                className="min-w-0 flex-1 rounded border border-border bg-bg-elevated px-2 py-1 text-xs outline-none"
               />
               <button
                 onClick={() => {
@@ -370,6 +392,14 @@ export function LibraryView() {
             <span className="truncate text-xs text-fg-muted">
               {selectedFolder ?? "根目录"}
             </span>
+            <button
+              onClick={handleAddFiles}
+              title="选择本地文件导入知识库"
+              className="flex shrink-0 items-center gap-1 rounded-md bg-accent px-2 py-1 text-xs text-white hover:bg-accent/90"
+            >
+              <Upload size={13} />
+              添加文件
+            </button>
             {selectedFolder && (
               <>
                 <button
@@ -427,7 +457,7 @@ export function LibraryView() {
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="搜索文件名…"
-                className="w-40 rounded-md border border-border bg-bg-elevated py-1 pl-7 pr-2 text-xs outline-none focus:border-accent"
+                className="w-40 rounded-md border border-border bg-bg-elevated py-1 pl-7 pr-2 text-xs outline-none"
               />
             </div>
           </div>
@@ -439,7 +469,7 @@ export function LibraryView() {
                 value={renameValue}
                 onChange={(e) => setRenameValue(e.target.value)}
                 autoFocus
-                className="flex-1 rounded border border-border bg-bg-elevated px-2 py-1 text-xs outline-none focus:border-accent"
+                className="min-w-0 flex-1 rounded border border-border bg-bg-elevated px-2 py-1 text-xs outline-none"
               />
               <button
                 onClick={() => handleRenameFolder(renaming)}
@@ -468,6 +498,9 @@ export function LibraryView() {
                   {selectedFolder
                     ? "在对话中上传文件时会落入 /Inbox，可在此移动到此文件夹"
                     : "未归入任何文件夹的文件会显示在这里"}
+                </p>
+                <p className="text-xs text-fg-subtle">
+                  点击「添加文件」选择本地文件，或直接将文件拖入窗口任意位置
                 </p>
               </div>
             ) : (

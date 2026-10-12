@@ -16,16 +16,31 @@ import { persist } from "zustand/middleware";
 
 export type Theme = "light" | "dark" | "system";
 
+// 左侧导航栏（NavRail）当前激活的功能视图。
+// "chat" 恢复会话两栏布局；其余对应主区整页视图。
+export type ActiveNav =
+  | "chat"
+  | "library"
+  | "federation"
+  | "skills"
+  | "ontology"
+  | "validation";
+
 interface UiState {
     theme: Theme;
     sidebarCollapsed: boolean;
+    // 左侧导航栏（NavRail）：当前激活视图 + 展开/收起（微信桌面版式）
+    activeNav: ActiveNav;
+    /** 校验任务工作台当前选中的本体 IRI（对话命令/工具栏触发时带入）。 */
+    validationIri: string | null;
+    navRailExpanded: boolean;
     // 移动端 Sidebar Drawer 开关（§17.2）。桌面端用 sidebarCollapsed 折叠，二者语义独立。
     mobileSidebarOpen: boolean;
     commandPaletteOpen: boolean;
-    settingsOpen: boolean;
-    federationOpen: boolean;
-    skillsOpen: boolean;
-    ontologyOpen: boolean;
+    // 模型设置弹窗（设置重构 ①：从总设置拆出的独立入口，⌘M / NavRail 左下角菜单）
+    modelSettingsOpen: boolean;
+    // MCP 工具服务器弹窗（设置重构 ③：与模型设置同形态，⌘⇧M / NavRail 左下角菜单）
+    mcpSettingsOpen: boolean;
     // Library 上传时的目标文件夹（临时态，不持久化）。
     // LibraryView 选中文件夹时同步写入；FileDropZone 上传时读取。
     // null = 根目录散文件。会话页上传时忽略此值（仍落 /Inbox）。
@@ -34,12 +49,13 @@ interface UiState {
 
     setTheme: (t: Theme) => void;
     toggleSidebar: () => void;
+    setActiveNav: (nav: ActiveNav) => void;
+    setValidationIri: (iri: string | null) => void;
+    toggleNavRail: () => void;
     setMobileSidebarOpen: (open: boolean) => void;
     setCommandPaletteOpen: (open: boolean) => void;
-    setSettingsOpen: (open: boolean) => void;
-    setFederationOpen: (open: boolean) => void;
-    setSkillsOpen: (open: boolean) => void;
-    setOntologyOpen: (open: boolean) => void;
+    setModelSettingsOpen: (open: boolean) => void;
+    setMcpSettingsOpen: (open: boolean) => void;
     setLibraryUploadFolder: (folder: string | null) => void;
     setLibraryViewActive: (active: boolean) => void;
 }
@@ -49,26 +65,29 @@ export const useUiStore = create<UiState>()(
         (set) => ({
             theme: "system",
             sidebarCollapsed: false,
+            activeNav: "chat",
+            validationIri: null,
+            navRailExpanded: false,
             mobileSidebarOpen: false,
             commandPaletteOpen: false,
-            settingsOpen: false,
-            federationOpen: false,
-            skillsOpen: false,
-            ontologyOpen: false,
+            modelSettingsOpen: false,
+            mcpSettingsOpen: false,
             libraryUploadFolder: null,
             libraryViewActive: false,
 
             setTheme: (theme) => set({ theme }),
             toggleSidebar: () =>
                 set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
+            setActiveNav: (activeNav) => set({ activeNav }),
+            setValidationIri: (validationIri) => set({ validationIri }),
+            toggleNavRail: () =>
+                set((s) => ({ navRailExpanded: !s.navRailExpanded })),
             setMobileSidebarOpen: (mobileSidebarOpen) =>
                 set({ mobileSidebarOpen }),
             setCommandPaletteOpen: (commandPaletteOpen) =>
                 set({ commandPaletteOpen }),
-            setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
-            setFederationOpen: (federationOpen) => set({ federationOpen }),
-            setSkillsOpen: (skillsOpen) => set({ skillsOpen }),
-            setOntologyOpen: (ontologyOpen) => set({ ontologyOpen }),
+            setModelSettingsOpen: (modelSettingsOpen) => set({ modelSettingsOpen }),
+            setMcpSettingsOpen: (mcpSettingsOpen) => set({ mcpSettingsOpen }),
             setLibraryUploadFolder: (libraryUploadFolder) =>
                 set({ libraryUploadFolder }),
             setLibraryViewActive: (libraryViewActive) =>
@@ -80,6 +99,7 @@ export const useUiStore = create<UiState>()(
             partialize: (s) => ({
                 theme: s.theme,
                 sidebarCollapsed: s.sidebarCollapsed,
+                navRailExpanded: s.navRailExpanded,
             }),
         },
     ),

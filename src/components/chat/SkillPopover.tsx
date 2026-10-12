@@ -29,7 +29,7 @@ export function SkillPopover({ conversationId }: { conversationId: string }) {
   const [open, setOpen] = useState(false)
   const { data: skills = [] } = useSkillsConversation(conversationId)
   const setEnabled = useSetSkillConversationEnabled(conversationId)
-  const setSkillsOpen = useUiStore((s) => s.setSkillsOpen)
+  const setActiveNav = useUiStore((s) => s.setActiveNav)
 
   const activeCount = useMemo(() => skills.filter(isSkillActive).length, [skills])
 
@@ -90,7 +90,7 @@ export function SkillPopover({ conversationId }: { conversationId: string }) {
                   <button
                     onClick={() => {
                       setOpen(false)
-                      setSkillsOpen(true)
+                      setActiveNav("skills")
                     }}
                     className="mt-1 flex items-center gap-1 text-[11px] text-accent hover:underline"
                   >
@@ -143,7 +143,7 @@ export function SkillPopover({ conversationId }: { conversationId: string }) {
                                       {s.disable_model_invocation && (
                                         <Shield
                                           size={9}
-                                          className="shrink-0 text-amber-500"
+                                          className="shrink-0 text-warning"
                                           aria-label="需 @skill-name 手动激活"
                                         />
                                       )}
@@ -178,7 +178,7 @@ export function SkillPopover({ conversationId }: { conversationId: string }) {
               <button
                 onClick={() => {
                   setOpen(false)
-                  setSkillsOpen(true)
+                  setActiveNav("skills")
                 }}
                 className="flex items-center gap-1 text-[10px] text-fg-subtle hover:text-accent"
               >

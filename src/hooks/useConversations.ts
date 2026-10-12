@@ -4,8 +4,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useNavigate } from "@tanstack/react-router"
 import { ipc } from "@/lib/ipc/commands"
-import type { CreateConversationInput } from "@/lib/domain"
+import type { CreateConversationInput, MessageRow } from "@/lib/domain"
 import { removeMountedCache } from "@/hooks/useMountedDocuments"
+import { activeRunConversations } from "@/hooks/useChat"
 
 const QK_CONVERSATIONS = ["conversations"] as const
 const QK_MESSAGES = (id: string) => ["messages", id] as const
@@ -80,9 +81,34 @@ export function useDeleteConversation() {
 const DEFAULT_MESSAGE_LIMIT = 50;
 
 export function useMessages(conversationId: string | null) {
+  const qc = useQueryClient()
   return useQuery({
     queryKey: conversationId ? QK_MESSAGES(conversationId) : ["messages", "none"],
-    queryFn: () => (conversationId ? ipc.listMessages(conversationId, DEFAULT_MESSAGE_LIMIT) : Promise.resolve([])),
+    queryFn: async () => {
+      if (!conversationId) return []
+      const rows = await ipc.listMessages(conversationId, DEFAULT_MESSAGE_LIMIT)
+      // 运行中会话保护：turn 整轮结束才落库，运行中 DB 拉到的是上一轮为止的消息；
+      // 若 DB 结果比缓存少（切走再切回的 remount refetch），保留缓存——否则流式中的
+      // 消息会被空/旧列表覆盖（"正在运行的会话不见了"）。run 结束时 onSuccess
+      // 会 invalidate，彼时 DB 已有本轮数据，正常刷新。
+      if (activeRunConversations.has(conversationId)) {
+        const cached = qc.getQueryData<MessageRow[]>(QK_MESSAGES(conversationId))
+        if (cached && cached.length > rows.length) return cached
+      }
+      return rows
+    },
+    enabled: !!conversationId,
+  })
+}
+
+/** 拉取会话全部消息（limit=null，导出等需要完整历史的场景；不参与运行中保护缓存）。 */
+export function useAllMessages(conversationId: string | null) {
+  return useQuery({
+    queryKey: ["messages-all", conversationId ?? ""],
+    queryFn: async () => {
+      if (!conversationId) return []
+      return await ipc.listMessages(conversationId, null)
+    },
     enabled: !!conversationId,
   })
 }

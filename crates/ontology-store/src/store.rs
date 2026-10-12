@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::data_type::is_valid_data_type;
 use crate::error::{StoreError, StoreResult};
+use crate::evidence::EvidenceSource;
 use crate::naming::{
     is_valid_dataset_api_name, is_valid_object_type_api_name, is_valid_property_api_name,
 };
@@ -72,10 +73,19 @@ impl OntologyStore {
     pub fn list_ontologies(&self) -> StoreResult<Vec<OntologySummary>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT api_name, display_name, COALESCE(description, '') FROM ontologies ORDER BY api_name",
+            "SELECT o.api_name, o.display_name, COALESCE(o.description, ''),
+                    CASE WHEN c.ontology_api_name IS NULL THEN 0
+                         WHEN TRIM(COALESCE(c.business_scenario,''))=''
+                          AND TRIM(COALESCE(c.business_essence,''))=''
+ THEN 0
+                         ELSE 1 END
+             FROM ontologies o
+             LEFT JOIN ontology_charter c ON c.ontology_api_name = o.api_name
+             ORDER BY o.api_name",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(OntologySummary {
+                has_charter: r.get::<_, i64>(3)? != 0,
                 api_name: r.get(0)?,
                 display_name: r.get(1)?,
                 description: r.get(2)?,
@@ -122,6 +132,8 @@ impl OntologyStore {
             "DELETE FROM ontologies WHERE api_name=?1",
             rusqlite::params![ontology_api_name],
         )?;
+        // 证据索引随本体删除（evidence_sources 源登记保留——可能被其他本体引用）
+        crate::evidence::delete_element_evidence(&tx, "palantir", ontology_api_name)?;
         tx.commit()?;
         if affected > 0 {
             self.notify_change();
@@ -224,7 +236,11 @@ impl OntologyStore {
 
     /// 删除全局 Dataset。被 ObjectType（backing）或 Dataset（view 派生）
     /// 引用时拒绝，返回引用方名单。
-    pub fn delete_dataset(&self, ontology_api_name: &str, dataset_api_name: &str) -> StoreResult<bool> {
+    pub fn delete_dataset(
+        &self,
+        ontology_api_name: &str,
+        dataset_api_name: &str,
+    ) -> StoreResult<bool> {
         let conn = self.conn.lock().unwrap();
         let mut refs = Vec::new();
         {
@@ -243,7 +259,10 @@ impl OntologyStore {
                 "SELECT api_name FROM datasets WHERE ontology_api_name=?1 AND source_dataset_api_name=?2",
             )?;
             let names: Vec<String> = stmt
-                .query_map(rusqlite::params![ontology_api_name, dataset_api_name], |r| r.get(0))?
+                .query_map(
+                    rusqlite::params![ontology_api_name, dataset_api_name],
+                    |r| r.get(0),
+                )?
                 .filter_map(Result::ok)
                 .collect();
             refs.extend(names.iter().map(|n| format!("Dataset {n}")));
@@ -266,15 +285,20 @@ impl OntologyStore {
     }
 
     /// 删除指定本体下的 DataSource。被同本体内 Dataset 引用时拒绝，返回引用方名单。
-    pub fn delete_data_source(&self, ontology_api_name: &str, data_source_api_name: &str) -> StoreResult<bool> {
+    pub fn delete_data_source(
+        &self,
+        ontology_api_name: &str,
+        data_source_api_name: &str,
+    ) -> StoreResult<bool> {
         let conn = self.conn.lock().unwrap();
         let refs: Vec<String> = {
             let mut stmt = conn.prepare(
                 "SELECT api_name FROM datasets WHERE ontology_api_name=?1 AND data_source_api_name=?2",
             )?;
-            let rows = stmt.query_map(rusqlite::params![ontology_api_name, data_source_api_name], |r| {
-                r.get::<_, String>(0)
-            })?;
+            let rows = stmt.query_map(
+                rusqlite::params![ontology_api_name, data_source_api_name],
+                |r| r.get::<_, String>(0),
+            )?;
             rows.filter_map(Result::ok).collect()
         };
         if !refs.is_empty() {
@@ -365,10 +389,7 @@ impl OntologyStore {
     }
 
     /// 列出本体的变更日志（按 revision 倒序，最新在前）。
-    pub fn list_changelog(
-        &self,
-        ontology_api_name: &str,
-    ) -> StoreResult<Vec<OntologyChangelog>> {
+    pub fn list_changelog(&self, ontology_api_name: &str) -> StoreResult<Vec<OntologyChangelog>> {
         let conn = self.conn.lock().unwrap();
         let ont = self.get_ontology_row(&conn, ontology_api_name)?;
         let mut stmt = conn.prepare(
@@ -398,19 +419,21 @@ impl OntologyStore {
     /// 无 charter 行时返回空结构体（各字段空串）——业务上视为「尚未定义宪章」，
     /// 不报错。调用方（describe_ontology_summary / 工具层）据此决定是否提示建模者补充。
     /// `conn` 已持有锁的版本（内部调用，避免重复加锁）。
-    fn get_charter_inner(&self, conn: &Connection, ontology_api_name: &str) -> StoreResult<OntologyCharter> {
+    fn get_charter_inner(
+        &self,
+        conn: &Connection,
+        ontology_api_name: &str,
+    ) -> StoreResult<OntologyCharter> {
         let row = conn.query_row(
-            "SELECT business_scenario, business_essence, design_intent, invariants, updated_by, updated_at \
+            "SELECT business_scenario, business_essence, updated_by, updated_at \
              FROM ontology_charter WHERE ontology_api_name=?1",
             rusqlite::params![ontology_api_name],
             |r| {
                 Ok(OntologyCharter {
                     business_scenario: r.get(0)?,
                     business_essence: r.get(1)?,
-                    design_intent: r.get(2)?,
-                    invariants: r.get(3)?,
-                    updated_by: r.get(4)?,
-                    updated_at: r.get(5)?,
+                    updated_by: r.get(2)?,
+                    updated_at: r.get(3)?,
                 })
             },
         );
@@ -447,21 +470,17 @@ impl OntologyStore {
         let ont = self.get_ontology_row(&conn, ontology_api_name)?;
         let now = now_ms();
         conn.execute(
-            "INSERT INTO ontology_charter (ontology_api_name, business_scenario, business_essence, design_intent, invariants, updated_by, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO ontology_charter (ontology_api_name, business_scenario, business_essence, updated_by, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(ontology_api_name) DO UPDATE SET
                 business_scenario = excluded.business_scenario,
                 business_essence   = excluded.business_essence,
-                design_intent      = excluded.design_intent,
-                invariants         = excluded.invariants,
                 updated_by         = excluded.updated_by,
                 updated_at         = excluded.updated_at",
             rusqlite::params![
                 ont.api_name,
                 charter.business_scenario,
                 charter.business_essence,
-                charter.design_intent,
-                charter.invariants,
                 if charter.updated_by.is_empty() { "agent" } else { &charter.updated_by },
                 now
             ],
@@ -474,11 +493,117 @@ impl OntologyStore {
     ///
     /// write-view：properties 嵌在 object_types 下，links 也嵌在 object_types 下
     /// （source 侧持有），action_types 独立列出。
+    /// 本体 api_name 是否已存在（宪章先行闸门用）。
+    pub fn exists(&self, ontology_api_name: &str) -> StoreResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM ontologies WHERE api_name = ?1",
+                rusqlite::params![ontology_api_name],
+                |_| Ok(()),
+            )
+            .is_ok())
+    }
+
+    /// 创建空本体 + 宪章（宪章先行，见 ARCHITECTURE.md 决策 24）。
+    ///
+    /// **仅前端宪章向导 IPC 可达**——agent 工具层无此路径，本体创建 = 用户
+    /// 确认宪章，AI 不得绕过（import 闸门会拒绝不存在的 api_name）。
+    /// 只建 ontologies 行（ObjectType/LinkType 等后续由 agent/导入增量补充）。
+    pub fn create_with_charter(
+        &self,
+        api_name: &str,
+        display_name: &str,
+        description: &str,
+        charter: &OntologyCharter,
+    ) -> StoreResult<()> {
+        if self.exists(api_name)? {
+            return Err(StoreError::Other(anyhow::anyhow!(
+                "本体已存在: {api_name}"
+            )));
+        }
+        // api_name 命名校验复用现有 PascalCase 约束（与导入路径一致）
+        if !crate::naming::is_valid_object_type_api_name(api_name) {
+            return Err(StoreError::InvalidApiName {
+                entity_kind: "Ontology".into(),
+                api_name: api_name.into(),
+                pattern: crate::naming::OBJECT_TYPE_API_NAME_PATTERN.into(),
+            });
+        }
+        let conn = self.conn.lock().unwrap();
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO ontologies (id, api_name, display_name, description, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'ACTIVE', ?5, ?5)",
+            rusqlite::params![
+                Uuid::new_v4().simple().to_string(),
+                api_name,
+                display_name,
+                description,
+                now,
+            ],
+        )?;
+        drop(conn);
+        self.set_charter(api_name, charter)?;
+        self.notify_change();
+        Ok(())
+    }
+
     pub fn export(&self, ontology_api_name: &str) -> StoreResult<OntologyPayload> {
         let conn = self.conn.lock().unwrap();
         let ont = self.get_ontology_row(&conn, ontology_api_name)?;
 
-        let object_types = self.export_object_types(&conn, &ont.id)?;
+        let mut object_types = self.export_object_types(&conn, &ont.id)?;
+        // 证据回填（round-trip）：从 element_evidence 读回 evidence 字段
+        let ev_rows = crate::evidence::list_element_evidence(&conn, "palantir", ontology_api_name)?;
+        for ot in &mut object_types {
+            ot.evidence = ev_rows
+                .iter()
+                .filter(|r| r.element_type == "object_type" && r.element_id == ot.api_name)
+                .map(|r| crate::evidence::Evidence {
+                    source_id: r.source_id.clone(),
+                    quote: r.quote.clone(),
+                    span: r.span,
+                    role: if r.role == "inferred" {
+                        crate::evidence::EvidenceRole::Inferred
+                    } else {
+                        crate::evidence::EvidenceRole::Direct
+                    },
+                })
+                .collect();
+            for p in &mut ot.properties {
+                p.evidence = ev_rows
+                    .iter()
+                    .filter(|r| r.element_type == "property" && r.element_id == p.api_name)
+                    .map(|r| crate::evidence::Evidence {
+                        source_id: r.source_id.clone(),
+                        quote: r.quote.clone(),
+                        span: r.span,
+                        role: if r.role == "inferred" {
+                            crate::evidence::EvidenceRole::Inferred
+                        } else {
+                            crate::evidence::EvidenceRole::Direct
+                        },
+                    })
+                    .collect();
+            }
+            for l in &mut ot.links {
+                l.evidence = ev_rows
+                    .iter()
+                    .filter(|r| r.element_type == "link" && r.element_id == l.api_name)
+                    .map(|r| crate::evidence::Evidence {
+                        source_id: r.source_id.clone(),
+                        quote: r.quote.clone(),
+                        span: r.span,
+                        role: if r.role == "inferred" {
+                            crate::evidence::EvidenceRole::Inferred
+                        } else {
+                            crate::evidence::EvidenceRole::Direct
+                        },
+                    })
+                    .collect();
+            }
+        }
         let action_types = self.export_action_types(&conn, &ont.id)?;
         let datasets = self.export_datasets(&conn, &ont.api_name)?;
         let data_sources = self.export_data_sources(&conn, &ont.api_name)?;
@@ -526,20 +651,50 @@ impl OntologyStore {
             } else {
                 "skip"
             };
+            // 属性级丢失检测：覆写 = 删旧 OT 重建（级联删属性），payload 未包含
+            // 的已有属性会被删掉。迭代场景 AI 容易只带新增属性——把丢失清单
+            // 写进 reason 让 agent 在落库前看到并补全 payload（有意删除可忽略）。
+            let mut reason = if status == "skip" {
+                "同名已存在且未列入 overwrite_object_types".to_string()
+            } else {
+                String::new()
+            };
+            if status == "overwrite" {
+                let existing_props = self.list_property_api_names(
+                    &conn,
+                    &payload.api_name,
+                    &ot.api_name,
+                );
+                let new_props: std::collections::HashSet<&str> =
+                    ot.properties.iter().map(|p| p.api_name.as_str()).collect();
+                let dropped: Vec<&String> = existing_props
+                    .iter()
+                    .filter(|p| !new_props.contains(p.as_str()))
+                    .collect();
+                if !dropped.is_empty() {
+                    if !reason.is_empty() {
+                        reason.push_str("；");
+                    }
+                    reason.push_str(&format!(
+                        "⚠ 覆写将删除已有属性（payload 未包含）：{}。若为有意删除可忽略；否则应先 export 该 OT 补全全部属性再导入，避免只带新增属性覆写导致旧属性丢失",
+                        dropped.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+            }
             object_types.push(ImportPreviewItem {
                 api_name: ot.api_name.clone(),
                 status: status.to_string(),
-                reason: if status == "skip" {
-                    "同名已存在且未列入 overwrite_object_types".to_string()
-                } else {
-                    String::new()
-                },
+                reason,
             });
         }
 
         // ── 3. 引用完整性检查（阻断性 errors）──
         let mut errors = Vec::new();
-        let mut ot_api_names: Vec<&str> = payload.object_types.iter().map(|o| o.api_name.as_str()).collect();
+        let mut ot_api_names: Vec<&str> = payload
+            .object_types
+            .iter()
+            .map(|o| o.api_name.as_str())
+            .collect();
         // 已存在但未覆写的 OT 也参与引用解析（它们的 link target 可能指向已存在的 OT）
         for e in &existing_ots {
             if !ot_api_names.iter().any(|a| *a == e) {
@@ -569,7 +724,11 @@ impl OntologyStore {
         }
         // 每个 OT 有且仅一个 is_primary_key
         for ot in &payload.object_types {
-            let pk_count = ot.properties.iter().filter(|p| p.is_primary_key.unwrap_or(false)).count();
+            let pk_count = ot
+                .properties
+                .iter()
+                .filter(|p| p.is_primary_key.unwrap_or(false))
+                .count();
             if pk_count != 1 {
                 errors.push(format!(
                     "ObjectType '{}' 必须有且仅一个 is_primary_key=true 的属性（当前 {} 个）",
@@ -581,10 +740,34 @@ impl OntologyStore {
         // ── 4. 非阻断 warnings ──
         let mut warnings = Vec::new();
         for ds in &payload.data_sources {
-            if ds.connector_config.get("password").and_then(|v| v.as_str()).is_some() {
-                warnings.push(format!("DataSource '{}' 的 connector_config 含明文 password，建议改用 credential", ds.api_name));
+            if ds
+                .connector_config
+                .get("password")
+                .and_then(|v| v.as_str())
+                .is_some()
+            {
+                warnings.push(format!(
+                    "DataSource '{}' 的 connector_config 含明文 password，建议改用 credential",
+                    ds.api_name
+                ));
             }
         }
+        // P3 反向校验（docs/EVIDENCE-CHAIN.md §4 E4 变体）：VIRTUAL 属性的
+        // backing_table.backing_column 必须能在已登记 db_column 源的 schema 文本中
+        // 找到——防 LLM 臆造不存在的物理列。未登记任何 db_column 源时不告警。
+        let db_column_sources: Vec<crate::evidence::EvidenceSource> = {
+            let sources = crate::evidence::load_sources_map(&conn)
+                .unwrap_or_default();
+            sources
+                .into_values()
+                .filter(|s| s.kind == "db_column")
+                .filter(|s| {
+                    s.ontology_api_name.is_empty()
+                        || s.ontology_api_name == payload.api_name
+                })
+                .collect()
+        };
+        let db_column_sources = &db_column_sources;
         for ot in &payload.object_types {
             for p in &ot.properties {
                 if p.backing_mapping.is_none() && ot.storage_type == "VIRTUAL" {
@@ -592,6 +775,25 @@ impl OntologyStore {
                         "VIRTUAL ObjectType '{}' 的属性 '{}' 缺 backing_mapping（虚拟类型通常需声明物理列映射）",
                         ot.api_name, p.api_name
                     ));
+                    continue;
+                }
+                if let Some(m) = &p.backing_mapping {
+                    if !db_column_sources.is_empty()
+                        && !m.backing_table.is_empty()
+                        && !m.backing_column.is_empty()
+                    {
+                        let needle = format!("{}.{}", m.backing_table, m.backing_column);
+                        let found = db_column_sources.iter().any(|s| {
+                            s.content.contains(&needle)
+                                || s.title.contains(&needle)
+                        });
+                        if !found {
+                            warnings.push(format!(
+                                "属性 '{}.{}' 的物理列 {} 未在任何已登记 DB schema 源中找到（可能为臆造列，请核对或用 register_evidence_source 登记 schema）",
+                                ot.api_name, p.api_name, needle
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -611,56 +813,100 @@ impl OntologyStore {
             })
             .collect::<StoreResult<Vec<_>>>()?;
 
-        let actions = payload.action_types.iter().map(|a| {
-            validate_action(a)?;
-            Ok(ImportPreviewItem {
-                api_name: a.api_name.clone(),
-                status: "create".to_string(),
-                reason: String::new(),
+        let actions = payload
+            .action_types
+            .iter()
+            .map(|a| {
+                validate_action(a)?;
+                Ok(ImportPreviewItem {
+                    api_name: a.api_name.clone(),
+                    status: "create".to_string(),
+                    reason: String::new(),
+                })
             })
-        }).collect::<StoreResult<Vec<_>>>()?;
+            .collect::<StoreResult<Vec<_>>>()?;
 
-        let datasets = payload.datasets.iter().map(|d| {
-            validate_dataset(d)?;
-            let exists = self.dataset_exists(&conn, &payload.api_name, &d.api_name)?;
-            Ok(ImportPreviewItem {
-                api_name: d.api_name.clone(),
-                status: if exists { "skip".to_string() } else { "create".to_string() },
-                reason: if exists { "同名已存在".to_string() } else { String::new() },
+        let datasets = payload
+            .datasets
+            .iter()
+            .map(|d| {
+                validate_dataset(d)?;
+                let exists = self.dataset_exists(&conn, &payload.api_name, &d.api_name)?;
+                Ok(ImportPreviewItem {
+                    api_name: d.api_name.clone(),
+                    status: if exists {
+                        "skip".to_string()
+                    } else {
+                        "create".to_string()
+                    },
+                    reason: if exists {
+                        "同名已存在".to_string()
+                    } else {
+                        String::new()
+                    },
+                })
             })
-        }).collect::<StoreResult<Vec<_>>>()?;
+            .collect::<StoreResult<Vec<_>>>()?;
 
-        let data_sources = payload.data_sources.iter().map(|d| {
-            validate_data_source(d)?;
-            let exists = self.data_source_exists(&conn, &payload.api_name, &d.api_name)?;
-            let status = if !exists {
-                "create".to_string()
-            } else if overwrite_ds.contains(&d.api_name) {
-                "overwrite".to_string()
-            } else {
-                "skip".to_string()
-            };
-            Ok(ImportPreviewItem {
-                api_name: d.api_name.clone(),
-                status,
-                reason: if exists && !overwrite_ds.contains(&d.api_name) {
-                    "同名已存在".to_string()
+        let data_sources = payload
+            .data_sources
+            .iter()
+            .map(|d| {
+                validate_data_source(d)?;
+                let exists = self.data_source_exists(&conn, &payload.api_name, &d.api_name)?;
+                let status = if !exists {
+                    "create".to_string()
+                } else if overwrite_ds.contains(&d.api_name) {
+                    "overwrite".to_string()
                 } else {
-                    String::new()
-                },
+                    "skip".to_string()
+                };
+                Ok(ImportPreviewItem {
+                    api_name: d.api_name.clone(),
+                    status,
+                    reason: if exists && !overwrite_ds.contains(&d.api_name) {
+                        "同名已存在".to_string()
+                    } else {
+                        String::new()
+                    },
+                })
             })
-        }).collect::<StoreResult<Vec<_>>>()?;
+            .collect::<StoreResult<Vec<_>>>()?;
 
         let existing_groups = self.list_existing_group_api_names(&conn, &payload.api_name)?;
-        let object_type_groups = payload.object_type_groups.iter().map(|g| {
-            validate_group(g)?;
-            let exists = existing_groups.contains(&g.api_name);
-            Ok(ImportPreviewItem {
-                api_name: g.api_name.clone(),
-                status: if exists { "skip".to_string() } else { "create".to_string() },
-                reason: if exists { "同名已存在".to_string() } else { String::new() },
+        let object_type_groups = payload
+            .object_type_groups
+            .iter()
+            .map(|g| {
+                validate_group(g)?;
+                let exists = existing_groups.contains(&g.api_name);
+                Ok(ImportPreviewItem {
+                    api_name: g.api_name.clone(),
+                    status: if exists {
+                        "skip".to_string()
+                    } else {
+                        "create".to_string()
+                    },
+                    reason: if exists {
+                        "同名已存在".to_string()
+                    } else {
+                        String::new()
+                    },
+                })
             })
-        }).collect::<StoreResult<Vec<_>>>()?;
+            .collect::<StoreResult<Vec<_>>>()?;
+
+        // ── 6. 证据闸门（docs/EVIDENCE-CHAIN.md L3，决策24后续）──
+        if req.evidence_mode == "strict" {
+            let sources = load_evidence_sources(&conn)?;
+            let (ev_errors, ev_warnings) = crate::evidence::validate_evidence_batch(
+                evidence_items(&payload),
+                &sources,
+                true,
+            );
+            errors.extend(ev_errors);
+            warnings.extend(ev_warnings);
+        }
 
         Ok(ImportPreview {
             ontology_api_name: payload.api_name.clone(),
@@ -687,6 +933,31 @@ impl OntologyStore {
     /// 不整体回滚（对齐 Gaia 的 partial failure 语义）。
     pub fn import(&self, req: &ImportRequest) -> StoreResult<ImportResult> {
         let mut conn = self.conn.lock().unwrap();
+
+        // ── 0. 证据闸门（strict 时阻断，与 preview 同规则——直接 import 不可绕过 preview 的闸门）──
+        if req.evidence_mode == "strict" {
+            let sources = load_evidence_sources(&conn)?;
+            let (ev_errors, _ev_warnings) = crate::evidence::validate_evidence_batch(
+                evidence_items(&req.payload),
+                &sources,
+                true,
+            );
+            if !ev_errors.is_empty() {
+                return Ok(ImportResult {
+                    ontology_api_name: req.payload.api_name.clone(),
+                    ontology_status: "failed".to_string(),
+                    object_types: Vec::new(),
+                    links_created: 0,
+                    links_skipped: 0,
+                    action_types: Vec::new(),
+                    datasets: Vec::new(),
+                    data_sources: Vec::new(),
+                    object_type_groups: Vec::new(),
+                    errors: ev_errors,
+                });
+            }
+        }
+
         let tx = conn.transaction()?;
         let payload = &req.payload;
         let overwrite = &req.overwrite_object_types;
@@ -709,14 +980,34 @@ impl OntologyStore {
 
         // ── 2. DataSource ──
         for ds in &payload.data_sources {
-            match self.upsert_data_source(&tx, &payload.api_name, ds, overwrite_ds.contains(&ds.api_name), now) {
-                Ok(Upsert::Created) => dataset_results_push(&mut data_source_results, &ds.api_name, "created", None),
-                Ok(Upsert::Overwritten) => dataset_results_push(&mut data_source_results, &ds.api_name, "overwritten", None),
-                Ok(Upsert::Skipped) => dataset_results_push(&mut data_source_results, &ds.api_name, "skipped", None),
+            match self.upsert_data_source(
+                &tx,
+                &payload.api_name,
+                ds,
+                overwrite_ds.contains(&ds.api_name),
+                now,
+            ) {
+                Ok(Upsert::Created) => {
+                    dataset_results_push(&mut data_source_results, &ds.api_name, "created", None)
+                }
+                Ok(Upsert::Overwritten) => dataset_results_push(
+                    &mut data_source_results,
+                    &ds.api_name,
+                    "overwritten",
+                    None,
+                ),
+                Ok(Upsert::Skipped) => {
+                    dataset_results_push(&mut data_source_results, &ds.api_name, "skipped", None)
+                }
                 Err(e) => {
                     let msg = format!("DataSource '{}': {}", ds.api_name, e);
                     errors.push(msg.clone());
-                    dataset_results_push(&mut data_source_results, &ds.api_name, "failed", Some(msg));
+                    dataset_results_push(
+                        &mut data_source_results,
+                        &ds.api_name,
+                        "failed",
+                        Some(msg),
+                    );
                 }
             }
         }
@@ -724,8 +1015,12 @@ impl OntologyStore {
         // ── 3. Dataset ──
         for d in &payload.datasets {
             match self.upsert_dataset(&tx, &payload.api_name, d, now) {
-                Ok(true) => dataset_results_push(&mut dataset_results, &d.api_name, "created", None),
-                Ok(false) => dataset_results_push(&mut dataset_results, &d.api_name, "skipped", None),
+                Ok(true) => {
+                    dataset_results_push(&mut dataset_results, &d.api_name, "created", None)
+                }
+                Ok(false) => {
+                    dataset_results_push(&mut dataset_results, &d.api_name, "skipped", None)
+                }
                 Err(e) => {
                     let msg = format!("Dataset '{}': {}", d.api_name, e);
                     errors.push(msg.clone());
@@ -739,7 +1034,13 @@ impl OntologyStore {
 
         // ── 4. ObjectType + Property ──
         for ot in &payload.object_types {
-            match self.upsert_object_type(&tx, &payload.api_name, ot, overwrite.contains(&ot.api_name), now) {
+            match self.upsert_object_type(
+                &tx,
+                &payload.api_name,
+                ot,
+                overwrite.contains(&ot.api_name),
+                now,
+            ) {
                 Ok(Upsert::Created) => ot_results.push(ImportItemResult {
                     api_name: ot.api_name.clone(),
                     status: "created".to_string(),
@@ -829,6 +1130,40 @@ impl OntologyStore {
             }
         }
 
+        // ── 7. 元素级证据落库（docs/EVIDENCE-CHAIN.md L4）──
+        // 仅 created/overwritten 的 OT 及其属性/关系（skipped 的保持旧证据不动）。
+        for ot in &payload.object_types {
+            let status = ot_results
+                .iter()
+                .find(|r| r.api_name == ot.api_name)
+                .map(|r| r.status.as_str())
+                .unwrap_or("failed");
+            if status != "created" && status != "overwritten" {
+                continue;
+            }
+            let mut items: Vec<(String, String, crate::evidence::Evidence)> = Vec::new();
+            for ev in &ot.evidence {
+                items.push(("object_type".into(), ot.api_name.clone(), ev.clone()));
+            }
+            for p in &ot.properties {
+                for ev in &p.evidence {
+                    items.push(("property".into(), p.api_name.clone(), ev.clone()));
+                }
+            }
+            for l in &ot.links {
+                for ev in &l.evidence {
+                    items.push(("link".into(), l.api_name.clone(), ev.clone()));
+                }
+            }
+            if !items.is_empty() {
+                if let Err(e) = crate::evidence::persist_element_evidence(
+                    &tx, "palantir", &payload.api_name, items, now,
+                ) {
+                    errors.push(format!("证据落库失败 '{}': {}", ot.api_name, e));
+                }
+            }
+        }
+
         tx.commit()?;
 
         // 通知前端刷新（无论是否部分失败，库已变更）。
@@ -862,7 +1197,10 @@ impl OntologyStore {
     /// 轻量目录视图：OT 只给 api_name/display_name/primary_key/storage_type/
     /// property_count，不含 properties[]/links[]/actions[]。link/action 仅计数。
     /// 供 agent 第一跳拿到 OT 概览，需要详情时调 `describe_object_type`。
-    pub fn describe_ontology_summary(&self, ontology_api_name: &str) -> StoreResult<OntologySummaryFull> {
+    pub fn describe_ontology_summary(
+        &self,
+        ontology_api_name: &str,
+    ) -> StoreResult<OntologySummaryFull> {
         let conn = self.conn.lock().unwrap();
         let ont = self.get_ontology_row(&conn, ontology_api_name)?;
 
@@ -946,35 +1284,76 @@ impl OntologyStore {
         let ont = self.get_ontology_row(&conn, ontology_api_name)?;
 
         // OT 基本字段
-        let ot_id: String = conn.query_row(
-            "SELECT id FROM object_types WHERE ontology_id=?1 AND api_name=?2",
-            rusqlite::params![ont.id, object_type_api_name],
-            |r| r.get(0),
-        ).map_err(|_| StoreError::NotFound(format!(
-            "object_type '{object_type_api_name}' in ontology '{ontology_api_name}'"
-        )))?;
+        let ot_id: String = conn
+            .query_row(
+                "SELECT id FROM object_types WHERE ontology_id=?1 AND api_name=?2",
+                rusqlite::params![ont.id, object_type_api_name],
+                |r| r.get(0),
+            )
+            .map_err(|_| {
+                StoreError::NotFound(format!(
+                    "object_type '{object_type_api_name}' in ontology '{ontology_api_name}'"
+                ))
+            })?;
 
-        let (display_name, description, primary_key, title_property, storage_type, visibility, backing_dataset_api_name):
-            (String, String, String, String, String, String, Option<String>) = conn.query_row(
+        let (
+            display_name,
+            description,
+            primary_key,
+            title_property,
+            storage_type,
+            visibility,
+            backing_dataset_api_name,
+        ): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = conn.query_row(
             "SELECT display_name, COALESCE(description,''), primary_key,
                     COALESCE(title_property,''), storage_type, visibility,
                     backing_dataset_api_name
              FROM object_types WHERE id=?1",
             rusqlite::params![ot_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6).unwrap_or(None))),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6).unwrap_or(None),
+                ))
+            },
         )?;
 
         // properties（复用 export 的查询逻辑）
-        let properties: Vec<PropertyReadView> = self.export_properties(&conn, &ot_id)?
-            .into_iter().map(|p| p.to_read_view()).collect();
+        let properties: Vec<PropertyReadView> = self
+            .export_properties(&conn, &ot_id)?
+            .into_iter()
+            .map(|p| p.to_read_view())
+            .collect();
         // outbound/inbound links：对齐 Gaia，只返 api_name 列表（详情调 describe_link_type）
-        let outbound_links: Vec<String> = self.export_links(&conn, &ont.id, object_type_api_name)?
-            .into_iter().map(|l| l.api_name).collect();
-        let inbound_links: Vec<String> = self.export_inbound_links(&conn, &ont.id, object_type_api_name)?
-            .into_iter().map(|l| l.api_name).collect();
+        let outbound_links: Vec<String> = self
+            .export_links(&conn, &ont.id, object_type_api_name)?
+            .into_iter()
+            .map(|l| l.api_name)
+            .collect();
+        let inbound_links: Vec<String> = self
+            .export_inbound_links(&conn, &ont.id, object_type_api_name)?
+            .into_iter()
+            .map(|l| l.api_name)
+            .collect();
         // applicable actions：对齐 Gaia，只返 api_name 列表
-        let actions: Vec<String> = self.export_actions_for_ot(&conn, &ont.id, object_type_api_name)?
-            .into_iter().map(|a| a.api_name).collect();
+        let actions: Vec<String> = self
+            .export_actions_for_ot(&conn, &ont.id, object_type_api_name)?
+            .into_iter()
+            .map(|a| a.api_name)
+            .collect();
 
         Ok(ObjectTypeFullMetadata {
             api_name: object_type_api_name.to_string(),
@@ -1026,7 +1405,11 @@ impl OntologyStore {
     /// 按 link api_name 查询，返回 `LinkTypeFull`（对齐 Gaia `describe_link_type` 的 9 字段 read-view）。
     /// 适合「只关心一条关系」的细粒度场景，不必先 describe 承载它的 OT。
     /// link 不存在返回 NotFound。
-    pub fn describe_link_type(&self, ontology_api_name: &str, link_api_name: &str) -> StoreResult<LinkTypeFull> {
+    pub fn describe_link_type(
+        &self,
+        ontology_api_name: &str,
+        link_api_name: &str,
+    ) -> StoreResult<LinkTypeFull> {
         let conn = self.conn.lock().unwrap();
         let ont = self.get_ontology_row(&conn, ontology_api_name)?;
         conn.query_row(
@@ -1050,9 +1433,83 @@ impl OntologyStore {
                 })
             },
         )
-        .map_err(|_| StoreError::NotFound(format!(
-            "link_type '{link_api_name}' in ontology '{ontology_api_name}'"
-        )))
+        .map_err(|_| {
+            StoreError::NotFound(format!(
+                "link_type '{link_api_name}' in ontology '{ontology_api_name}'"
+            ))
+        })
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 证据链源登记（docs/EVIDENCE-CHAIN.md L1，决策24后续）
+    // ════════════════════════════════════════════════════════════════
+
+    /// 登记证据源（content 为登记时刻快照，不可变）。
+    /// 幂等：同 ontology+kind+content_hash 已存在时直接返回既有 source_id。
+    /// 返回 source_id（src-{uuid}）。
+    pub fn register_evidence_source(
+        &self,
+        kind: &str,
+        title: &str,
+        content: &str,
+        ontology_api_name: &str,
+        origin_ref: &str,
+    ) -> StoreResult<String> {
+        if kind.is_empty() || title.trim().is_empty() || content.trim().is_empty() {
+            return Err(StoreError::InvalidInput(
+                "kind/title/content 均不能为空".to_string(),
+            ));
+        }
+        let conn = self.conn.lock().unwrap();
+        crate::evidence::register_source(
+            &conn,
+            kind,
+            title,
+            content,
+            ontology_api_name,
+            origin_ref,
+            now_ms(),
+        )
+    }
+
+    /// 列出某本体的元素级证据（docs/EVIDENCE-CHAIN.md L4，前端三态展示）。
+    /// standard："palantir"（key=api_name）| "w3c"（key=本体 IRI，同库文件共享）。
+    pub fn list_element_evidence(
+        &self,
+        standard: &str,
+        ontology_key: &str,
+    ) -> StoreResult<Vec<crate::evidence::ElementEvidenceRow>> {
+        let conn = self.conn.lock().unwrap();
+        crate::evidence::list_element_evidence(&conn, standard, ontology_key)
+    }
+
+    /// 列出证据源（ontology_api_name 为 None 时返回全部；Some("") 返回全局共享源）。
+    pub fn list_evidence_sources(
+        &self,
+        ontology_api_name: Option<&str>,
+    ) -> StoreResult<Vec<EvidenceSource>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT source_id, ontology_api_name, kind, title, content, content_hash, origin_ref, created_at
+             FROM evidence_sources
+             WHERE (?1 IS NULL OR ontology_api_name = ?2)
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![ontology_api_name, ontology_api_name.unwrap_or("")], row_to_source)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 按 id 取单个证据源。
+    pub fn get_evidence_source(&self, source_id: &str) -> StoreResult<Option<EvidenceSource>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT source_id, ontology_api_name, kind, title, content, content_hash, origin_ref, created_at
+             FROM evidence_sources WHERE source_id=?1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![source_id], row_to_source)?;
+        Ok(rows.next().transpose()?)
     }
 }
 
@@ -1080,6 +1537,47 @@ struct OntRow {
     description: String,
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// 证据闸门辅助（docs/EVIDENCE-CHAIN.md L3）
+// ═══════════════════════════════════════════════════════════════════
+
+fn row_to_source(r: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceSource> {
+    Ok(EvidenceSource {
+        source_id: r.get(0)?,
+        ontology_api_name: r.get(1)?,
+        kind: r.get(2)?,
+        title: r.get(3)?,
+        content: r.get(4)?,
+        content_hash: r.get(5)?,
+        origin_ref: r.get(6)?,
+        created_at: r.get(7)?,
+    })
+}
+
+/// 从全库加载证据源映射（闸门校验用）。委托 evidence::load_sources_map。
+fn load_evidence_sources(
+    conn: &Connection,
+) -> StoreResult<std::collections::HashMap<String, EvidenceSource>> {
+    crate::evidence::load_sources_map(conn)
+}
+
+/// 收集 payload 中全部 (元素标签, evidence) 对——闸门校验的输入。
+fn evidence_items(
+    payload: &OntologyPayload,
+) -> Vec<(String, Vec<crate::evidence::Evidence>)> {
+    let mut items = Vec::new();
+    for ot in &payload.object_types {
+        items.push((ot.api_name.clone(), ot.evidence.clone()));
+        for p in &ot.properties {
+            items.push((format!("{}.{}", ot.api_name, p.api_name), p.evidence.clone()));
+        }
+        for l in &ot.links {
+            items.push((format!("{}.{}", ot.api_name, l.api_name), l.evidence.clone()));
+        }
+    }
+    items
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1091,7 +1589,12 @@ fn new_id() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
-fn dataset_results_push(v: &mut Vec<ImportItemResult>, api_name: &str, status: &str, error: Option<String>) {
+fn dataset_results_push(
+    v: &mut Vec<ImportItemResult>,
+    api_name: &str,
+    status: &str,
+    error: Option<String>,
+) {
     v.push(ImportItemResult {
         api_name: api_name.to_string(),
         status: status.to_string(),
@@ -1233,7 +1736,11 @@ impl OntologyStore {
         .map_err(|_| StoreError::NotFound(format!("ontology '{api_name}'")))
     }
 
-    fn export_object_types(&self, conn: &Connection, ont_id: &str) -> StoreResult<Vec<ObjectTypeDef>> {
+    fn export_object_types(
+        &self,
+        conn: &Connection,
+        ont_id: &str,
+    ) -> StoreResult<Vec<ObjectTypeDef>> {
         let mut stmt = conn.prepare(
             "SELECT id, api_name, display_name, description, primary_key, title_property, storage_type, visibility, capabilities
              FROM object_types WHERE ontology_id=?1 ORDER BY api_name",
@@ -1255,6 +1762,8 @@ impl OntologyStore {
                     properties: Vec::new(),
                     links: Vec::new(),
                     confidence: None,
+                    // 证据链不落 payload 表（P1 仅校验闸门，element_evidence 表 P2）
+                    evidence: Vec::new(),
                 },
             ))
         })?;
@@ -1304,6 +1813,7 @@ impl OntologyStore {
                 backing_mapping,
                 vector_config,
                 confidence: None,
+                evidence: Vec::new(),
             })
         })?;
         let mut props = Vec::new();
@@ -1313,7 +1823,12 @@ impl OntologyStore {
         Ok(props)
     }
 
-    fn export_links(&self, conn: &Connection, ont_id: &str, ot_api_name: &str) -> StoreResult<Vec<LinkDef>> {
+    fn export_links(
+        &self,
+        conn: &Connection,
+        ont_id: &str,
+        ot_api_name: &str,
+    ) -> StoreResult<Vec<LinkDef>> {
         let mut stmt = conn.prepare(
             "SELECT api_name, display_name, description, target_object_type_api_name, foreign_key_property_api_name,
                     cardinality, weight_property, temporal
@@ -1330,6 +1845,7 @@ impl OntologyStore {
                 weight_property: r.get(6).unwrap_or(None),
                 temporal: r.get::<_, i64>(7)? != 0,
                 confidence: None,
+                evidence: Vec::new(),
             })
         })?;
         let mut links = Vec::new();
@@ -1341,7 +1857,12 @@ impl OntologyStore {
 
     /// inbound links：target = 本 OT 的 link（对齐 Gaia describe_object_type 的 inbound_links）。
     /// 与 `export_links`（outbound）对称，仅 WHERE 条件不同。
-    fn export_inbound_links(&self, conn: &Connection, ont_id: &str, ot_api_name: &str) -> StoreResult<Vec<LinkDef>> {
+    fn export_inbound_links(
+        &self,
+        conn: &Connection,
+        ont_id: &str,
+        ot_api_name: &str,
+    ) -> StoreResult<Vec<LinkDef>> {
         let mut stmt = conn.prepare(
             "SELECT api_name, display_name, description, target_object_type_api_name, foreign_key_property_api_name,
                     cardinality, weight_property, temporal
@@ -1358,6 +1879,7 @@ impl OntologyStore {
                 weight_property: r.get(6).unwrap_or(None),
                 temporal: r.get::<_, i64>(7)? != 0,
                 confidence: None,
+                evidence: Vec::new(),
             })
         })?;
         let mut links = Vec::new();
@@ -1367,16 +1889,18 @@ impl OntologyStore {
         Ok(links)
     }
 
-    fn export_action_types(&self, conn: &Connection, ont_id: &str) -> StoreResult<Vec<ActionTypeDef>> {
+    fn export_action_types(
+        &self,
+        conn: &Connection,
+        ont_id: &str,
+    ) -> StoreResult<Vec<ActionTypeDef>> {
         let mut stmt = conn.prepare(
             "SELECT api_name, display_name, description, affected_object_type_api_name,
                     parameters, rules, submission_criteria, effects, ontology_rules, risk_level, operation_kind, batch_enabled
              FROM action_types WHERE ontology_id=?1 ORDER BY api_name",
         )?;
         let rows = stmt.query_map(rusqlite::params![ont_id], |r| {
-            let parse = |s: String| -> Vec<Value> {
-                serde_json::from_str(&s).unwrap_or_default()
-            };
+            let parse = |s: String| -> Vec<Value> { serde_json::from_str(&s).unwrap_or_default() };
             Ok(ActionTypeDef {
                 api_name: r.get(0)?,
                 display_name: r.get(1)?,
@@ -1384,7 +1908,9 @@ impl OntologyStore {
                 affected_object_type_api_name: r.get(3)?,
                 parameters: parse(r.get::<_, String>(4).unwrap_or_else(|_| "[]".to_string())),
                 rules: parse(r.get::<_, String>(5).unwrap_or_else(|_| "[]".to_string())),
-                submission_criteria: parse(r.get::<_, String>(6).unwrap_or_else(|_| "[]".to_string())),
+                submission_criteria: parse(
+                    r.get::<_, String>(6).unwrap_or_else(|_| "[]".to_string()),
+                ),
                 effects: parse(r.get::<_, String>(7).unwrap_or_else(|_| "[]".to_string())),
                 ontology_rules: parse(r.get::<_, String>(8).unwrap_or_else(|_| "[]".to_string())),
                 risk_level: r.get(9)?,
@@ -1402,16 +1928,19 @@ impl OntologyStore {
 
     /// 作用于指定 OT 的 action（affected_object_type = 本 OT，对齐 Gaia
     /// describe_object_type 的 actions[]）。与 `export_action_types` 的区别仅 WHERE。
-    fn export_actions_for_ot(&self, conn: &Connection, ont_id: &str, ot_api_name: &str) -> StoreResult<Vec<ActionTypeDef>> {
+    fn export_actions_for_ot(
+        &self,
+        conn: &Connection,
+        ont_id: &str,
+        ot_api_name: &str,
+    ) -> StoreResult<Vec<ActionTypeDef>> {
         let mut stmt = conn.prepare(
             "SELECT api_name, display_name, description, affected_object_type_api_name,
                     parameters, rules, submission_criteria, effects, ontology_rules, risk_level, operation_kind, batch_enabled
              FROM action_types WHERE ontology_id=?1 AND affected_object_type_api_name=?2 ORDER BY api_name",
         )?;
         let rows = stmt.query_map(rusqlite::params![ont_id, ot_api_name], |r| {
-            let parse = |s: String| -> Vec<Value> {
-                serde_json::from_str(&s).unwrap_or_default()
-            };
+            let parse = |s: String| -> Vec<Value> { serde_json::from_str(&s).unwrap_or_default() };
             Ok(ActionTypeDef {
                 api_name: r.get(0)?,
                 display_name: r.get(1)?,
@@ -1419,7 +1948,9 @@ impl OntologyStore {
                 affected_object_type_api_name: r.get(3)?,
                 parameters: parse(r.get::<_, String>(4).unwrap_or_else(|_| "[]".to_string())),
                 rules: parse(r.get::<_, String>(5).unwrap_or_else(|_| "[]".to_string())),
-                submission_criteria: parse(r.get::<_, String>(6).unwrap_or_else(|_| "[]".to_string())),
+                submission_criteria: parse(
+                    r.get::<_, String>(6).unwrap_or_else(|_| "[]".to_string()),
+                ),
                 effects: parse(r.get::<_, String>(7).unwrap_or_else(|_| "[]".to_string())),
                 ontology_rules: parse(r.get::<_, String>(8).unwrap_or_else(|_| "[]".to_string())),
                 risk_level: r.get(9)?,
@@ -1437,12 +1968,21 @@ impl OntologyStore {
 
     /// 计数：某 ontology 下指定表（link_types / action_types）的行数。
     /// summary 用——只给计数不展开，避免体积膨胀。
-    fn count_by_ontology(&self, conn: &Connection, table: &str, ont_id: &str) -> StoreResult<usize> {
+    fn count_by_ontology(
+        &self,
+        conn: &Connection,
+        table: &str,
+        ont_id: &str,
+    ) -> StoreResult<usize> {
         // table 名是内部常量，不做用户输入拼接（防注入）
         let sql = match table {
             "link_types" => "SELECT COUNT(*) FROM link_types WHERE ontology_id=?1",
             "action_types" => "SELECT COUNT(*) FROM action_types WHERE ontology_id=?1",
-            _ => return Err(StoreError::Other(anyhow::anyhow!("invalid count table: {table}"))),
+            _ => {
+                return Err(StoreError::Other(anyhow::anyhow!(
+                    "invalid count table: {table}"
+                )))
+            }
         };
         let n: i64 = conn.query_row(sql, rusqlite::params![ont_id], |r| r.get(0))?;
         Ok(n as usize)
@@ -1517,7 +2057,11 @@ impl OntologyStore {
         Ok(out)
     }
 
-    fn export_object_type_groups(&self, _conn: &Connection, _ont_id: &str) -> StoreResult<Vec<ObjectTypeGroupDef>> {
+    fn export_object_type_groups(
+        &self,
+        _conn: &Connection,
+        _ont_id: &str,
+    ) -> StoreResult<Vec<ObjectTypeGroupDef>> {
         // ADR-023: groups 是 passthrough 字段——import 接受，export 不导出（对齐 Gaia）。
         Ok(Vec::new())
     }
@@ -1535,7 +2079,12 @@ impl OntologyStore {
         Ok(n > 0)
     }
 
-    fn upsert_ontology(&self, tx: &rusqlite::Transaction, payload: &OntologyPayload, now: i64) -> StoreResult<OntUpsert> {
+    fn upsert_ontology(
+        &self,
+        tx: &rusqlite::Transaction,
+        payload: &OntologyPayload,
+        now: i64,
+    ) -> StoreResult<OntUpsert> {
         if self.ontology_exists_tx(tx, &payload.api_name)? {
             // 只 UPDATE display_name + updated_at——description 不由 import 覆盖
             // （description 是本体级简介，归属 charter 管理域，避免增量导入覆盖业务说明）。
@@ -1564,7 +2113,35 @@ impl OntologyStore {
         Ok(n > 0)
     }
 
-    fn list_existing_ot_api_names(&self, conn: &Connection, ont_api_name: &str) -> StoreResult<Vec<String>> {
+    /// 列出已有 OT 的全部属性 api_name（覆写丢失检测用）。
+    fn list_property_api_names(
+        &self,
+        conn: &Connection,
+        ont_api_name: &str,
+        ot_api_name: &str,
+    ) -> Vec<String> {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT p.api_name FROM properties p
+             JOIN object_types ot ON ot.id = p.object_type_id
+             JOIN ontologies o ON o.id = ot.ontology_id
+             WHERE o.api_name=?1 AND ot.api_name=?2",
+        ) else {
+            return Vec::new();
+        };
+        let rows = stmt.query_map(rusqlite::params![ont_api_name, ot_api_name], |r| {
+            r.get::<_, String>(0)
+        });
+        match rows {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn list_existing_ot_api_names(
+        &self,
+        conn: &Connection,
+        ont_api_name: &str,
+    ) -> StoreResult<Vec<String>> {
         let mut stmt = conn.prepare(
             "SELECT ot.api_name FROM object_types ot
              JOIN ontologies o ON o.id = ot.ontology_id
@@ -1578,7 +2155,11 @@ impl OntologyStore {
         Ok(v)
     }
 
-    fn list_existing_group_api_names(&self, conn: &Connection, ont_api_name: &str) -> StoreResult<Vec<String>> {
+    fn list_existing_group_api_names(
+        &self,
+        conn: &Connection,
+        ont_api_name: &str,
+    ) -> StoreResult<Vec<String>> {
         let mut stmt = conn.prepare(
             "SELECT g.api_name FROM object_type_groups g
              JOIN ontologies o ON o.id = g.ontology_id
@@ -1592,7 +2173,12 @@ impl OntologyStore {
         Ok(v)
     }
 
-    fn dataset_exists(&self, conn: &Connection, ontology_api_name: &str, api_name: &str) -> StoreResult<bool> {
+    fn dataset_exists(
+        &self,
+        conn: &Connection,
+        ontology_api_name: &str,
+        api_name: &str,
+    ) -> StoreResult<bool> {
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM datasets WHERE ontology_api_name=?1 AND api_name=?2",
             rusqlite::params![ontology_api_name, api_name],
@@ -1601,7 +2187,12 @@ impl OntologyStore {
         Ok(n > 0)
     }
 
-    fn data_source_exists(&self, conn: &Connection, ontology_api_name: &str, api_name: &str) -> StoreResult<bool> {
+    fn data_source_exists(
+        &self,
+        conn: &Connection,
+        ontology_api_name: &str,
+        api_name: &str,
+    ) -> StoreResult<bool> {
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM data_sources WHERE ontology_api_name=?1 AND api_name=?2",
             rusqlite::params![ontology_api_name, api_name],
@@ -1610,7 +2201,14 @@ impl OntologyStore {
         Ok(n > 0)
     }
 
-    fn upsert_data_source(&self, tx: &rusqlite::Transaction, ontology_api_name: &str, ds: &DataSourceDef, overwrite: bool, now: i64) -> StoreResult<Upsert> {
+    fn upsert_data_source(
+        &self,
+        tx: &rusqlite::Transaction,
+        ontology_api_name: &str,
+        ds: &DataSourceDef,
+        overwrite: bool,
+        now: i64,
+    ) -> StoreResult<Upsert> {
         if self.data_source_exists_tx(tx, ontology_api_name, &ds.api_name)? {
             if !overwrite {
                 // skip（不覆写，对齐 Gaia：同名 DS 默认 skip）
@@ -1624,9 +2222,14 @@ impl OntologyStore {
                      connector_config=?5, credential_id=?6, updated_at=?7
                  WHERE ontology_api_name=?1 AND api_name=?8",
                 rusqlite::params![
-                    ontology_api_name, ds.display_name, ds.description,
-                    ds.connector_type, json_to_string(&ds.connector_config),
-                    ds.credential_id, now, ds.api_name
+                    ontology_api_name,
+                    ds.display_name,
+                    ds.description,
+                    ds.connector_type,
+                    json_to_string(&ds.connector_config),
+                    ds.credential_id,
+                    now,
+                    ds.api_name
                 ],
             )?;
             Ok(Upsert::Overwritten)
@@ -1644,7 +2247,12 @@ impl OntologyStore {
         }
     }
 
-    fn data_source_exists_tx(&self, tx: &rusqlite::Transaction, ontology_api_name: &str, api_name: &str) -> StoreResult<bool> {
+    fn data_source_exists_tx(
+        &self,
+        tx: &rusqlite::Transaction,
+        ontology_api_name: &str,
+        api_name: &str,
+    ) -> StoreResult<bool> {
         let n: i64 = tx.query_row(
             "SELECT COUNT(*) FROM data_sources WHERE ontology_api_name=?1 AND api_name=?2",
             rusqlite::params![ontology_api_name, api_name],
@@ -1653,7 +2261,13 @@ impl OntologyStore {
         Ok(n > 0)
     }
 
-    fn upsert_dataset(&self, tx: &rusqlite::Transaction, ontology_api_name: &str, d: &DatasetDef, now: i64) -> StoreResult<bool> {
+    fn upsert_dataset(
+        &self,
+        tx: &rusqlite::Transaction,
+        ontology_api_name: &str,
+        d: &DatasetDef,
+        now: i64,
+    ) -> StoreResult<bool> {
         if self.dataset_exists_tx(tx, ontology_api_name, &d.api_name)? {
             Ok(false)
         } else {
@@ -1671,7 +2285,12 @@ impl OntologyStore {
         }
     }
 
-    fn dataset_exists_tx(&self, tx: &rusqlite::Transaction, ontology_api_name: &str, api_name: &str) -> StoreResult<bool> {
+    fn dataset_exists_tx(
+        &self,
+        tx: &rusqlite::Transaction,
+        ontology_api_name: &str,
+        api_name: &str,
+    ) -> StoreResult<bool> {
         let n: i64 = tx.query_row(
             "SELECT COUNT(*) FROM datasets WHERE ontology_api_name=?1 AND api_name=?2",
             rusqlite::params![ontology_api_name, api_name],
@@ -1693,18 +2312,23 @@ impl OntologyStore {
             rusqlite::params![ont_api_name],
             |r| r.get(0),
         )?;
-        let existing_id: Option<String> = tx.query_row(
-            "SELECT id FROM object_types WHERE ontology_id=?1 AND api_name=?2",
-            rusqlite::params![ont_id, ot.api_name],
-            |r| r.get(0),
-        ).optional()?;
+        let existing_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM object_types WHERE ontology_id=?1 AND api_name=?2",
+                rusqlite::params![ont_id, ot.api_name],
+                |r| r.get(0),
+            )
+            .optional()?;
 
         if let Some(id) = existing_id {
             if !overwrite {
                 return Ok(Upsert::Skipped);
             }
             // 覆写：删旧 OT（级联删 properties），重建
-            tx.execute("DELETE FROM object_types WHERE id=?1", rusqlite::params![id])?;
+            tx.execute(
+                "DELETE FROM object_types WHERE id=?1",
+                rusqlite::params![id],
+            )?;
             let new_ot_id = new_id();
             self.insert_object_type(tx, &new_ot_id, &ont_id, ot, now)?;
             for p in &ot.properties {
@@ -1864,11 +2488,13 @@ impl OntologyStore {
             rusqlite::params![ont_api_name],
             |r| r.get(0),
         )?;
-        let existing_gid: Option<String> = tx.query_row(
-            "SELECT id FROM object_type_groups WHERE ontology_id=?1 AND api_name=?2",
-            rusqlite::params![ont_id, g.api_name],
-            |r| r.get(0),
-        ).optional()?;
+        let existing_gid: Option<String> = tx
+            .query_row(
+                "SELECT id FROM object_type_groups WHERE ontology_id=?1 AND api_name=?2",
+                rusqlite::params![ont_id, g.api_name],
+                |r| r.get(0),
+            )
+            .optional()?;
         if existing_gid.is_some() {
             Ok(false)
         } else {
@@ -1880,11 +2506,13 @@ impl OntologyStore {
             )?;
             // 成员关联
             for member_api_name in &g.members {
-                let ot_id: Option<String> = tx.query_row(
-                    "SELECT id FROM object_types WHERE ontology_id=?1 AND api_name=?2",
-                    rusqlite::params![ont_id, member_api_name],
-                    |r| r.get(0),
-                ).optional()?;
+                let ot_id: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM object_types WHERE ontology_id=?1 AND api_name=?2",
+                        rusqlite::params![ont_id, member_api_name],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
                 if let Some(ot_id) = ot_id {
                     tx.execute(
                         "INSERT OR IGNORE INTO object_type_group_members (group_id, object_type_id, ontology_id, created_at)
@@ -1904,6 +2532,102 @@ use rusqlite::OptionalExtension;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_warns_on_unverified_backing_column() {
+        let store = OntologyStore::open_in_memory().unwrap();
+        // 登记 db_column 源：只有 suppliers 表，没有 customers 表
+        store
+            .register_evidence_source(
+                "db_column",
+                "ERP schema",
+                "suppliers.supplier_id\nsuppliers.supplier_name",
+                "SupplyChain",
+                "",
+            )
+            .unwrap();
+        let mut payload = sample_payload();
+        use crate::payload::BackingMapping;
+        payload.object_types[0].storage_type = "VIRTUAL".to_string();
+        for (i, p) in payload.object_types[0].properties.iter_mut().enumerate() {
+            p.backing_mapping = Some(BackingMapping {
+                dataset_api_name: String::new(),
+                backing_catalog: String::new(),
+                backing_schema: String::new(),
+                backing_table: if i == 0 { "suppliers".into() } else { "customers".into() },
+                backing_column: if i == 0 { "supplier_id".into() } else { "customer_id".into() },
+            });
+        }
+        let req = ImportRequest {
+            payload,
+            overwrite_object_types: vec![],
+            overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
+        };
+        let preview = store.preview_import(&req).unwrap();
+        let customers = preview
+            .warnings
+            .iter()
+            .find(|w| w.contains("customers.customer_id"))
+            .expect("customers.customer_id 应触发反向校验 warning");
+        assert!(customers.contains("未在任何已登记 DB schema 源中找到"));
+        assert!(
+            !preview
+                .warnings
+                .iter()
+                .any(|w| w.contains("suppliers.supplier_id 未在")),
+            "已登记列不应告警"
+        );
+    }
+
+    #[test]
+    fn evidence_roundtrip_via_import_export() {
+        let store = OntologyStore::open_in_memory().unwrap();
+        // 登记源 + 带证据的 payload
+        let src = store
+            .register_evidence_source(
+                "scenario",
+                "业务场景描述",
+                "采购部门依据合同条款审核供应商入库申请，供应商是提供货物的企业。",
+                "SupplyChain",
+                "",
+            )
+            .unwrap();
+        let mut payload = sample_payload();
+        use crate::evidence::{Evidence, EvidenceRole};
+        payload.object_types[0].evidence.push(Evidence {
+            source_id: src.clone(),
+            quote: "供应商是提供货物的企业".to_string(),
+            span: None,
+            role: EvidenceRole::Direct,
+        });
+        let req = ImportRequest {
+            payload: payload.clone(),
+            overwrite_object_types: vec![],
+            overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
+        };
+        store.import(&req).unwrap();
+        // element_evidence 已落库
+        let rows = store
+            .list_element_evidence("palantir", "SupplyChain")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].element_id, "Supplier");
+        assert_eq!(rows[0].matched_by, "exact");
+        assert_eq!(rows[0].role, "direct");
+        // export 回填（round-trip）
+        let exported = store.export("SupplyChain").unwrap();
+        assert_eq!(exported.object_types[0].evidence.len(), 1);
+        assert_eq!(
+            exported.object_types[0].evidence[0].quote,
+            "供应商是提供货物的企业"
+        );
+        assert_eq!(
+            exported.object_types[0].evidence[0].source_id,
+            src
+        );
+    }
 
     pub(super) fn sample_payload() -> OntologyPayload {
         OntologyPayload {
@@ -1931,6 +2655,7 @@ mod tests {
                         backing_mapping: None,
                         vector_config: None,
                         confidence: None,
+                        evidence: Vec::new(),
                     },
                     PropertyDef {
                         api_name: "name".to_string(),
@@ -1943,10 +2668,12 @@ mod tests {
                         backing_mapping: None,
                         vector_config: None,
                         confidence: None,
+                        evidence: Vec::new(),
                     },
                 ],
                 links: vec![],
                 confidence: None,
+                evidence: Vec::new(),
             }],
             action_types: vec![],
             datasets: vec![],
@@ -1984,10 +2711,15 @@ mod tests {
             payload: payload.clone(),
             overwrite_object_types: vec![],
             overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
         };
         // preview 应无 errors
         let preview = store.preview_import(&req).unwrap();
-        assert!(preview.errors.is_empty(), "preview errors: {:?}", preview.errors);
+        assert!(
+            preview.errors.is_empty(),
+            "preview errors: {:?}",
+            preview.errors
+        );
         assert_eq!(preview.object_types[0].status, "create");
         // import
         let result = store.import(&req).unwrap();
@@ -2000,14 +2732,22 @@ mod tests {
         assert_eq!(exported.object_types[0].api_name, "Supplier");
         assert_eq!(exported.object_types[0].properties.len(), 2);
         // export 按 api_name 排序（稳定输出），用 find 而非下标断言
-        let pk = exported.object_types[0].properties.iter()
+        let pk = exported.object_types[0]
+            .properties
+            .iter()
             .find(|p| p.is_primary_key == Some(true))
             .expect("应有主键属性");
         assert_eq!(pk.api_name, "supplierId");
         // datasets / data_sources 是全局资产，import 落库后 export 必须能拿回
         // （回归 guard：曾因 export_* 返回空 vec 导致前端看不到数据源/数据集）
-        assert!(!exported.datasets.is_empty(), "export 应返回已导入的 datasets");
-        assert!(!exported.data_sources.is_empty(), "export 应返回已导入的 data_sources");
+        assert!(
+            !exported.datasets.is_empty(),
+            "export 应返回已导入的 datasets"
+        );
+        assert!(
+            !exported.data_sources.is_empty(),
+            "export 应返回已导入的 data_sources"
+        );
         assert_eq!(exported.datasets[0].api_name, "suppliers_dataset");
         assert_eq!(exported.data_sources[0].api_name, "erp_postgres");
     }
@@ -2017,18 +2757,78 @@ mod tests {
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = sample_payload();
         // 第一次 import：create
-        let r1 = store.import(&ImportRequest { payload: payload.clone(), overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        let r1 = store
+            .import(&ImportRequest {
+                payload: payload.clone(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         assert_eq!(r1.object_types[0].status, "created");
         // 第二次 import（不带 overwrite）：应 skip
-        let r2 = store.import(&ImportRequest { payload: payload.clone(), overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        let r2 = store
+            .import(&ImportRequest {
+                payload: payload.clone(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         assert_eq!(r2.object_types[0].status, "skipped");
         // 第三次 import（带 overwrite）：应 overwritten
-        let r3 = store.import(&ImportRequest {
-            payload: payload.clone(),
-            overwrite_object_types: vec!["Supplier".to_string()],
-            overwrite_data_sources: vec![],
-        }).unwrap();
+        let r3 = store
+            .import(&ImportRequest {
+                payload: payload.clone(),
+                overwrite_object_types: vec!["Supplier".to_string()],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         assert_eq!(r3.object_types[0].status, "overwritten");
+    }
+
+    #[test]
+    fn preview_warns_when_overwrite_drops_existing_properties() {
+        let store = OntologyStore::open_in_memory().unwrap();
+        let payload = sample_payload();
+        store
+            .import(&ImportRequest {
+                payload: payload.clone(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
+        // 迭代场景：payload 只带 1 个属性（丢了 sample 里的其它属性）
+        let mut partial = payload.clone();
+        let full_props = partial.object_types[0].properties.clone();
+        partial.object_types[0].properties = vec![full_props[0].clone()];
+        let pv = store
+            .preview_import(&ImportRequest {
+                payload: partial,
+                overwrite_object_types: vec!["Supplier".to_string()],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
+        let item = &pv.object_types[0];
+        assert_eq!(item.status, "overwrite");
+        assert!(
+            item.reason.contains("覆写将删除已有属性"),
+            "丢失属性必须告警，实际 reason: {}",
+            item.reason
+        );
+        // payload 属性完整时不应告警
+        let pv2 = store
+            .preview_import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec!["Supplier".to_string()],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
+        assert!(!pv2.object_types[0].reason.contains("覆写将删除已有属性"));
     }
 
     #[test]
@@ -2036,9 +2836,17 @@ mod tests {
         let store = OntologyStore::open_in_memory().unwrap();
         let mut payload = sample_payload();
         payload.object_types[0].properties[0].is_primary_key = Some(false); // 0 个主键
-        let req = ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] };
+        let req = ImportRequest {
+            payload,
+            overwrite_object_types: vec![],
+            overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
+        };
         let preview = store.preview_import(&req).unwrap();
-        assert!(preview.errors.iter().any(|e| e.contains("必须有且仅一个 is_primary_key")));
+        assert!(preview
+            .errors
+            .iter()
+            .any(|e| e.contains("必须有且仅一个 is_primary_key")));
     }
 
     #[test]
@@ -2055,10 +2863,19 @@ mod tests {
             weight_property: None,
             temporal: false,
             confidence: None,
+       evidence: Vec::new(),
         });
-        let req = ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] };
+        let req = ImportRequest {
+            payload,
+            overwrite_object_types: vec![],
+            overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
+        };
         let preview = store.preview_import(&req).unwrap();
-        assert!(preview.errors.iter().any(|e| e.contains("NonExistent") && e.contains("不存在")));
+        assert!(preview
+            .errors
+            .iter()
+            .any(|e| e.contains("NonExistent") && e.contains("不存在")));
     }
 
     #[test]
@@ -2066,7 +2883,12 @@ mod tests {
         let store = OntologyStore::open_in_memory().unwrap();
         let mut payload = sample_payload();
         payload.object_types[0].api_name = "supplier".to_string(); // 小写，非法 PascalCase
-        let req = ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] };
+        let req = ImportRequest {
+            payload,
+            overwrite_object_types: vec![],
+            overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
+        };
         let preview = store.preview_import(&req);
         assert!(preview.is_err());
     }
@@ -2093,7 +2915,12 @@ mod tests {
             batch_enabled: true,
             confidence: None,
         });
-        let req = ImportRequest { payload: payload.clone(), overwrite_object_types: vec![], overwrite_data_sources: vec![] };
+        let req = ImportRequest {
+            payload: payload.clone(),
+            overwrite_object_types: vec![],
+            overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
+        };
         let preview = store.preview_import(&req).unwrap();
         assert!(preview.errors.is_empty(), "preview should have no errors");
         assert_eq!(preview.actions[0].status, "create");
@@ -2124,7 +2951,12 @@ mod tests {
             members: vec!["Supplier".to_string()],
             confidence: None,
         });
-        let req = ImportRequest { payload: payload.clone(), overwrite_object_types: vec![], overwrite_data_sources: vec![] };
+        let req = ImportRequest {
+            payload: payload.clone(),
+            overwrite_object_types: vec![],
+            overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
+        };
         let preview = store.preview_import(&req).unwrap();
         assert!(preview.errors.is_empty(), "preview should have no errors");
         let result = store.import(&req).unwrap();
@@ -2168,14 +3000,26 @@ mod tests {
             is_view: false,
             confidence: None,
         });
-        let req = ImportRequest { payload: payload.clone(), overwrite_object_types: vec![], overwrite_data_sources: vec![] };
+        let req = ImportRequest {
+            payload: payload.clone(),
+            overwrite_object_types: vec![],
+            overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
+        };
         let preview = store.preview_import(&req).unwrap();
         assert!(preview.errors.is_empty(), "preview should have no errors");
         let result = store.import(&req).unwrap();
         assert_eq!(result.data_sources[0].status, "created");
         assert_eq!(result.datasets[0].status, "created");
         // 再 import 一遍：应 skip（幂等）
-        let r2 = store.import(&ImportRequest { payload: payload.clone(), overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        let r2 = store
+            .import(&ImportRequest {
+                payload: payload.clone(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         assert_eq!(r2.data_sources[0].status, "skipped");
         assert_eq!(r2.datasets[0].status, "skipped");
     }
@@ -2185,7 +3029,14 @@ mod tests {
         // overwrite OT 时，旧 properties 应被级联删除，新 properties 重建
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = sample_payload();
-        store.import(&ImportRequest { payload: payload.clone(), overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload: payload.clone(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         // 改 OT：加一个属性、删一个属性
         let mut payload2 = payload.clone();
         payload2.object_types[0].properties.push(PropertyDef {
@@ -2199,14 +3050,18 @@ mod tests {
             backing_mapping: None,
             vector_config: None,
             confidence: None,
+       evidence: Vec::new(),
         });
         // 删除 name 属性（index 1）
         payload2.object_types[0].properties.remove(1);
-        let r = store.import(&ImportRequest {
-            payload: payload2,
-            overwrite_object_types: vec!["Supplier".to_string()],
-            overwrite_data_sources: vec![],
-        }).unwrap();
+        let r = store
+            .import(&ImportRequest {
+                payload: payload2,
+                overwrite_object_types: vec!["Supplier".to_string()],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         assert_eq!(r.object_types[0].status, "overwritten");
         // export 验证：应有 supplierId + phone 两个属性（name 已删）
         let exported = store.export("SupplyChain").unwrap();
@@ -2215,7 +3070,10 @@ mod tests {
         let names: Vec<&str> = ot.properties.iter().map(|p| p.api_name.as_str()).collect();
         assert!(names.contains(&"supplierId"));
         assert!(names.contains(&"phone"));
-        assert!(!names.contains(&"name"), "deleted property should not reappear");
+        assert!(
+            !names.contains(&"name"),
+            "deleted property should not reappear"
+        );
     }
 
     // ── 只读 summary / drill-in 测试 ──
@@ -2234,6 +3092,7 @@ mod tests {
             weight_property: None,
             temporal: false,
             confidence: None,
+       evidence: Vec::new(),
         });
         // 第二个 OT：Part（无 link）
         p.object_types.push(ObjectTypeDef {
@@ -2257,6 +3116,7 @@ mod tests {
                     backing_mapping: None,
                     vector_config: None,
                     confidence: None,
+                    evidence: Vec::new(),
                 },
                 PropertyDef {
                     api_name: "partName".to_string(),
@@ -2269,10 +3129,12 @@ mod tests {
                     backing_mapping: None,
                     vector_config: None,
                     confidence: None,
+                    evidence: Vec::new(),
                 },
             ],
             links: vec![],
             confidence: None,
+       evidence: Vec::new(),
         });
         // 作用 Supplier 的 action
         p.action_types.push(ActionTypeDef {
@@ -2297,7 +3159,14 @@ mod tests {
     fn describe_ontology_summary_returns_ot_catalog_with_counts() {
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = linked_payload();
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         let s = store.describe_ontology_summary("SupplyChain").unwrap();
         assert_eq!(s.api_name, "SupplyChain");
@@ -2316,8 +3185,6 @@ mod tests {
         // 未设 charter 时返回空结构体（不报错，各字段空串）
         assert_eq!(s.charter.business_scenario, "");
         assert_eq!(s.charter.business_essence, "");
-        assert_eq!(s.charter.design_intent, "");
-        assert_eq!(s.charter.invariants, "");
     }
 
     #[test]
@@ -2333,13 +3200,18 @@ mod tests {
     fn set_and_get_charter_roundtrip() {
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = linked_payload();
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         let charter = OntologyCharter {
             business_scenario: "供应链采购场景：采购员向供应商下达采购单".into(),
             business_essence: "核心对象：供应商、零件、采购单；状态流转：草稿→已下单→已到货".into(),
-            design_intent: "够用且可扩展：先建供应商+零件+采购单三角，后续可扩展质检/物流".into(),
-            invariants: "采购单金额必须 >0；供应商状态为活跃时才可下单".into(),
             updated_by: "agent".into(),
             updated_at: 0,
         };
@@ -2348,8 +3220,6 @@ mod tests {
         let got = store.get_charter("SupplyChain").unwrap();
         assert_eq!(got.business_scenario, charter.business_scenario);
         assert_eq!(got.business_essence, charter.business_essence);
-        assert_eq!(got.design_intent, charter.design_intent);
-        assert_eq!(got.invariants, charter.invariants);
         assert_eq!(got.updated_by, "agent");
         assert!(got.updated_at > 0, "updated_at 应被后端填为当前时间");
     }
@@ -2359,13 +3229,26 @@ mod tests {
         // charter 是 1:1 upsert，重复写是 UPDATE 不是新增多条
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = linked_payload();
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
-        let mut c1 = OntologyCharter { business_essence: "第一版本质".into(), ..Default::default() };
+        let mut c1 = OntologyCharter {
+            business_essence: "第一版本质".into(),
+            ..Default::default()
+        };
         c1.updated_by = "agent".into();
         store.set_charter("SupplyChain", &c1).unwrap();
 
-        let mut c2 = OntologyCharter { business_essence: "第二版本质修订".into(), ..Default::default() };
+        let mut c2 = OntologyCharter {
+            business_essence: "第二版本质修订".into(),
+            ..Default::default()
+        };
         c2.updated_by = "user".into();
         store.set_charter("SupplyChain", &c2).unwrap();
 
@@ -2385,13 +3268,18 @@ mod tests {
     fn describe_ontology_summary_includes_charter_when_set() {
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = linked_payload();
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         let charter = OntologyCharter {
             business_scenario: "场景X".into(),
             business_essence: "本质Y".into(),
-            design_intent: "意图Z".into(),
-            invariants: "不变量W".into(),
             updated_by: "agent".into(),
             updated_at: 0,
         };
@@ -2400,8 +3288,6 @@ mod tests {
         let s = store.describe_ontology_summary("SupplyChain").unwrap();
         assert_eq!(s.charter.business_scenario, "场景X");
         assert_eq!(s.charter.business_essence, "本质Y");
-        assert_eq!(s.charter.design_intent, "意图Z");
-        assert_eq!(s.charter.invariants, "不变量W");
     }
 
     #[test]
@@ -2411,7 +3297,14 @@ mod tests {
         // charter 应保持不变，ontology.description 也不被覆盖（由 set_charter 管理）。
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = linked_payload();
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         let charter = OntologyCharter {
             business_essence: "不应被覆盖的本质".into(),
@@ -2423,10 +3316,20 @@ mod tests {
         // 二次 import（模拟增量更新，payload 带不同 description）
         let mut p2 = linked_payload();
         p2.description = "被 import 覆盖的 description（不应生效）".to_string();
-        store.import(&ImportRequest { payload: p2, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload: p2,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         let got = store.get_charter("SupplyChain").unwrap();
-        assert_eq!(got.business_essence, "不应被覆盖的本质", "charter 不应被 import 覆盖");
+        assert_eq!(
+            got.business_essence, "不应被覆盖的本质",
+            "charter 不应被 import 覆盖"
+        );
     }
 
     #[test]
@@ -2434,8 +3337,19 @@ mod tests {
         // ON DELETE CASCADE 应级联删 charter
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = linked_payload();
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
-        let charter = OntologyCharter { business_essence: "本质".into(), updated_by: "agent".into(), ..Default::default() };
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
+        let charter = OntologyCharter {
+            business_essence: "本质".into(),
+            updated_by: "agent".into(),
+            ..Default::default()
+        };
         store.set_charter("SupplyChain", &charter).unwrap();
 
         store.delete("SupplyChain").unwrap();
@@ -2448,7 +3362,14 @@ mod tests {
     fn list_object_types_is_lighter_than_summary() {
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = linked_payload();
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         let ots = store.list_object_types("SupplyChain").unwrap();
         assert_eq!(ots.len(), 2);
@@ -2462,10 +3383,19 @@ mod tests {
     fn describe_object_type_returns_full_schema_with_inbound_links_and_actions() {
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = linked_payload();
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         // Supplier：有 1 个 outbound link（supplies→Part）、0 inbound、1 action
-        let sup = store.describe_object_type("SupplyChain", "Supplier").unwrap();
+        let sup = store
+            .describe_object_type("SupplyChain", "Supplier")
+            .unwrap();
         assert_eq!(sup.api_name, "Supplier");
         assert_eq!(sup.primary_key, "supplierId");
         assert_eq!(sup.title_property, "name");
@@ -2473,7 +3403,10 @@ mod tests {
         // 对齐 Gaia：inbound/outbound_links 是 api_name 字符串列表
         assert_eq!(sup.outbound_links.len(), 1);
         assert_eq!(sup.outbound_links[0], "supplies");
-        assert!(sup.inbound_links.is_empty(), "Supplier has no inbound links");
+        assert!(
+            sup.inbound_links.is_empty(),
+            "Supplier has no inbound links"
+        );
         assert_eq!(sup.actions.len(), 1);
         assert_eq!(sup.actions[0], "submitOrder");
 
@@ -2490,9 +3423,18 @@ mod tests {
     fn describe_object_type_unknown_ot_returns_not_found() {
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = linked_payload();
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
-        let err = store.describe_object_type("SupplyChain", "Ghost").unwrap_err();
+        let err = store
+            .describe_object_type("SupplyChain", "Ghost")
+            .unwrap_err();
         assert!(matches!(err, StoreError::NotFound(_)));
     }
 
@@ -2502,7 +3444,14 @@ mod tests {
     fn list_link_types_returns_brief_catalog() {
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = linked_payload();
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         let links = store.list_link_types("SupplyChain").unwrap();
         assert_eq!(links.len(), 1);
@@ -2519,7 +3468,14 @@ mod tests {
     fn describe_link_type_returns_full_def() {
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = linked_payload();
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         let l = store.describe_link_type("SupplyChain", "supplies").unwrap();
         assert_eq!(l.api_name, "supplies");
@@ -2535,9 +3491,18 @@ mod tests {
     fn describe_link_type_unknown_returns_not_found() {
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = linked_payload();
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
-        let err = store.describe_link_type("SupplyChain", "ghostLink").unwrap_err();
+        let err = store
+            .describe_link_type("SupplyChain", "ghostLink")
+            .unwrap_err();
         assert!(matches!(err, StoreError::NotFound(_)));
     }
 
@@ -2547,15 +3512,30 @@ mod tests {
     fn delete_removes_ontology_and_cascades_children() {
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = sample_payload();
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         // 导入后应能查到
-        assert!(store.list_ontologies().unwrap().iter().any(|o| o.api_name == "SupplyChain"));
+        assert!(store
+            .list_ontologies()
+            .unwrap()
+            .iter()
+            .any(|o| o.api_name == "SupplyChain"));
 
         let deleted = store.delete("SupplyChain").unwrap();
         assert!(deleted, "删除已存在的本体应返回 true");
 
         // 本体本身不在了
-        assert!(!store.list_ontologies().unwrap().iter().any(|o| o.api_name == "SupplyChain"));
+        assert!(!store
+            .list_ontologies()
+            .unwrap()
+            .iter()
+            .any(|o| o.api_name == "SupplyChain"));
         // 级联清子表：object_types 为空（直接查 DB 验证级联生效，不只依赖 list 语义）
         let conn = store.conn.lock().unwrap();
         let ot_count: i64 = conn
@@ -2609,7 +3589,14 @@ mod tests {
     fn delete_ontology_cascades_owned_datasets_and_data_sources() {
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = payload_with_assets("SupplyChain");
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         // 导入后该本体的资产可见（按本体隔离）
         assert_eq!(store.list_datasets("SupplyChain").unwrap().len(), 1);
         assert_eq!(store.list_data_sources("SupplyChain").unwrap().len(), 1);
@@ -2617,18 +3604,36 @@ mod tests {
         store.delete("SupplyChain").unwrap();
 
         // 删除本体后：资产随本体级联删除（FK ON DELETE CASCADE）
-        assert!(store.list_datasets("SupplyChain").unwrap().is_empty(),
-            "删除本体应级联删除其 dataset");
-        assert!(store.list_data_sources("SupplyChain").unwrap().is_empty(),
-            "删除本体应级联删除其 data_source");
+        assert!(
+            store.list_datasets("SupplyChain").unwrap().is_empty(),
+            "删除本体应级联删除其 dataset"
+        );
+        assert!(
+            store.list_data_sources("SupplyChain").unwrap().is_empty(),
+            "删除本体应级联删除其 data_source"
+        );
     }
 
     #[test]
     fn datasets_data_sources_are_isolated_between_ontologies() {
         // 决策 10 修订：不同本体的同名 dataset/data_source 独立存在，互不申到。
         let store = OntologyStore::open_in_memory().unwrap();
-        store.import(&ImportRequest { payload: payload_with_assets("SupplyChain"), overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
-        store.import(&ImportRequest { payload: payload_with_assets("Logistics"), overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload: payload_with_assets("SupplyChain"),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
+        store
+            .import(&ImportRequest {
+                payload: payload_with_assets("Logistics"),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         // 两个本体各自拥有同名资产，不串扰
         assert_eq!(store.list_datasets("SupplyChain").unwrap().len(), 1);
@@ -2638,12 +3643,20 @@ mod tests {
 
         // 删 SupplyChain：只影响 SupplyChain 的资产，Logistics 的保留
         store.delete("SupplyChain").unwrap();
-        assert!(store.list_datasets("SupplyChain").unwrap().is_empty(),
-            "SupplyChain 的 dataset 应随本体删除");
-        assert_eq!(store.list_datasets("Logistics").unwrap().len(), 1,
-            "Logistics 的 dataset 不应被删（按本体隔离）");
-        assert_eq!(store.list_data_sources("Logistics").unwrap().len(), 1,
-            "Logistics 的 data_source 不应被删（按本体隔离）");
+        assert!(
+            store.list_datasets("SupplyChain").unwrap().is_empty(),
+            "SupplyChain 的 dataset 应随本体删除"
+        );
+        assert_eq!(
+            store.list_datasets("Logistics").unwrap().len(),
+            1,
+            "Logistics 的 dataset 不应被删（按本体隔离）"
+        );
+        assert_eq!(
+            store.list_data_sources("Logistics").unwrap().len(),
+            1,
+            "Logistics 的 data_source 不应被删（按本体隔离）"
+        );
 
         // export Logistics 仍能看到它的资产
         let exported = store.export("Logistics").unwrap();
@@ -2657,14 +3670,30 @@ mod tests {
     fn delete_frees_api_name_for_reimport() {
         let store = OntologyStore::open_in_memory().unwrap();
         let payload = sample_payload();
-        store.import(&ImportRequest { payload: payload.clone(), overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload: payload.clone(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         assert!(store.delete("SupplyChain").unwrap());
 
         // 删除后同 api_name 可重新导入（不报 UNIQUE 冲突）
-        let res = store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] });
+        let res = store.import(&ImportRequest {
+            payload,
+            overwrite_object_types: vec![],
+            overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
+        });
         assert!(res.is_ok(), "删除后应可重新导入同 api_name");
         // 重新导入后能查到
-        assert!(store.list_ontologies().unwrap().iter().any(|o| o.api_name == "SupplyChain"));
+        assert!(store
+            .list_ontologies()
+            .unwrap()
+            .iter()
+            .any(|o| o.api_name == "SupplyChain"));
     }
     #[test]
     fn on_change_callback_fires_on_import_and_delete() {
@@ -2676,12 +3705,14 @@ mod tests {
         }));
 
         // import 触发一次
-        store.import(&ImportRequest {
-            payload: sample_payload(),
-            overwrite_object_types: vec![],
-            overwrite_data_sources: vec![],
-        })
-        .unwrap();
+        store
+            .import(&ImportRequest {
+                payload: sample_payload(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // 未注册前删除不触发（此处已注册）：删除存在 → 触发；删除不存在 → 不触发
@@ -2711,7 +3742,14 @@ mod tests {
             batch_enabled: false,
             confidence: None,
         });
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         // 删 Part：links(supplies 双端引用) + actions(renamePart) 连删，properties FK 级联
         let (removed, links, actions) = store.delete_object_type("SupplyChain", "Part").unwrap();
@@ -2722,7 +3760,11 @@ mod tests {
         let payload = store.export("SupplyChain").unwrap();
         assert!(payload.object_types.iter().all(|ot| ot.api_name != "Part"));
         // Supplier 还在，但它的 links 被(双端规则)清了
-        let supplier = payload.object_types.iter().find(|ot| ot.api_name == "Supplier").unwrap();
+        let supplier = payload
+            .object_types
+            .iter()
+            .find(|ot| ot.api_name == "Supplier")
+            .unwrap();
         assert!(supplier.links.is_empty());
         // renamePart(影响 Part)被连删;submitOrder(影响 Supplier)保留
         assert_eq!(payload.action_types.len(), 1);
@@ -2752,12 +3794,23 @@ mod tests {
             batch_enabled: false,
             confidence: None,
         });
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         assert!(store.delete_link_type("SupplyChain", "supplies").unwrap());
         assert!(!store.delete_link_type("SupplyChain", "supplies").unwrap());
-        assert!(store.delete_action_type("SupplyChain", "renamePart").unwrap());
-        assert!(!store.delete_action_type("SupplyChain", "renamePart").unwrap());
+        assert!(store
+            .delete_action_type("SupplyChain", "renamePart")
+            .unwrap());
+        assert!(!store
+            .delete_action_type("SupplyChain", "renamePart")
+            .unwrap());
 
         let payload = store.export("SupplyChain").unwrap();
         assert!(payload.object_types[0].links.is_empty());
@@ -2790,30 +3843,50 @@ mod tests {
             is_view: false,
             confidence: None,
         });
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         // OT 绑定该 dataset（backing 引用，直接 SQL 设置——import 的 write-view 不含 OT 级 backing）
         {
             let conn = store.conn.lock().unwrap();
-            conn.execute("UPDATE object_types SET backing_dataset_api_name='suppliers_dataset'", []).unwrap();
+            conn.execute(
+                "UPDATE object_types SET backing_dataset_api_name='suppliers_dataset'",
+                [],
+            )
+            .unwrap();
         }
 
         // 被 OT backing 引用 → 拒绝
-        let err = store.delete_dataset("SupplyChain", "suppliers_dataset").unwrap_err();
+        let err = store
+            .delete_dataset("SupplyChain", "suppliers_dataset")
+            .unwrap_err();
         assert!(err.to_string().contains("被引用"));
 
         // 解绑后可删
         let conn_affected = {
             // 直接清掉 OT 的 backing 引用（模拟用户先解绑）
             let conn = store.conn.lock().unwrap();
-            conn.execute("UPDATE object_types SET backing_dataset_api_name=NULL", []).unwrap()
+            conn.execute("UPDATE object_types SET backing_dataset_api_name=NULL", [])
+                .unwrap()
         };
         assert_eq!(conn_affected, 1);
-        assert!(store.delete_dataset("SupplyChain", "suppliers_dataset").unwrap());
+        assert!(store
+            .delete_dataset("SupplyChain", "suppliers_dataset")
+            .unwrap());
         // 幂等
-        assert!(!store.delete_dataset("SupplyChain", "suppliers_dataset").unwrap());
+        assert!(!store
+            .delete_dataset("SupplyChain", "suppliers_dataset")
+            .unwrap());
 
         // 不存在 → false
-        assert!(!store.delete_dataset("SupplyChain", "no_such_dataset").unwrap());
+        assert!(!store
+            .delete_dataset("SupplyChain", "no_such_dataset")
+            .unwrap());
     }
 
     #[test]
@@ -2840,31 +3913,61 @@ mod tests {
             is_view: false,
             confidence: None,
         });
-        store.import(&ImportRequest { payload, overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         // 被 suppliers_dataset 引用 → 拒绝
-        let err = store.delete_data_source("SupplyChain", "erp_postgres").unwrap_err();
+        let err = store
+            .delete_data_source("SupplyChain", "erp_postgres")
+            .unwrap_err();
         assert!(err.to_string().contains("被引用"));
-        assert!(!store.delete_data_source("SupplyChain", "no_such_source").unwrap());
+        assert!(!store
+            .delete_data_source("SupplyChain", "no_such_source")
+            .unwrap());
     }
 
     #[test]
     fn changelog_revision_increments_and_enforces_limits() {
         let store = OntologyStore::open_in_memory().unwrap();
-        store.import(&ImportRequest { payload: sample_payload(), overwrite_object_types: vec![], overwrite_data_sources: vec![] }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload: sample_payload(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         // 第一条 revision=1
-        let r1 = store.commit_change(
-            "SupplyChain", "冷启动建模", "从业务材料抽象出 Supplier/Part",
-            r#"{"created":["Supplier","Part"]}"#, None, "agent",
-        ).unwrap();
+        let r1 = store
+            .commit_change(
+                "SupplyChain",
+                "冷启动建模",
+                "从业务材料抽象出 Supplier/Part",
+                r#"{"created":["Supplier","Part"]}"#,
+                None,
+                "agent",
+            )
+            .unwrap();
         assert_eq!(r1, 1);
 
         // 第二条 revision=2
-        let r2 = store.commit_change(
-            "SupplyChain", "加状态属性", "给 Supplier 加 status",
-            r#"{"modified":["Supplier"]}"#, Some("conv-123"), "agent",
-        ).unwrap();
+        let r2 = store
+            .commit_change(
+                "SupplyChain",
+                "加状态属性",
+                "给 Supplier 加 status",
+                r#"{"modified":["Supplier"]}"#,
+                Some("conv-123"),
+                "agent",
+            )
+            .unwrap();
         assert_eq!(r2, 2);
 
         // list 倒序：最新在前
@@ -2876,16 +3979,22 @@ mod tests {
 
         // title+body 超 500 → 拒
         let long_title = "x".repeat(501);
-        let err = store.commit_change("SupplyChain", &long_title, "", "{}", None, "agent").unwrap_err();
+        let err = store
+            .commit_change("SupplyChain", &long_title, "", "{}", None, "agent")
+            .unwrap_err();
         assert!(err.to_string().contains("500"));
 
         // 整条超 1K（change_summary 撑大）→ 拒
         let big_summary = "y".repeat(999);
-        let err = store.commit_change("SupplyChain", "t", "b", &big_summary, None, "agent").unwrap_err();
+        let err = store
+            .commit_change("SupplyChain", "t", "b", &big_summary, None, "agent")
+            .unwrap_err();
         assert!(err.to_string().contains("1000"));
 
         // 不存在的本体 → 拒（get_ontology_row 返回 NotFound）
-        assert!(store.commit_change("NoSuch", "x", "", "{}", None, "agent").is_err());
+        assert!(store
+            .commit_change("NoSuch", "x", "", "{}", None, "agent")
+            .is_err());
     }
 
     /// DataSource 見写：脱敏 *** 先入库，再带 overwrite_data_sources 重导真实密码，
@@ -2912,33 +4021,51 @@ mod tests {
         });
 
         // 第一次导入：created，DB 里存的是脱敏值
-        let r1 = store.import(&ImportRequest {
-            payload: payload.clone(),
-            overwrite_object_types: vec![],
-            overwrite_data_sources: vec![],
-        }).unwrap();
+        let r1 = store
+            .import(&ImportRequest {
+                payload: payload.clone(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         assert_eq!(r1.data_sources[0].status, "created");
         let exported1 = store.export("SupplyChain").unwrap();
-        let cfg1 = exported1.data_sources[0].connector_config.as_object().unwrap();
+        let cfg1 = exported1.data_sources[0]
+            .connector_config
+            .as_object()
+            .unwrap();
         assert_eq!(cfg1.get("password").and_then(|v| v.as_str()), Some("***"));
 
         // 第二次导入（不带 overwrite）：skip，DB 不变
-        let r2 = store.import(&ImportRequest {
-            payload: payload.clone(),
-            overwrite_object_types: vec![],
-            overwrite_data_sources: vec![],
-        }).unwrap();
+        let r2 = store
+            .import(&ImportRequest {
+                payload: payload.clone(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         assert_eq!(r2.data_sources[0].status, "skipped");
         let exported2 = store.export("SupplyChain").unwrap();
         assert_eq!(
-            exported2.data_sources[0].connector_config.as_object().unwrap().get("password").and_then(|v| v.as_str()),
+            exported2.data_sources[0]
+                .connector_config
+                .as_object()
+                .unwrap()
+                .get("password")
+                .and_then(|v| v.as_str()),
             Some("***"),
             "未見写时 password 应仍为脱敏值"
         );
 
         // 修改 payload：把脱敏 *** 换成真实密码
         let mut payload_real = payload.clone();
-        let ds = payload_real.data_sources.iter_mut().find(|d| d.api_name == "erp_postgres").unwrap();
+        let ds = payload_real
+            .data_sources
+            .iter_mut()
+            .find(|d| d.api_name == "erp_postgres")
+            .unwrap();
         ds.connector_config = serde_json::json!({
             "host": "gaia-postgres",
             "port": 5432,
@@ -2951,11 +4078,14 @@ mod tests {
         ds.credential_id = Some("cred-abc".to_string());
 
         // 第三次导入（带 overwrite_data_sources）：overwritten，DB 真实密码落库
-        let r3 = store.import(&ImportRequest {
-            payload: payload_real,
-            overwrite_object_types: vec![],
-            overwrite_data_sources: vec!["erp_postgres".to_string()],
-        }).unwrap();
+        let r3 = store
+            .import(&ImportRequest {
+                payload: payload_real,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec!["erp_postgres".to_string()],
+            evidence_mode: String::new(),
+            })
+            .unwrap();
         assert_eq!(r3.data_sources[0].status, "overwritten");
         assert!(r3.errors.is_empty());
 
@@ -2966,8 +4096,14 @@ mod tests {
         assert_eq!(ds3.display_name, "ERP 数据库（已配置）");
         assert_eq!(ds3.credential_id, Some("cred-abc".to_string()));
         let cfg3 = ds3.connector_config.as_object().unwrap();
-        assert_eq!(cfg3.get("password").and_then(|v| v.as_str()), Some("real-secret-123"));
-        assert_eq!(cfg3.get("host").and_then(|v| v.as_str()), Some("gaia-postgres"));
+        assert_eq!(
+            cfg3.get("password").and_then(|v| v.as_str()),
+            Some("real-secret-123")
+        );
+        assert_eq!(
+            cfg3.get("host").and_then(|v| v.as_str()),
+            Some("gaia-postgres")
+        );
         assert_eq!(cfg3.get("port").and_then(|v| v.as_i64()), Some(5432));
     }
 
@@ -2986,27 +4122,36 @@ mod tests {
             confidence: None,
         });
         // 先入库
-        store.import(&ImportRequest {
-            payload: payload.clone(),
-            overwrite_object_types: vec![],
-            overwrite_data_sources: vec![],
-        }).unwrap();
+        store
+            .import(&ImportRequest {
+                payload: payload.clone(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
 
         // 不带 overwrite 预演：skip
-        let p1 = store.preview_import(&ImportRequest {
-            payload: payload.clone(),
-            overwrite_object_types: vec![],
-            overwrite_data_sources: vec![],
-        }).unwrap();
+        let p1 = store
+            .preview_import(&ImportRequest {
+                payload: payload.clone(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         assert_eq!(p1.data_sources[0].status, "skip");
         assert!(p1.data_sources[0].reason.contains("同名已存在"));
 
         // 带 overwrite 预演：overwrite
-        let p2 = store.preview_import(&ImportRequest {
-            payload: payload.clone(),
-            overwrite_object_types: vec![],
-            overwrite_data_sources: vec!["erp_postgres".to_string()],
-        }).unwrap();
+        let p2 = store
+            .preview_import(&ImportRequest {
+                payload: payload.clone(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec!["erp_postgres".to_string()],
+            evidence_mode: String::new(),
+            })
+            .unwrap();
         assert_eq!(p2.data_sources[0].status, "overwrite");
         assert!(p2.data_sources[0].reason.is_empty());
     }
@@ -3049,22 +4194,32 @@ mod tests {
                     FOREIGN KEY (ontology_id) REFERENCES ontologies(id) ON DELETE CASCADE
                 );
                 "#,
-            ).unwrap();
+            )
+            .unwrap();
             // 确认旧表带 direction 列。
             let mut s = conn.prepare("PRAGMA table_info(link_types)").unwrap();
-            let cols: Vec<String> = s.query_map([], |r| r.get::<_, String>(1)).unwrap()
-                .filter_map(Result::ok).collect();
-            assert!(cols.iter().any(|c| c == "direction"), "旧表应有 direction 列");
+            let cols: Vec<String> = s
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect();
+            assert!(
+                cols.iter().any(|c| c == "direction"),
+                "旧表应有 direction 列"
+            );
         }
         // 2. 用修复后的 OntologyStore::open 打开旧库（触发 init_schema 迁移）。
         let store = OntologyStore::open(&tmp).unwrap();
         // 3. import 含 link 的 payload（linked_payload = 2 OT + 1 link）。
         let payload = linked_payload();
-        let result = store.import(&ImportRequest {
-            payload,
-            overwrite_object_types: vec![],
-            overwrite_data_sources: vec![],
-        }).unwrap();
+        let result = store
+            .import(&ImportRequest {
+                payload,
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
         // 4. link 应成功落库（修复前会因 direction NOT NULL 失败）。
         assert_eq!(result.links_created, 1, "link 应成功落库");
         assert!(result.errors.is_empty(), "不应有错误: {:?}", result.errors);
@@ -3072,23 +4227,38 @@ mod tests {
         {
             let conn = store.conn.lock().unwrap();
             let mut s = conn.prepare("PRAGMA table_info(link_types)").unwrap();
-            let cols: Vec<String> = s.query_map([], |r| r.get::<_, String>(1)).unwrap()
-                .filter_map(Result::ok).collect();
-            assert!(!cols.iter().any(|c| c == "direction"), "迁移后不应有 direction 列");
+            let cols: Vec<String> = s
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect();
+            assert!(
+                !cols.iter().any(|c| c == "direction"),
+                "迁移后不应有 direction 列"
+            );
         }
         // 6. 二次 open 幂等（direction 已无，迁移为 no-op，import 仍正常）。
         drop(store);
         let store2 = OntologyStore::open(&tmp).unwrap();
-        let result2 = store2.import(&ImportRequest {
-            payload: linked_payload(),
-            overwrite_object_types: vec![],
-            overwrite_data_sources: vec![],
-        }).unwrap();
-        assert_eq!(result2.links_created, 0, "二次导入同名 link 应 skip（不报错）");
-        assert!(result2.errors.is_empty(), "二次导入不应有错误: {:?}", result2.errors);
+        let result2 = store2
+            .import(&ImportRequest {
+                payload: linked_payload(),
+                overwrite_object_types: vec![],
+                overwrite_data_sources: vec![],
+                evidence_mode: String::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            result2.links_created, 0,
+            "二次导入同名 link 应 skip（不报错）"
+        );
+        assert!(
+            result2.errors.is_empty(),
+            "二次导入不应有错误: {:?}",
+            result2.errors
+        );
         let _ = std::fs::remove_file(&tmp);
     }
-
 }
 
 #[cfg(test)]
@@ -3104,10 +4274,7 @@ mod repro_real_db {
             eprintln!("skip: legacy db not found at {src}");
             return;
         }
-        let tmp = std::env::temp_dir().join(format!(
-            "onto_migrate_test_{}.db",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("onto_migrate_test_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         std::fs::copy(src, &tmp).unwrap();
         let store = OntologyStore::open(&tmp).expect("legacy db should migrate cleanly");
@@ -3181,17 +4348,15 @@ mod repro_real_db {
             )
             .unwrap();
         // DDL 里 api_name 所在行不应含 UNIQUE（列级）；表级 UNIQUE(ontology_api_name, api_name) 不算
-        let has_col_level_unique = ddl
-            .lines()
-            .map(|l| l.trim())
-            .any(|line| {
-                let up = line.to_uppercase();
-                !up.starts_with("UNIQUE(")
-                    && up.contains("API_NAME")
-                    && up.contains("UNIQUE")
-            });
-        assert!(!has_col_level_unique,
-            "迁移后 datasets DDL 不应含列级 api_name UNIQUE（正是用户 bug 根因）。实际 DDL:\n{}", ddl);
+        let has_col_level_unique = ddl.lines().map(|l| l.trim()).any(|line| {
+            let up = line.to_uppercase();
+            !up.starts_with("UNIQUE(") && up.contains("API_NAME") && up.contains("UNIQUE")
+        });
+        assert!(
+            !has_col_level_unique,
+            "迁移后 datasets DDL 不应含列级 api_name UNIQUE（正是用户 bug 根因）。实际 DDL:\n{}",
+            ddl
+        );
         drop(conn);
 
         // 构造新本体 payload，含同名 dataset dealership（与旧库遗留全局行同名）
@@ -3213,23 +4378,35 @@ mod repro_real_db {
             payload: p,
             overwrite_object_types: vec![],
             overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
         };
 
         // preview 应说该 dataset 是 create（联合唯一索引不冲突）
         let prev = store.preview_import(&req).unwrap();
-        let ds_item = prev.datasets.iter().find(|i| i.api_name == "dealership")
+        let ds_item = prev
+            .datasets
+            .iter()
+            .find(|i| i.api_name == "dealership")
             .expect("preview 应包含 dealership");
-        assert_eq!(ds_item.status, "create",
-            "preview 应判定 dealership 为新建（联合唯一索引下 (NewOnt, dealership) 不冲突）");
+        assert_eq!(
+            ds_item.status, "create",
+            "preview 应判定 dealership 为新建（联合唯一索引下 (NewOnt, dealership) 不冲突）"
+        );
 
         // 实际 import 必须成功——这正是用户 bug：旧代码这里会因残留单列 UNIQUE 失败
         let result = store.import(&req).expect(
             "迁移后导入新本体（含与旧库遗留全局行同名的 dataset）必须成功——
-            若失败说明旧的单列 api_name UNIQUE 约束未被表重建去掉");
-        let ds_created = result.datasets.iter().find(|i| i.api_name == "dealership")
+            若失败说明旧的单列 api_name UNIQUE 约束未被表重建去掉",
+        );
+        let ds_created = result
+            .datasets
+            .iter()
+            .find(|i| i.api_name == "dealership")
             .expect("import 结果应包含 dealership");
-        assert_eq!(ds_created.status, "created",
-            "dealership 应被成功创建，旧库遗留的全局行不阻硕新本体同名 dataset");
+        assert_eq!(
+            ds_created.status, "created",
+            "dealership 应被成功创建，旧库遗留的全局行不阻硕新本体同名 dataset"
+        );
 
         // 验证两行共存：旧的全局行 (空串, dealership) + 新本体 (NewOnt, dealership)
         let conn = store.conn.lock().unwrap();
@@ -3238,9 +4415,12 @@ mod repro_real_db {
                 "SELECT COUNT(*) FROM datasets WHERE api_name='dealership'",
                 [],
                 |r| r.get(0),
-            ).unwrap();
-        assert_eq!(n, 2,
-            "应有两个同名 dealership 行：旧全局行 + 新本体行，按本体隔离共存");
+            )
+            .unwrap();
+        assert_eq!(
+            n, 2,
+            "应有两个同名 dealership 行：旧全局行 + 新本体行，按本体隔离共存"
+        );
         drop(conn);
         let _ = std::fs::remove_file(&tmp);
     }
@@ -3257,10 +4437,7 @@ mod repro_real_db {
             eprintln!("skip: 真实 DB 不存在于 {src}");
             return;
         }
-        let tmp = std::env::temp_dir().join(format!(
-            "onto_real_verify_{}.db",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("onto_real_verify_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         std::fs::copy(src, &tmp).unwrap();
         let store = OntologyStore::open(&tmp).expect("真实库应迁移成功");
@@ -3278,8 +4455,11 @@ mod repro_real_db {
             let up = line.to_uppercase();
             !up.starts_with("UNIQUE(") && up.contains("API_NAME") && up.contains("UNIQUE")
         });
-        assert!(!has_col_unique,
-            "真实库迁移后不应残留列级 api_name UNIQUE。实际 DDL:\n{}", ddl);
+        assert!(
+            !has_col_unique,
+            "真实库迁移后不应残留列级 api_name UNIQUE。实际 DDL:\n{}",
+            ddl
+        );
         drop(conn);
 
         // 导入新本体 NewOnt，含同名 dataset dealership（与真实库遗留全局行同名）
@@ -3301,10 +4481,15 @@ mod repro_real_db {
             payload: p,
             overwrite_object_types: vec![],
             overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
         };
-        let result = store.import(&req).expect(
-            "真实库迁移后导入同名 dataset 的新本体必须成功——这正是用户报的 bug");
-        let ds = result.datasets.iter().find(|i| i.api_name == "dealership")
+        let result = store
+            .import(&req)
+            .expect("真实库迁移后导入同名 dataset 的新本体必须成功——这正是用户报的 bug");
+        let ds = result
+            .datasets
+            .iter()
+            .find(|i| i.api_name == "dealership")
             .expect("import 结果应含 dealership");
         assert_eq!(ds.status, "created");
         // 清理：删除测试创建的本体（级联清其 dataset）

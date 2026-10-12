@@ -63,7 +63,7 @@ metadata:
 9. **敏感属性在 description 标注**——敏感属性（证件号/手机号/金额等）在 `description` 文本里显式标注"【敏感】"。
 10. **置信度标记产出质量**——每个产出的实体标注 `confirmed`/`high`/`tentative`；`tentative` 项必须在产物的 `open_questions` 里列出待确认问题。
 11. **字段集以 schema 契约为真相源，禁自创字段**——每个实体的合法字段集以 [references/gaia-schema-contract.md](references/gaia-schema-contract.md) 字段表为准，**不得自创字段**（如 LinkType 的 `cross_domain`、Dataset 的 `description`、DataSource 的 `connection` 等）。Gaia pydantic 默认 `extra='ignore'` 会静默丢弃多余字段（不会 500），但导入脚本不预期这些字段，且违反「产物即契约」原则。如需标注额外元信息（如跨域标记、领域分类），写进实体的 `description` 文本，不要新增字段。
-12. **本体设计宪章（charter）是不变点，禁随意修改**——charter（business_scenario/business_essence/design_intent/invariants）记录业务本质说明，**不随实体增删改而变更**。冷启动首导后用 `set_ontology_charter` 落库一次；增量更新时**只读不写**（用 `describe_ontology` 读作约束基线），**只有用户明确要求调整不变点时才调 `set_ontology_charter` 修订**。常规增量更新调 `set_ontology_charter` 是违规——会让 AI 失去稳定的业务认知基线。
+12. **本体设计宪章（charter）是不变点，禁随意修改**——charter（business_scenario/business_essence）记录业务本质说明，**不随实体增删改而变更**。**宪章先行（决策 24）**：`import_ontology` 对库内不存在的 api_name 一律拒绝，本体创建必须由用户在「新建本体」向导完成宪章；AI 在对话中给出宪章要点草稿并指引用户完成向导。增量更新时**只读不写**（用 `describe_ontology` 读作约束基线），**只有用户明确要求调整不变点时**才让用户在「设计宪章」面板修订。AI 没有任何写宪章的工具（用户主权，决策 22/23）。
 
 ## 标准产出流程
 
@@ -71,6 +71,15 @@ metadata:
 材料输入 → 实体识别 → 命名规范化 → 关系/动作建模 → 数据源绑定 → 自检
          → preview_ontology_import（校验）→ import_ontology（落库）
 ```
+
+**证据环（决策 24 后续，操作顺序——先登记后建模）**：
+
+1. 素材到手后、组装 payload **之前**：把建模依据的素材调 `register_evidence_source`
+   登记为证据源，记下返回的 source_id。
+2. 组装 payload 时：每个 ObjectType / Property / Link 都在 evidence 字段里引用
+   source_id + 原句；quote **从源 content 里复制粘贴**，不要凭记忆默写。
+3. 确属抽象设计：先向用户说明并取得确认，evidence 的 source_id 写 `none`、
+   quote 写用户确认的理由。
 
 ### 工具链（agent 可调用的 DynamicTool）
 
@@ -81,7 +90,6 @@ metadata:
 | `export_ontology(ontology_api_name)` | 导出当前本体完整定义（write-view JSON） | 增量更新前拿当前快照 |
 | `preview_ontology_import(payload, overwrite_object_types?)` | dry-run 预演导入，返回 per-entity 预测 + 引用完整性 errors + warnings | **落库前必调**，errors 非空则先修正 |
 | `import_ontology(payload, overwrite_object_types?)` | 执行导入（DAG 顺序落库，best-effort 部分失败） | preview 无 errors 后调 |
-| `set_ontology_charter(ont, business_scenario, business_essence, design_intent, invariants)` | 写入/更新本体设计宪章（不变点） | **冷启动首导后调一次**；增量更新时**不调**（除非用户明确要求调整不变点） |
 
 **删除组（import 只能 upsert，删除实体/关系必须用这组）：**
 
@@ -95,9 +103,9 @@ metadata:
 
 删除工具全部幂等（不存在返回 deleted=false），落库后自动触发 ontology-changed 事件刷新前端。
 
-**冷启动**：先收集 charter（见下「本体设计宪章（不变点）」），再 `preview_ontology_import(payload)` → `import_ontology(payload)` → `set_ontology_charter(...)`。
+**冷启动**：先给出宪章两字段（业务场景/业务本质）要点草稿（见下「本体设计宪章（不变点）」），指引用户在「新建本体」向导完成宪章创建本体；本体建立后 `preview_ontology_import(payload)` → `import_ontology(payload)`（AI 无写宪章工具，宪章由用户落库）。
 
-**增量更新**：`export_ontology(ont)` → **先调 `describe_ontology(ont)` 读 charter 作为本次变更的约束基线** → 改 payload 里需要变更的实体 → 把要覆写的 OT 列入 `overwrite_object_types` → `preview_ontology_import` → `import_ontology`。未列入 overwrite 的同名 OT 默认 skip，保护已有成果。**增量更新不调 `set_ontology_charter`**（charter 是不变点，不随实体变更而变）。
+**增量更新**：`export_ontology(ont)` → **先调 `describe_ontology(ont)` 读 charter 作为本次变更的约束基线** → 改 payload 里需要变更的实体 → 把要覆写的 OT 列入 `overwrite_object_types` → `preview_ontology_import` → `import_ontology`。未列入 overwrite 的同名 OT 默认 skip，保护已有成果。**增量更新不触碰 charter**（charter 是不变点，不随实体变更而变；AI 无写宪章工具）。
 
 ## 本体设计宪章（不变点）
 
@@ -106,34 +114,32 @@ metadata:
 
 ### 为什么需要 charter
 
-本体是「够用且可扩展」的——围绕**业务意图目标**建最小必要本体，保留可扩展性。但「意图」本身如果不显式记录下来，增量更新几轮后就会漂移：AI 可能为了当前需求添加与初衷冲突的实体、或偏离业务本质。charter 把**业务意图、本质、设计取舍、业务约束**固化为不变点，让每一次增量更新都对照检查。
+本体是「够用且可扩展」的——围绕**业务意图目标**建最小必要本体，保留可扩展性。但「意图」本身如果不显式记录下来，增量更新几轮后就会漂移：AI 可能为了当前需求添加与初衷冲突的实体、或偏离业务本质。charter 把**业务意图与业务本质**固化为不变点，让每一次增量更新都对照检查。
 
-### 四字段语义
+### 字段语义
 
 | 字段 | 语义 | 示例 |
 | ------ | ------ | -------- |
 | `business_scenario` | 业务场景：服务于什么业务目标、谁用、解决什么问题 | 「供应链采购场景：采购员向供应商下达采购单并跟踪到货」 |
 | `business_essence` | 业务本质：核心业务对象/状态/关系/动态行为的一句话本质概括 | 「核心对象：供应商/零件/采购单；状态流转：草稿→已下单→已到货」 |
-| `design_intent` | 设计意图：为什么这样建模、够用且可扩展的取舍、可扩展方向 | 「先建供应商+零件+采购单三角，后续可扩展质检/物流；未建中间表因为暂无多对多」 |
-| `invariants` | 补充说明（自由文本）：不可违反的业务约束、边界条件等 | 「采购单金额必须 >0；供应商状态为活跃时才可下单；不可物理删除已下单采购单」 |
 
 ### 冷启动场景：先收集 charter，再详细建模
 
 **流程**：
 
-1. **从历史对话/材料中提取 charter 信息**——如果用户在对话里已描述过业务场景、业务对象、建模目标，应主动提取整理成四字段，**不要重复问用户已说过的内容**。
+1. **从历史对话/材料中提取 charter 信息**——如果用户在对话里已描述过业务场景、业务对象、建模目标，应主动提取整理成两字段（业务场景/业务本质），**不要重复问用户已说过的内容**。
 2. **信息不足时向用户确认**——如果历史对话/材料无法推断出 `business_scenario` 或 `business_essence`，向用户提问收集（「这个本体主要服务于什么业务？核心业务对象有哪些？」）。不要凭空臆测 charter。
-3. **charter 落库**——首导 `import_ontology(payload)` 成功后，调 `set_ontology_charter(...)` 把 charter 写入。后续增量更新不再调。
-4. **然后开始详细实体建模**——charter 是建模的北极星，实体识别/命名/关系建模都应对照 charter 的 `business_essence` 和 `invariants`。
+3. **charter 由用户落库**——宪章先行：用户在「新建本体」向导确认宪章后才存在本体；AI 全程只起草不写入。后续增量更新不触碰 charter。
+4. **然后开始详细实体建模**——charter 是建模的北极星，实体识别/命名/关系建模都应对照 charter 的 `business_essence`。
 
 ### 增量更新场景：读 charter 作约束，不修改它
 
 **流程**：
 
-1. **先调 `describe_ontology(ont)` 读取 charter**——拿到 `business_scenario`/`business_essence`/`design_intent`/`invariants`，作为本次变更的约束基线。
-2. **对照 `invariants` 自检本次变更**——新增/修改的实体是否违反业务约束？（如 charter 说「采购单金额必须 >0」，本次新增的属性不应允许负金额。）软约束：违反时在交付说明里提醒用户，不阻断落库。
-3. **不调 `set_ontology_charter`**——charter 是不变点，增量更新不触碰。
-4. **除非用户明确要求调整不变点**——只有当用户明说「更新业务场景说明」「调整设计意图」「补充业务约束」时，才调 `set_ontology_charter` 修订对应字段。
+1. **先调 `describe_ontology(ont)` 读取 charter**——拿到 `business_scenario`/`business_essence`，作为本次变更的约束基线。
+2. **对照 `business_essence` 自检本次变更**——新增/修改的实体是否与业务本质一致？（如 charter 说核心是「供应商/零件/采购单」，本次不应凭空引入无关实体。）软约束：偏离时在交付说明里提醒用户，不阻断落库。
+3. **不触碰 charter**——charter 是不变点，增量更新不触碰；AI 无写宪章工具。
+4. **除非用户明确要求调整不变点**——用户明说「更新业务场景说明」等时，指引用户在「设计宪章」面板修订对应字段。
 
 **删除实体/关系**：不需要走 export/import——直接调对应的 delete 工具。删 OT 前用 `describe_object_type` 看清连删范围（链接/动作），向用户确认后执行。
 
@@ -223,6 +229,15 @@ metadata:
 | `high` | 基于行业最佳实践 + 材料强推断，极大概率正确 |
 | `tentative` | 存在多种选择，需用户确认——必须进 `open_questions` |
 
+## 属性/实体的依据原则（不要让用户手工确认）
+
+**实体与属性的依据 = 输入文档，不是用户逐条确认**：
+
+1. 直接从材料抽取建模（confirmed/high 直接产出），**不要把候选属性清单抛给用户逐个勾选/确认**——那是把建模工作推回给用户
+2. 用户已提供材料时，缺材料信息才问；问题只限**业务决策类**（如「审批流是否需要多级」「金额是否含税」），且汇成一次提问，不挤牙膏
+3. 材料未覆盖、把握不足的属性标 `tentative` 进 `open_questions`，**照常建模不阻塞**——落库后用户可在 UI 改
+4. 迭代已有本体时同理：新属性必须能在材料/上下文中找到依据，**不凭空发明**，也不要求用户确认每一个
+
 ## 禁止清单（红线）
 
 1. ❌ 定义无业务含义的空实体、空属性、空关系
@@ -237,7 +252,7 @@ metadata:
 10. ❌ ObjectTypeGroup 命名暗示权限（如 `AdminGroup`/`SensitiveData`——权限靠 Project + Marking）
 11. ❌ 产物里塞真实凭据（必须用 `***` 占位）
 12. ❌ `tentative` 项不进 `open_questions` 就交付
-13. ❌ 常规增量更新调 `set_ontology_charter`（只有用户明确要求调整不变点时才允许）
+13. ❌ 让 AI 写宪章（宪章用户主权：AI 只起草，落库由用户在向导/面板完成）
 14. ❌ 冷启动不收集 charter 就开始详细建模（失去业务认知基线，后续增量更新必漂移）
 15. ❌ 改输出格式字段名大小写或自创字段
 

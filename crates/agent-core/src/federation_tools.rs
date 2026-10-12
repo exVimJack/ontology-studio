@@ -34,7 +34,7 @@ pub fn federation_tools(
 
 /// `list_data_sources()`：列出已注册数据源 + 每源表清单 + 连接状态。
 fn list_data_sources_tool(svc: Arc<FederationService>, allowed: Arc<std::collections::HashSet<String>>) -> DynamicTool {
-    DynamicTool::new(
+    crate::dynamic_tool(
         "list_data_sources",
         "列出所有已注册的数据源（数据库/CSV/Excel）。返回每个数据源的 name（即 catalog 名，\
          SQL 三段式寻址前缀，如 `mydb.public.users`）、类型、连接状态、表数量。\
@@ -45,7 +45,7 @@ fn list_data_sources_tool(svc: Arc<FederationService>, allowed: Arc<std::collect
             "properties": {},
             "additionalProperties": false,
         }),
-        move |_ctx, _args| {
+        move |_args| {
             let svc = svc.clone();
             let allowed = allowed.clone();
             Box::pin(async move {
@@ -87,7 +87,7 @@ fn list_data_sources_tool(svc: Arc<FederationService>, allowed: Arc<std::collect
 
 /// `describe_table(source_name, table_name)`：表结构 + 前 5 行样本。
 fn describe_table_tool(svc: Arc<FederationService>, allowed: Arc<std::collections::HashSet<String>>) -> DynamicTool {
-    DynamicTool::new(
+    crate::dynamic_tool(
         "describe_table",
         "查看某个数据源中某张表的结构（列名/类型/是否可空）+ 前 5 行样本数据。\
          先用 list_data_sources 拿到 source_name（catalog 名）和可用表名，\
@@ -108,7 +108,7 @@ fn describe_table_tool(svc: Arc<FederationService>, allowed: Arc<std::collection
             "required": ["source_name", "table_name"],
             "additionalProperties": false,
         }),
-        move |_ctx, args| {
+        move |args| {
             let svc = svc.clone();
             let allowed = allowed.clone();
             Box::pin(async move {
@@ -172,7 +172,7 @@ fn describe_table_tool(svc: Arc<FederationService>, allowed: Arc<std::collection
 
 /// `execute_sql(sql, limit?)`：执行只读 SELECT，返回 JSON 行集。
 fn execute_sql_tool(svc: Arc<FederationService>, allowed: Arc<std::collections::HashSet<String>>) -> DynamicTool {
-    DynamicTool::new(
+    crate::dynamic_tool(
         "execute_sql",
         "在已注册的数据源上执行只读 SQL 查询（SELECT / WITH，含跨源 JOIN）。\
          SQL 中表名用三段式 catalog 限定：`source_name.schema.table`（如 `mydb.public.users`），\
@@ -196,7 +196,7 @@ fn execute_sql_tool(svc: Arc<FederationService>, allowed: Arc<std::collections::
             "required": ["sql"],
             "additionalProperties": false,
         }),
-        move |_ctx, args| {
+        move |args| {
             let svc = svc.clone();
             let allowed = allowed.clone();
             Box::pin(async move {

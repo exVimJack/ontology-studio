@@ -40,9 +40,11 @@ fn store_with_min_ontology() -> Arc<OntologyStore> {
                 backing_mapping: None,
                 vector_config: None,
                 confidence: None,
+                evidence: Vec::new(),
             }],
             links: vec![],
             confidence: None,
+            evidence: Vec::new(),
         }],
         action_types: vec![],
         datasets: vec![],
@@ -54,6 +56,7 @@ fn store_with_min_ontology() -> Arc<OntologyStore> {
             payload,
             overwrite_object_types: vec![],
             overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
         })
         .unwrap();
     store
@@ -63,7 +66,7 @@ fn store_with_min_ontology() -> Arc<OntologyStore> {
 fn readonly_tools_constructs_exactly_five() {
     let store = store_with_min_ontology();
     let tools = ontology_readonly_tools(store);
-    let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+    let names: Vec<&str> = tools.iter().map(|t| t.name().as_str()).collect();
     assert_eq!(names.len(), 5, "readonly group must have exactly 5 tools");
     assert_eq!(names, vec![
         "describe_ontology",
@@ -78,13 +81,13 @@ fn readonly_tools_constructs_exactly_five() {
 fn modeling_tools_constructs_four() {
     let store = store_with_min_ontology();
     let tools = ontology_modeling_tools(store);
-    let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-    assert_eq!(names.len(), 4, "modeling group must have exactly 4 tools (export/preview/import + set_ontology_charter)");
+    let names: Vec<&str> = tools.iter().map(|t| t.name().as_str()).collect();
+    assert_eq!(names.len(), 4, "modeling group must have exactly 4 tools (export/register_evidence_source/preview/import)——set_ontology_charter 已按宪章用户主权移出 agent 工具");
     assert_eq!(names, vec![
         "export_ontology",
+        "register_evidence_source",
         "preview_ontology_import",
         "import_ontology",
-        "set_ontology_charter",
     ]);
 }
 
@@ -95,9 +98,9 @@ fn readonly_and_modeling_groups_disjoint() {
     let readonly_tools = ontology_readonly_tools(store.clone());
     let modeling_tools = ontology_modeling_tools(store);
     let readonly: std::collections::HashSet<&str> =
-        readonly_tools.iter().map(|t| t.name()).collect();
+        readonly_tools.iter().map(|t| t.name().as_str()).collect();
     let modeling: std::collections::HashSet<&str> =
-        modeling_tools.iter().map(|t| t.name()).collect();
+        modeling_tools.iter().map(|t| t.name().as_str()).collect();
     let overlap: Vec<_> = readonly.intersection(&modeling).collect();
     assert!(overlap.is_empty(), "readonly/modeling groups overlap: {overlap:?}");
 }

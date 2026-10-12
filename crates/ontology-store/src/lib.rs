@@ -7,15 +7,29 @@
 //!
 //! 设计原则：Rust 侧校验是真相源（naming.rs + data_type.rs），DB 约束做兜底。
 
+pub mod adversarial;
 pub mod data_type;
 pub mod error;
+pub mod evidence;
 pub mod naming;
 pub mod payload;
 pub mod schema;
 pub mod store;
 pub mod ttl;
+pub mod ttl_checks_l23;
+pub mod ttl_coverage;
+pub mod ttl_edit;
+pub mod validation;
 
 pub use error::{StoreError, StoreResult};
+pub use evidence::{Evidence, EvidenceRole, EvidenceSource};
 pub use payload::*;
 pub use store::OntologyStore;
-pub use ttl::{TtlChangelog, TtlCharter, TtlImportResult, TtlOntologySummary, TtlStore, TtlValidation};
+pub use ttl::{
+    TtlChangelog, TtlCharter, TtlImportResult, TtlOntologySummary, TtlStore, TtlValidation,
+};
+pub use ttl_edit::TtlPropertyEdit;
+pub use validation::{
+    AActionRecord, DisputeRecord, IssueSeverity, IssueStatus, PrincipleRef,
+    ValidationEvidenceRef, ValidationIssue, ValidationReview,
+};

@@ -21,7 +21,7 @@ rusqlite = { version = "0.39", features = ["bundled", "load_extension"] }
 # 先按标点/换行分句再逐句 jieba.cut，避免对大全文 DAG O(n²) 退化
 # （1.4M 字符 600s→1s）。替代 sqlite-jieba-tokenizer 0.6（其对整段 cut 致退化）。
 # jieba-rs 内嵌词典 dict.txt + idf.txt（~11MB），已确认接受。
-jieba-rs = "0.9"
+jieba-rs = "0.11"
 rusqlite-ext = "0.39"
 sqlite-chinese-stopword = "0.1"
 sqlite-english-stemmer = "0.1"

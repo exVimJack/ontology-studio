@@ -33,57 +33,122 @@
   --color-accent-fg: var(--accent-fg);
   --color-danger: var(--danger);
   --color-danger-fg: var(--danger-fg);
+  /* 语义色三变体（Gaia 方案）：供 text-success-text / bg-warning-bg 等工具类 */
+  --color-success: var(--success);
+  --color-success-text: var(--success);
+  --color-success-bg: var(--success-bg);
+  --color-success-border: var(--success-border);
+  --color-warning: var(--warning);
+  --color-warning-hover: var(--warning-hover);
+  --color-warning-text: var(--warning-text);
+  --color-warning-bg: var(--warning-bg);
+  --color-warning-border: var(--warning-border);
+  --color-danger-text: var(--danger);
+  --color-danger-bg: var(--danger-bg);
+  --color-danger-border: var(--danger-border);
 
   --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 10px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+  /* 阴影工具类映射（shadow-card / shadow-panel / shadow-modal） */
+  --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.06);
+  --shadow-panel: -8px 0 24px rgba(0, 0, 0, 0.18);
+  --shadow-modal: 0 20px 60px rgba(0, 0, 0, 0.4);
+  /* 字体栈（Gaia 同款）：Fira Sans 正文 + Fira Code 等宽；中文回退系统字体 */
+  --font-ui: 'Fira Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', Inter, system-ui, sans-serif;
+  --font-mono: 'Fira Code', 'SF Mono', 'JetBrains Mono', ui-monospace, 'Cascadia Code', Consolas, monospace;
+  /* 过渡节奏（Gaia 同款）：交互反馈 0.15s，视图切换 0.25s */
+  --transition-fast: 0.15s;
+  --transition-view: 0.25s;
 }
 
-/* 浅色（默认） */
+/* ── 主题 token（色调方案对齐 Gaia Design System：蓝调双主题）──
+   亮色：浅蓝底（#F8FAFC）+ 深蓝正文（#1E3A8A）+ 深蓝 primary（#1E40AF）+ 琥珀强调
+   暗色：深蓝黑底（Gaia 蓝调）+ 近白正文 + 亮蓝 primary（#3B82F6）
+   语义色 -text/-bg/-border 三变体：color-mix 派生，暗亮自动重算（Gaia 同款） */
+/* 浅色（默认，完全对齐 Gaia :root） */
 :root {
-  --bg: #ffffff;
-  --bg-elevated: #f9fafb;
-  --bg-hover: #f3f4f6;
-  --border: #e5e7eb;
-  --fg: #111827;
-  --fg-muted: #6b7280;
-  --fg-subtle: #9ca3af;
-  --accent: #2563eb;
-  --accent-fg: #ffffff;
-  --danger: #ef4444;
-  --danger-fg: #ffffff;
+  --bg: #F8FAFC;
+  --bg-elevated: #FFFFFF;
+  --bg-hover: #E9EEF6;
+  --border: #DBEAFE; /* Gaia 原值（blue-100）*/
+  /* 微信灰阶（决策：方案 A，2026-09 效果图确认）——品牌色 accent 不动 */
+  --fg: #1A1A1A; /* 微信主文字：近黑 */
+  --fg-muted: #595959; /* 次要文字：微信 #979797 实测偏淡，加深两档保对比 */
+  --fg-subtle: #8C8C8C; /* 弱文字：时间戳/标签，兼顾可读 */
+  --accent: #1E40AF;
+  --accent-fg: #FFFFFF;
+  /* Gaia 同款：accent 半透明底（选中态卡片/hover 衬底/focus 光环） */
+  --accent-bg: color-mix(in srgb, var(--accent) 8%, transparent);
+  --danger: #DC2626;
+  --danger-fg: #FFFFFF;
+  /* 琥珀强调（Gaia：数据高亮 / KPI 强调） */
+  --warning: #D97706;
+  --warning-hover: #B45309;
+  --warning-text: #92400E;
+  --success: #16A34A;
+  /* 语义色三变体（color-mix，暗亮自动重算） */
+  --success-text: var(--success);
+  --success-bg: color-mix(in srgb, var(--success) 12%, transparent);
+  --success-border: color-mix(in srgb, var(--success) 40%, transparent);
+  --warning-bg: color-mix(in srgb, var(--warning) 12%, transparent);
+  --warning-border: color-mix(in srgb, var(--warning) 40%, transparent);
+  --danger-text: var(--danger);
+  --danger-bg: color-mix(in srgb, var(--danger) 12%, transparent);
+  --danger-border: color-mix(in srgb, var(--danger) 40%, transparent);
 }
 
-/* 深色 */
+/* 深色：底色/边框/primary 用 Gaia 蓝调，正文用微信深色灰阶（#D5D5D5） */
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0f1115;
-    --bg-elevated: #171a21;
-    --bg-hover: #1f242d;
-    --border: #2a2f3a;
-    --fg: #e5e7eb;
-    --fg-muted: #9ca3af;
-    --fg-subtle: #6b7280;
-    --accent: #3b82f6;
-    --accent-fg: #ffffff;
-    --danger: #f87171;
-    --danger-fg: #1f1010;
+    --scrollbar-thumb: rgba(255, 255, 255, 0.22);
+    --scrollbar-thumb-hover: rgba(255, 255, 255, 0.38);
+    --scrollbar-track: rgba(255, 255, 255, 0.05);
+    --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.3);
+    --bg: #0B1220;
+    --bg-elevated: #0F172A;
+    --bg-hover: #1E293B;
+    --border: #1E293B; /* Gaia 原值 */
+    /* 微信深色灰阶 */
+    --fg: #D5D5D5;
+    --fg-muted: #9E9E9E;
+    --fg-subtle: #7A7A7A;
+    --accent: #3B82F6;
+    --accent-fg: #FFFFFF;
+    --accent-bg: color-mix(in srgb, var(--accent) 8%, transparent);
+    --danger: #DC2626;
+    --danger-fg: #FFFFFF;
+    --warning: #F59E0B;
+    --warning-hover: #D97706;
+    --warning-text: #FCD34D;
+    --success: #00A870;
   }
 }
 
 /* 用户显式深色（stores/ui-store 切换时给 html 加 .dark） */
 .dark {
-  --bg: #0f1115;
-  --bg-elevated: #171a21;
-  --bg-hover: #1f242d;
-  --border: #2a2f3a;
-  --fg: #e5e7eb;
-  --fg-muted: #9ca3af;
-  --fg-subtle: #6b7280;
-  --accent: #3b82f6;
-  --accent-fg: #ffffff;
-  --danger: #f87171;
-  --danger-fg: #1f1010;
+  --scrollbar-thumb: rgba(255, 255, 255, 0.22);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.38);
+  --scrollbar-track: rgba(255, 255, 255, 0.05);
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --bg: #0B1220;
+  --bg-elevated: #0F172A;
+  --bg-hover: #1E293B;
+  --border: #1E293B; /* Gaia 原值 */
+  /* 微信深色灰阶（.dark 显式切换，与 media 同值） */
+  --fg: #D5D5D5;
+  --fg-muted: #9E9E9E;
+  --fg-subtle: #7A7A7A;
+  --accent: #3B82F6;
+  --accent-fg: #FFFFFF;
+  --accent-bg: color-mix(in srgb, var(--accent) 8%, transparent);
+  --danger: #DC2626;
+  --danger-fg: #FFFFFF;
+  --warning: #F59E0B;
+  --warning-hover: #D97706;
+  --warning-text: #FCD34D;
+  --success: #00A870;
 }
 
 html, body, #root {
@@ -93,13 +158,16 @@ html, body, #root {
 /* ── shadcn/ui 兼容 token（供 @assistant-ui/react-streamdown 等期望 shadcn 变量的库） ──
    映射到我们的自定义 token，保持单一真实来源。
    注意：shadcn 的 --accent 是“hover 高亮色”，与我们的主色 --accent 语义不同；
-   streamdown 主要用 --primary/--background/--foreground/--border，不依赖 --accent。 */
+   streamdown 主要用 --primary/--background/--foreground/--border，不依赖 --accent。
+   ⚠️ 不要写 --border: var(--border)——自引用 = invalid at computed-value time，
+   会把 :root 级联值整个废掉，所有 border 工具类退化为 currentColor
+   （文字色深蓝），正是“边框全是深蓝”的根因。shadcn 期望的 --border
+   与我们的 --border 同名同义，无需映射，这里不声明即可。 */
 :root {
   --background: var(--bg);
   --foreground: var(--fg);
   --muted: var(--bg-elevated);
   --muted-foreground: var(--fg-muted);
-  --border: var(--border);
   --primary: var(--accent);
   --primary-foreground: var(--accent-fg);
   --destructive: var(--danger);
@@ -113,21 +181,64 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-family: var(--font-ui);
   font-size: 14px;
-  line-height: 1.5;
+  line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
 }
 
-/* 自定义滚动条（细，符合桌面应用审美） */
+/* 等宽场景（代码块/IRI/SPARQL）：markdown 代码块与手写 mono 类共用 */
+code, pre, .font-mono {
+  font-family: var(--font-mono);
+}
+
+/* ── 动效（Gaia 同款）────────────────────────────────── */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+/* 主区视图切换淡入（NavRail 切功能视图时不再生硬） */
+.fade-in {
+  animation: fade-in var(--transition-view) ease;
+}
+
+/* ── 交互细节：统一按钮/交互元素过渡 + focus ring ──
+   仅样式增强，不改变任何交互行为 */
+button, a, input, select, textarea {
+  transition: background-color var(--transition-fast),
+              border-color var(--transition-fast),
+              color var(--transition-fast),
+              opacity var(--transition-fast);
+}
+button:focus-visible, a:focus-visible, input:focus-visible,
+select:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+/* textarea 单独去掉蓝色高亮框（会话输入框/编辑框点击后不应出现蓝色矩形边框） */
+textarea:focus-visible {
+  outline: none;
+}
+
+/* 弹窗/浮层阴影增强（层级靠阴影区分，Gaia 同款 modal shadow）——
+   仅匹配现有 fixed 居中弹窗结构，不改交互 */
+.fixed.inset-0.z-50.flex.items-center.justify-center {
+  box-shadow: var(--shadow-modal);
+}
+
+/* 自定义滚动条（Gaia 同款：中性 thumb + 半透明 track 衬底，暗亮两套自动切） */
 *::-webkit-scrollbar { width: 8px; height: 8px; }
 *::-webkit-scrollbar-thumb {
-  background: var(--border);
+  background: var(--scrollbar-thumb, rgba(60, 70, 84, 0.42));
   border-radius: 4px;
 }
-*::-webkit-scrollbar-thumb:hover { background: var(--fg-subtle); }
-*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover, rgba(40, 48, 58, 0.62));
+}
+*::-webkit-scrollbar-track {
+  background: var(--scrollbar-track, rgba(60, 70, 84, 0.08));
+}
 
 /* 流式光标动画 */
 @keyframes cursor-blink {
@@ -139,4 +250,27 @@ body {
   margin-left: 1px;
   animation: cursor-blink 1s steps(1) infinite;
   color: var(--accent);
+}
+
+/* 图谱加载动画：双层圆环旋转（不依赖 tailwind animate-spin，保证任何构建下都动） */
+@keyframes graph-spin {
+  to { transform: rotate(360deg); }
+}
+.graph-spinner {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 3px solid rgba(148, 163, 184, 0.18);
+  border-top-color: #6366f1;
+  animation: graph-spin 0.9s linear infinite;
+}
+.graph-spinner::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 3px solid transparent;
+  border-right-color: rgba(59, 130, 246, 0.55);
+  animation: graph-spin 1.4s linear infinite reverse;
 }

@@ -21,6 +21,76 @@ const QK_PAYLOAD = (apiName: string) => ["ontology-payload", apiName] as const;
 const QK_CHANGELOG = (apiName: string) =>
   ["ontology-changelog", apiName] as const;
 const QK_CHARTER = (apiName: string) => ["ontology-charter", apiName] as const;
+const QK_ELEMENT_EVIDENCE = (apiName: string) =>
+  ["ontology-element-evidence", apiName] as const;
+
+/** 元素级证据行（docs/EVIDENCE-CHAIN.md L4，后端 element_evidence 表）。 */
+export interface ElementEvidenceRow {
+  element_type: string;
+  element_id: string;
+  source_id: string;
+  source_title: string;
+  source_kind: string;
+  quote: string;
+  role: "direct" | "inferred";
+  /** "exact" | "normalized" | ""（空 = 引用未通过校验：源缺失或 quote 不符） */
+  matched_by: string;
+  span: [number, number] | null;
+  created_at: number;
+}
+
+/** 证据三态（docs/EVIDENCE-CHAIN.md §6）：direct 🟢 / inferred 🟡 / ungrounded 🔴。 */
+export type EvidenceStatus = "direct" | "inferred" | "manual" | "ungrounded";
+
+/** 三态展示元数据（Palantir 与 W3C TTL 视图共用）。 */
+export const EVIDENCE_STATUS_META: Record<
+  EvidenceStatus,
+  { icon: string; label: string; title: string }
+> = {
+  direct: { icon: "🟢", label: "有据", title: "有出处引用（direct）" },
+  inferred: { icon: "🟡", label: "推断", title: "仅推断依据（inferred）" },
+  manual: {
+    icon: "⚪",
+    label: "手认",
+    title: "手工确认：用户显式声明该元素为人工设计，无需源引用",
+  },
+  ungrounded: {
+    icon: "🔴",
+    label: "无据",
+    title: "无出处引用或引用校验未通过（ungrounded）",
+  },
+};
+
+/** 由一组证据行判定三态（invalid 视为 ungrounded：🔴）。 */
+export function evidenceStatus(rows: ElementEvidenceRow[]): EvidenceStatus {
+  if (rows.length === 0) return "ungrounded";
+  if (rows.some((r) => r.matched_by === "")) return "ungrounded";
+  if (rows.every((r) => r.matched_by === "manual")) return "manual";
+  if (rows.every((r) => r.matched_by === "manual" || r.role === "inferred"))
+    return "inferred";
+  return "direct";
+}
+
+/** TTL（W3C）视图的证据状态判定：无证据行的元素视为 ⚪ 手工确认。
+ *  语义：用户亲手导入/编辑 TTL = 为定义背书（显式人工确认），非「未经输入佐证」；
+ *  🔴 仅保留给「有证据行但引用校验失败」（源被删/quote 失配，曾经有据现在失效）。 */
+export function evidenceStatusTtl(rows: ElementEvidenceRow[]): EvidenceStatus {
+  if (rows.length === 0) return "manual";
+  return evidenceStatus(rows);
+}
+
+/** 列出 Palantir 本体的元素级证据（详情面板三态展示）。 */
+export function useElementEvidence(apiName: string | null) {
+  return useQuery<ElementEvidenceRow[]>({
+    queryKey: QK_ELEMENT_EVIDENCE(apiName ?? ""),
+    queryFn: async () => {
+      const json = await ipc.listElementEvidence("palantir", apiName!);
+      return JSON.parse(json) as ElementEvidenceRow[];
+    },
+    enabled: !!apiName,
+  });
+}
+
 const QK_DATASETS = ["ontology-datasets"] as const;
 const QK_DATA_SOURCES = ["ontology-data-sources"] as const;
 
@@ -170,6 +240,28 @@ export function useOntologyCharter(apiName: string | null) {
 }
 
 /** 写入/更新本体设计宪章（只有用户明确要求调整时才调用）。 */
+/** 宪章先行（决策 24）：创建空本体 + 设计宪章（仅宪章向导调用）。 */
+export function useCreateOntologyWithCharter() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      apiName,
+      displayName,
+      description,
+      charter,
+    }: {
+      apiName: string;
+      displayName: string;
+      description: string;
+      charter: OntologyCharter;
+    }): Promise<null> =>
+      ipc.createOntologyWithCharter(apiName, displayName, description, charter),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: QK_LIST });
+    },
+  });
+}
+
 export function useSetOntologyCharter() {
   const qc = useQueryClient();
   return useMutation({

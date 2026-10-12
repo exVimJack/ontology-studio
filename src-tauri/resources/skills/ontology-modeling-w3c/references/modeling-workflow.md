@@ -180,26 +180,22 @@ W3C 路线的 charter 和 changelog 用**双轨制**记录：
 
 | 轨道 | 载体 | 工具 | 用途 |
 |---|---|---|---|
-| 结构化索引 | SQLite `ontology_ttl_charter` 表 | `set_ontology_ttl_charter` / `list_ontology_ttl` | 可查询、可 UI 展示 |
-| W3C 原生词汇 | .ttl 文本内 | 手写（validate→import） | 产物中立、可被任何 RDF 工具消费 |
+| 结构化索引 | SQLite `ontology_ttl_charter` 表 | 前端「设计宪章」面板（`get_ontology_ttl_charter` 只读） | 可查询、可 UI 展示 |
+| W3C 原生词汇 | .ttl 文本内 | 宪章向导创建骨架时写入 / 用户面板保存 | 产物中立、可被任何 RDF 工具消费 |
 
-**结构化索引**（工具落库）——四字段语义：
+**结构化索引**（用户在向导/面板落库，AI 无写宪章工具——宪章用户主权，决策 22/23/24）——**两字段**：
 - `business_scenario`：业务场景（服务于什么业务目标、谁用、解决什么问题）
 - `business_essence`：业务本质（核心业务对象/状态/关系/动态行为的一句话本质概括）
-- `design_intent`：设计意图（为什么这样建模、够用且可扩展的取舍、可扩展方向）
-- `invariants`：补充说明（自由文本，记录不可违反的业务约束、边界条件等）
 
-**W3C 原生词汇**（同步写进 .ttl，对应关系）：
+**W3C 原生词汇**（同步写进 .ttl，对应关系；旧文件里的 rdfs:comment/skos:scopeNote 为历史遗留，读取时忽略、不再产出）：
 ```turtle
 @prefix dcterms: <http://purl.org/dc/terms/> .
 @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
 
 <https://example.org/ontology/procurement#ProcurementOntology>
     a owl:Ontology ;
-    dcterms:title "采购本体"@zh ;              # ← business_scenario
-    skos:definition "覆盖采购订单/供应商/对账"@zh ; # ← business_essence
-    rdfs:comment "够用且可扩展，预留结算扩展点"@zh ;# ← design_intent
-    skos:scopeNote "供应商编号全局唯一"@zh ;        # ← invariants
+    dcterms:description "采购场景：采购员向供应商下单并跟踪到货"@zh ; # ← business_scenario
+    skos:definition "核心对象：采购单/供应商/零件；状态：草稿→已下单→已到货"@zh ; # ← business_essence
     owl:versionInfo "1.0.0" .
 ```
 
@@ -219,8 +215,9 @@ W3C 路线的 charter 和 changelog 用**双轨制**记录：
 ### 3. 闭环流程
 
 ```
-冷启动：import_ontology_ttl → set_ontology_ttl_charter（写宪章）
-                              → commit_ontology_ttl_change（记初始导入）
+冷启动：用户完成「新建本体」宪章向导（宪章先行，决策 24）
+        → import_ontology_ttl（AI 在已建立的本体上导入建模成果）
+        → commit_ontology_ttl_change（记初始导入）
 
 增量：export → 改 .ttl → validate → import(overwrite=true)
                               → commit_ontology_ttl_change（记本次变更）

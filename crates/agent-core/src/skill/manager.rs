@@ -358,7 +358,21 @@ impl SkillManager {
             folder_path: Some(folder),
             source_conv_id: None,     // 非会话上传来源
         };
-        let doc_id = self.memory.upsert_document(row)?;
+        // 幂等升级（历史 bug 修复）：doc_id 缓存是进程内的，过去每次启动都会把
+        // 全部 skill 文档 re-upsert（indexed_at=0），而每个资源各开一线程并发建索引，
+        // 无 busy_timeout 时大面积 SQLITE_BUSY 失败且无人重试 → 文档永久搜不到。
+        // 现改为：内容未变时直接复用现有记录（不 upsert、不重置索引状态）；
+        // 需要建/重建索引的文档收集后交给单个后台线程串行处理（消除并发写冲突）。
+        let body_path = format!("skill://{}", record.name);
+        let mut to_index: Vec<String> = Vec::new();
+        let doc_id = match self.memory.read_document_by_path(&body_path).ok().flatten() {
+            Some((id, _, _, text, _)) if text == body => id,
+            _ => {
+                let id = self.memory.upsert_document(row)?;
+                to_index.push(id.clone());
+                id
+            }
+        };
 
         // 资源入库：遍历 references/assets/scripts 三个规范子目录，
         // 扫描每个目录下的文本文件，逐个 upsert。
@@ -386,46 +400,36 @@ impl SkillManager {
                 let res_path = resource_doc_path(&record.name, *subdir, &filename);
                 // 资源放到 /Skills/<name>/<subdir>/ 下（如 /Skills/ontology-modeling/references/）
                 let res_folder = format!("/Skills/{}/{}", record.name, subdir.dir_name());
-                let res_row = memory::documents::DocumentRow {
-                    id: memory::new_document_id(),
-                    path: res_path.clone(),
-                    name: filename.clone(),
-                    // 三类资源统一用 skill-resource 标记（与 skill-md 区分，
-                    // 供 list_documents / 前端区分策略）。
-                    format: "skill-resource".to_string(),
-                    text: text.clone(),
-                    char_count: text.chars().count() as u32,
-                    created_at: memory::now_ms(),
-                    folder_path: Some(res_folder),
-                    source_conv_id: None,
-                };
-                match self.memory.upsert_document(res_row) {
-                    Ok(res_id) => {
-                        // 异步建 FTS5 索引（与 body 同路径）
-                        let mem = self.memory.clone();
-                        let db_path = self.memory.db_path().map(|p| p.to_path_buf());
-                        if db_path.is_some() {
-                            std::thread::spawn(move || {
-                                if let Err(e) = mem.index_document(&res_id) {
-                                    tracing::warn!(error = %e, "resource FTS5 index failed (non-blocking)");
-                                }
-                            });
-                        } else {
-                            let mem = self.memory.clone();
-                            if let Err(e) = mem.index_document(&res_id) {
-                                tracing::warn!(error = %e, "resource FTS5 index failed (in-memory)");
+                res_paths.push(res_path.clone());
+                match self.memory.read_document_by_path(&res_path).ok().flatten() {
+                    // 内容未变：跳过 upsert，保留已建索引
+                    Some((_, _, _, old_text, _)) if old_text == text => {}
+                    _ => {
+                        let res_row = memory::documents::DocumentRow {
+                            id: memory::new_document_id(),
+                            path: res_path.clone(),
+                            name: filename.clone(),
+                            // 三类资源统一用 skill-resource 标记（与 skill-md 区分，
+                            // 供 list_documents / 前端区分策略）。
+                            format: "skill-resource".to_string(),
+                            text: text.clone(),
+                            char_count: text.chars().count() as u32,
+                            created_at: memory::now_ms(),
+                            folder_path: Some(res_folder),
+                            source_conv_id: None,
+                        };
+                        match self.memory.upsert_document(res_row) {
+                            Ok(res_id) => to_index.push(res_id),
+                            Err(e) => {
+                                tracing::warn!(
+                                    skill = %record.name,
+                                    dir = subdir.dir_name(),
+                                    file = %filename,
+                                    error = %e,
+                                    "resource upsert failed, skipping"
+                                );
                             }
                         }
-                        res_paths.push(res_path);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            skill = %record.name,
-                            dir = subdir.dir_name(),
-                            file = %filename,
-                            error = %e,
-                            "resource upsert failed, skipping"
-                        );
                     }
                 }
             }
@@ -438,21 +442,23 @@ impl SkillManager {
             );
         }
 
-        // 异步建 body 的 FTS5 索引（不阻塞；内存库退化为同步）
-        let mem = self.memory.clone();
-        let id_clone = doc_id.clone();
-        let db_path = self.memory.db_path().map(|p| p.to_path_buf());
-        if db_path.is_some() {
-            // 文件库：后台索引
-            std::thread::spawn(move || {
-                if let Err(e) = mem.index_document(&id_clone) {
-                    tracing::warn!(error = %e, "skill FTS5 index failed (non-blocking)");
+        // 建/重建索引：单后台线程串行处理（文件库）；内存库同步（测试场景）。
+        if !to_index.is_empty() {
+            if self.memory.db_path().is_some() {
+                let mem = self.memory.clone();
+                std::thread::spawn(move || {
+                    for id in to_index {
+                        if let Err(e) = mem.index_document(&id) {
+                            tracing::warn!(error = %e, doc_id = %id, "skill FTS5 index failed");
+                        }
+                    }
+                });
+            } else {
+                for id in to_index {
+                    if let Err(e) = self.memory.index_document(&id) {
+                        tracing::warn!(error = %e, "skill FTS5 index failed (in-memory)");
+                    }
                 }
-            });
-        } else {
-            // 内存库：同步索引（测试场景可接受）
-            if let Err(e) = self.memory.index_document(&doc_id) {
-                tracing::warn!(error = %e, "skill FTS5 index failed (in-memory)");
             }
         }
 

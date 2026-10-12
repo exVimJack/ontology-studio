@@ -1,15 +1,20 @@
 use ontology_store::ttl::TtlStore;
-fn store() -> (TtlStore, String) {
+fn store() -> Option<(TtlStore, String)> {
     let s = TtlStore::open_in_memory().unwrap();
-    let ttl = std::fs::read_to_string("/Users/thinkpiggy/Downloads/DealerSalesOntology.ttl").unwrap();
+    // 样例文件是作者本机个人路径，不在其他环境存在——None = 跳过（非回归失败）
+    let Ok(ttl) = std::fs::read_to_string("/Users/thinkpiggy/Downloads/DealerSalesOntology.ttl")
+    else {
+        eprintln!("skip: DealerSalesOntology.ttl 不在本机（环境依赖样例）");
+        return None;
+    };
     s.import_ttl(&ttl, true).unwrap();
     let iri = s.list_ontologies().unwrap()[0].ontology_iri.clone();
-    (s, iri)
+    Some((s, iri))
 }
 
 #[test]
 fn all_panels_label_queries() {
-    let (s, iri) = store();
+    let Some((s, iri)) = store() else { return; };
 
     // ── HierarchyPanel：cls + sup + 各自 label（嵌套 OPTIONAL，方案 D）──
     let q = "SELECT ?cls ?sup ?clslabel ?suplabel WHERE { \
@@ -49,5 +54,9 @@ fn all_panels_label_queries() {
         ?cls rdfs:subClassOf ?sup . FILTER(isIRI(?sup)) FILTER(CONTAINS(STR(?cls), \"CustomerProfile\")) \
         OPTIONAL { ?sup rdfs:label ?suplabel . FILTER(LANGMATCHES(LANG(?suplabel), \"zh\")) } }";
     let r = s.query_sparql(&iri, q).unwrap();
-    println!("ClassDetail superQ: {} 行, {} bytes", r.matches("\"sup\"").count(), r.len());
+    println!(
+        "ClassDetail superQ: {} 行, {} bytes",
+        r.matches("\"sup\"").count(),
+        r.len()
+    );
 }

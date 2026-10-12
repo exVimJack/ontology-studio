@@ -4,9 +4,17 @@ import { invoke as __TAURI_INVOKE, Channel } from "@tauri-apps/api/core";
 
 /** Commands */
 export const commands = {
+	/**
+	 *  取消指定摄取任务（cooperative）。
+	 * 
+	 *  parser 在下一次循环边界检查到 cancel flag 后 break，返回 Cancelled。
+	 *  对底层库内部阻塞（如 lopdf::Document::load）无法立即中止——只在循环点生效。
+	 */
+	cancelIngest: (jobId: string) => typedError<boolean, AppError>(__TAURI_INVOKE("cancel_ingest", { jobId })),
 	createConversation: (input: CreateConversationInput_Deserialize) => typedError<ConversationRow, AppError>(__TAURI_INVOKE("create_conversation", { input })),
-	listConversations: () => typedError<ConversationSummary_Serialize[], AppError>(__TAURI_INVOKE("list_conversations")),
-	renameConversation: (id: string, title: string) => typedError<ConversationRow, AppError>(__TAURI_INVOKE("rename_conversation", { id, title })),
+	deleteConversation: (id: string) => typedError<null, AppError>(__TAURI_INVOKE("delete_conversation", { id })),
+	deleteMessage: (input: DeleteMessageInput) => typedError<null, AppError>(__TAURI_INVOKE("delete_message", { input })),
+	deleteMessageAndAfter: (input: DeleteMessageAndAfterInput) => typedError<number, AppError>(__TAURI_INVOKE("delete_message_and_after", { input })),
 	/**
 	 *  自动生成会话标题（LLM 概括首条用户消息）。
 	 * 
@@ -22,18 +30,150 @@ export const commands = {
 	 *  标题为空或仍为默认值时返回 Err，提示前端走兜底。
 	 */
 	generateConversationTitle: (id: string) => typedError<ConversationRow, AppError>(__TAURI_INVOKE("generate_conversation_title", { id })),
-	setConversationPinned: (input: SetPinnedInput) => typedError<null, AppError>(__TAURI_INVOKE("set_conversation_pinned", { input })),
-	deleteConversation: (id: string) => typedError<null, AppError>(__TAURI_INVOKE("delete_conversation", { id })),
+	listConversations: () => typedError<ConversationSummary_Serialize[], AppError>(__TAURI_INVOKE("list_conversations")),
 	listMessages: (conversationId: string, limit: number | null) => typedError<MessageRow_Serialize[], AppError>(__TAURI_INVOKE("list_messages", { conversationId, limit })),
-	deleteMessage: (input: DeleteMessageInput) => typedError<null, AppError>(__TAURI_INVOKE("delete_message", { input })),
-	setMessageStatus: (input: SetMessageStatusInput_Deserialize) => typedError<null, AppError>(__TAURI_INVOKE("set_message_status", { input })),
+	renameConversation: (id: string, title: string) => typedError<ConversationRow, AppError>(__TAURI_INVOKE("rename_conversation", { id, title })),
 	sendMessage: (input: SendMessageInput, onChunk: Channel<ChatStreamChunk_Deserialize>) => typedError<string, AppError>(__TAURI_INVOKE("send_message", { input, onChunk })),
+	setConversationPinned: (input: SetPinnedInput) => typedError<null, AppError>(__TAURI_INVOKE("set_conversation_pinned", { input })),
+	setMessageStatus: (input: SetMessageStatusInput_Deserialize) => typedError<null, AppError>(__TAURI_INVOKE("set_message_status", { input })),
 	/**
 	 *  中断指定 assistant 消息的流式生成。
 	 *  触发 send_message 注册的 oneshot cancel sender → 流循环 select! 退出 → 落库 Cancelled。
 	 */
 	cancelStream: (messageId: string) => typedError<null, AppError>(__TAURI_INVOKE("cancel_stream", { messageId })),
-	setProvider: (input: SetProviderInput_Deserialize) => typedError<ProviderConfig_Serialize, AppError>(__TAURI_INVOKE("set_provider", { input })),
+	/**
+	 *  摄取一批文件（batch 级并行）。
+	 * 
+	 *  流程（§14.2）：
+	 *  1. 为每个 path 生成 job_id，注册 cancel flag，发 Queued
+	 *  2. 用 `JoinSet` + 信号量限并发，每个文件 `spawn_blocking` 串行解析
+	 *  3. 各文件独立发 Parsing 进度（经节流桥接）→ Done/Error/Cancelled
+	 * 
+	 *  单文件内串行（保逐页进度 + 可取消），多文件并行（限并发数）。
+	 */
+	ingestFiles: (paths: string[], onProgress: Channel<IngestProgress>, conversationId: string | null, folderPath: string | null) => typedError<IngestResultItem[], AppError>(__TAURI_INVOKE("ingest_files", { paths, onProgress, conversationId, folderPath })),
+	/**  列出知识库全部入库文档（不含全文，`@` 菜单选择挂载用）。 */
+	listAllDocuments: () => typedError<DocumentSummaryDto[], AppError>(__TAURI_INVOKE("list_all_documents")),
+	/**
+	 *  挂载文档到会话（`@` 挂载持久化）。幂等。
+	 *  path 必须先经 ingest 摄取（documents 表已有该 path）。
+	 */
+	mountDocument: (conversationId: string, path: string) => typedError<boolean, AppError>(__TAURI_INVOKE("mount_document", { conversationId, path })),
+	/**  卸载会话下的某篇文档（不删 documents 全文）。 */
+	unmountDocument: (conversationId: string, path: string) => typedError<boolean, AppError>(__TAURI_INVOKE("unmount_document", { conversationId, path })),
+	/**  列出会话已挂载的文档（按挂载时间排序，不含全文）。 */
+	listMountedDocuments: (conversationId: string) => typedError<MountedDocDto[], AppError>(__TAURI_INVOKE("list_mounted_documents", { conversationId })),
+	/**  按 path 删除知识库文档（同时清 FTS5 索引 + 所有会话的挂载关联）。 */
+	deleteDocument: (path: string) => typedError<boolean, AppError>(__TAURI_INVOKE("delete_document", { path })),
+	/**  按 id 读取文档全文（可分页，预览用）。 */
+	readDocument: (id: string, offset: number | null, limit: number | null) => typedError<{
+	path: string,
+	name: string,
+	format: string,
+	text: string,
+	char_count: number,
+} | null, AppError>(__TAURI_INVOKE("read_document", { id, offset, limit })),
+	/**
+	 *  新建空文件夹（持久化到 folders 表）。
+	 *  path 如 "/曾国藩专题" 或 "/曾国藩专题/书信集"。自动推导 parent_path/name。
+	 *  已存在则忽略（幂等）。返回是否实际创建。
+	 */
+	createFolder: (path: string) => typedError<boolean, AppError>(__TAURI_INVOKE("create_folder", { path })),
+	/**
+	 *  列出文件夹树（后端已构建嵌套层级 + 排序，前端直接渲染）。
+	 * 
+	 *  替代旧版扁平 `list_folders` 返回 `Vec<String>` 的做法——
+	 *  树构建是领域逻辑，不应在前端解析 `/` 拆分。
+	 */
+	listFolders: () => typedError<FolderNodeDto[], AppError>(__TAURI_INVOKE("list_folders")),
+	/**
+	 *  列出指定文件夹下的直接子文件（Library 右栏展示）。
+	 *  folder = null 或 "/" 表示根目录散文件（folder_path IS NULL）。
+	 */
+	listDocumentsByFolder: (folder: string | null) => typedError<DocumentSummaryDto[], AppError>(__TAURI_INVOKE("list_documents_by_folder", { folder })),
+	/**  移动单个文件到目标文件夹。target_folder=null 表示根目录散文件。 */
+	moveDocument: (path: string, targetFolder: string | null) => typedError<boolean, AppError>(__TAURI_INVOKE("move_document", { path, targetFolder })),
+	/**
+	 *  重命名文件夹（递归处理子文件夹）。
+	 *  old_path 如 "/曾国藩专题", new_path 如 "/曾公研究"。
+	 */
+	renameFolder: (oldPath: string, newPath: string) => typedError<boolean, AppError>(__TAURI_INVOKE("rename_folder", { oldPath, newPath })),
+	/**
+	 *  删除文件夹及其下所有文件（含子文件夹递归）。
+	 *  每个文件走 delete_document_by_path（清 documents 行 + FTS5 索引 + conversation_documents 关联）。
+	 *  返回删除的文件数。
+	 */
+	deleteFolder: (folder: string) => typedError<number, AppError>(__TAURI_INVOKE("delete_folder", { folder })),
+	/**  读取会话激活集。 */
+	getActiveScope: (conversationId: string) => typedError<ActiveScopeDto, AppError>(__TAURI_INVOKE("get_active_scope", { conversationId })),
+	/**  设置会话激活集的文件夹部分。 */
+	setActiveFolders: (conversationId: string, folders: string[]) => typedError<null, AppError>(__TAURI_INVOKE("set_active_folders", { conversationId, folders })),
+	/**  设置会话激活集的数据源部分。 */
+	setActiveSources: (conversationId: string, sources: string[]) => typedError<null, AppError>(__TAURI_INVOKE("set_active_sources", { conversationId, sources })),
+	/**
+	 *  设置会话激活集的本体部分（@OntologyName 引用本体）。
+	 * 
+	 *  存 ontology api_name 列表。传入空 Vec 清空引用。
+	 *  会话模式挂 5 个只读 drill-in 工具，agent 按 api_name 钻取 schema（不注入全文）。
+	 */
+	setActiveOntologies: (conversationId: string, ontologies: string[]) => typedError<null, AppError>(__TAURI_INVOKE("set_active_ontologies", { conversationId, ontologies })),
+	/**  注册数据源（落 SQLite + 热注册到 SessionContext + 探测连接）。 */
+	registerDataSource: (config: DataSourceConfig_Deserialize) => typedError<DataSourceSummary_Serialize, AppError>(__TAURI_INVOKE("register_data_source", { config })),
+	/**  测试连接（临时注册探查后注销，不落库）。返回表结构快照。 */
+	testDataSource: (config: DataSourceConfig_Deserialize) => typedError<SchemaSnapshot_Serialize, AppError>(__TAURI_INVOKE("test_data_source", { config })),
+	/**
+	 *  注销数据源（删 SQLite 记录；SessionContext 内 catalog 随进程生命周期留存，
+	 *  重启不恢复——DF 54 无 deregister_catalog，见 catalog.rs）。
+	 */
+	deregisterDataSource: (id: string) => typedError<null, AppError>(__TAURI_INVOKE("deregister_data_source", { id })),
+	/**  列出所有已注册数据源（含连接状态/表数）。 */
+	listDataSources: () => typedError<DataSourceSummary_Serialize[], AppError>(__TAURI_INVOKE("list_data_sources")),
+	/**  取单个数据源配置（编辑用）。 */
+	getDataSource: (id: string) => typedError<{
+	id: string,
+	name: string,
+	connection: ConnectionConfig_Serialize,
+	/**  连接颜色标记（DBX 范式：红=生产/蓝=测试/绿=本地）。 */
+	color?: string | null,
+	/**  创建时间（unix ms）。 */
+	created_at: number,
+} | null, AppError>(__TAURI_INVOKE("get_data_source", { id })),
+	/**  浏览 catalog 下所有表结构（不含样本行，list_tables 工具）。 */
+	browseFederationSchema: (catalog: string) => typedError<SchemaSnapshot_Serialize, AppError>(__TAURI_INVOKE("browse_federation_schema", { catalog })),
+	/**  描述单表：列/类型/可空 + 前 5 行样本 + 行数估计（describe_table 工具）。 */
+	describeFederationTable: (catalog: string, table: string) => typedError<TableMeta_Serialize, AppError>(__TAURI_INVOKE("describe_federation_table", { catalog, table })),
+	/**  执行只读 SQL（三段式寻址 catalog.public.table）。自动追加 LIMIT，30s 超时。 */
+	executeFederationQuery: (sql: string, limit: number | null) => typedError<QueryResult_Serialize, AppError>(__TAURI_INVOKE("execute_federation_query", { sql, limit })),
+	/**  EXPLAIN：生成执行计划摘要（调试/审计，本身只读）。 */
+	explainFederationQuery: (sql: string) => typedError<string, AppError>(__TAURI_INVOKE("explain_federation_query", { sql })),
+	httpPostJson: (url: string, headers: { [key in string]: string }, body: string) => typedError<HttpPostResult, AppError>(__TAURI_INVOKE("http_post_json", { url, headers, body })),
+	/**  读取已持久化的 MCP server 配置（不含连接状态，启动恢复用）。 */
+	getMcpServers: () => typedError<McpServerConfig[], AppError>(__TAURI_INVOKE("get_mcp_servers")),
+	/**  列出当前 tool_handle 上注册的所有工具（已连接 MCP server 暴露的工具）。 */
+	listMcpTools: () => typedError<McpToolDef[], AppError>(__TAURI_INVOKE("list_mcp_tools")),
+	/**
+	 *  配置并连接 MCP server（整体替换）。
+	 * 
+	 *  传入完整 server 列表，命令：
+	 *    1. 持久化配置到 store
+	 *    2. drop 旧 McpManager（断开旧连接）
+	 *    3. 新建 McpManager 连接所有 server，工具注册到共享 tool_handle
+	 *    4. 把 tool_handle 注入 ChatService（若已配置）
+	 * 
+	 *  返回每个 server 的连接状态。单个失败不影响其他。
+	 */
+	setMcpServers: (servers: McpServerConfig[]) => typedError<McpServerStatus_Serialize[], AppError>(__TAURI_INVOKE("set_mcp_servers", { servers })),
+	/**
+	 *  当前上下文窗口（token），供 UI 展示会话用量百分比（「28k/128k tok」）。
+	 * 
+	 *  数据来源优先级：
+	 *  1. ChatService 实际使用的窗口（set_provider 时五层 fallback 解析的值，
+	 *     即压缩策略真正生效的预算基准）——最准。
+	 *  2. ChatService 未注入 memory（异常路径）→ 按 provider_config 同步解析
+	 *     （用户配置 → 内置表 → 保守默认）。
+	 *  3. 无 provider 配置 → None（前端不显示用量条）。
+	 */
+	getContextWindow: () => typedError<number | null, AppError>(__TAURI_INVOKE("get_context_window")),
 	getProvider: () => typedError<{
 	kind: ProviderKind,
 	/**  API Key（明文，一期；二期落 Rust 侧加密存储） */
@@ -91,134 +231,70 @@ export const commands = {
 	/**  深度思考配置。None 等同 Off。 */
 	reasoning?: ReasoningLevel | null,
 } | null, AppError>(__TAURI_INVOKE("get_provider")),
+	setProvider: (input: SetProviderInput_Deserialize) => typedError<ProviderConfig_Serialize, AppError>(__TAURI_INVOKE("set_provider", { input })),
+	/**  读取校验者 B 的独立 provider 配置。None = 未配置（兜底用建模者配置）。 */
+	getVerifierProvider: () => typedError<{
+	kind: ProviderKind,
+	/**  API Key（明文，一期；二期落 Rust 侧加密存储） */
+	api_key: string,
+	/**  自定义 base URL。None 则用 provider 默认（rig 内置各 provider 的 BASE_URL 常量）。 */
+	base_url?: string | null,
+	/**  模型名，如 "gpt-4o" / "claude-sonnet-4-5" / "deepseek-chat" / "gemini-2.5-pro" */
+	model: string,
+	/**  采样温度。知识工作台常需低温度（factual 输出）。None 用 provider 默认。 */
+	temperature?: number | null,
 	/**
-	 *  配置并连接 MCP server（整体替换）。
+	 *  最大输出 token 数。区别于 context_window（输入窗口）。
+	 *  None 时 Anthropic 用 provider 默认（4096）；OpenAI 不设（无上限）。
+	 */
+	max_tokens?: number,
+	/**  nucleus sampling。None 不设。走 additional_params 透传。 */
+	top_p?: number | null,
+	/**
+	 *  是否支持 `developer` role。false 时降级为 `system` message（Ollama/vLLM 等）。
+	 *  None 用 kind 默认（OpenAI 官方 true，兼容端点 false）。
+	 */
+	supports_developer_role?: boolean | null,
+	/**
+	 *  是否支持 `reasoning_effort` 参数。false 时 drop（兼容端点不认）。
+	 *  None 用 kind 默认。
+	 */
+	supports_reasoning_effort?: boolean | null,
+	/**  模型支持输入模态。默认 [Text]；多模态模型填 [Text, Image]。 */
+	input_types: InputType[],
+	/**
+	 *  模型上下文窗口（token 数）。可选，用户显式覆盖。
 	 * 
-	 *  传入完整 server 列表，命令：
-	 *    1. 持久化配置到 store
-	 *    2. drop 旧 McpManager（断开旧连接）
-	 *    3. 新建 McpManager 连接所有 server，工具注册到共享 tool_handle
-	 *    4. 把 tool_handle 注入 ChatService（若已配置）
+	 *  优先级最高（见 context_window::resolve_context_window）：
+	 *    用户配置 > 官方元数据探测（按 kind 分派）> 内置已知模型表 > 默认 100K
+	 *  None 时自动探测（OpenRouter/Anthropic/Gemini 读官方字段；
+	 *  DeepSeek 等无官方元数据的模型走内置表）。
+	 *  探测全程超时+错误保护，不影响对话主流程；真正的安全网是运行时
+	 *  usage + overflow 错误恢复（见 chat.rs / 决策 16）。
+	 */
+	context_window?: number,
+	/**
+	 *  系统人设（preamble）。可选，用户在设置页配置。
 	 * 
-	 *  返回每个 server 的连接状态。单个失败不影响其他。
+	 *  Skill 系统首次引入 preamble 机制（决策 20）：系统人设 + Skill Tier 1
+	 *  （<available_skills> 块）拼接为完整 preamble，注入 AgentBuilder::preamble。
+	 *  拼在系统人设后，不破坏 prefix cache（前缀不变，skill 段是后缀追加）。
+	 *  None 时仅用 skill 段（若无 skill 则无 preamble）。
 	 */
-	setMcpServers: (servers: McpServerConfig[]) => typedError<McpServerStatus_Serialize[], AppError>(__TAURI_INVOKE("set_mcp_servers", { servers })),
-	/**  读取已持久化的 MCP server 配置（不含连接状态，启动恢复用）。 */
-	getMcpServers: () => typedError<McpServerConfig[], AppError>(__TAURI_INVOKE("get_mcp_servers")),
-	/**  列出当前 tool_handle 上注册的所有工具（已连接 MCP server 暴露的工具）。 */
-	listMcpTools: () => typedError<McpToolDef[], AppError>(__TAURI_INVOKE("list_mcp_tools")),
+	preamble?: string | null,
 	/**
-	 *  摄取一批文件（batch 级并行）。
-	 * 
-	 *  流程（§14.2）：
-	 *  1. 为每个 path 生成 job_id，注册 cancel flag，发 Queued
-	 *  2. 用 `JoinSet` + 信号量限并发，每个文件 `spawn_blocking` 串行解析
-	 *  3. 各文件独立发 Parsing 进度（经节流桥接）→ Done/Error/Cancelled
-	 * 
-	 *  单文件内串行（保逐页进度 + 可取消），多文件并行（限并发数）。
+	 *  自定义 HTTP Header（代理、OpenRouter X-Title、Anthropic anthropic_betas 等）。
+	 *  键值对，构造 client 时合并进 `Client::builder().http_headers()`。
 	 */
-	ingestFiles: (paths: string[], onProgress: Channel<IngestProgress>, conversationId: string | null, folderPath: string | null) => typedError<IngestResultItem[], AppError>(__TAURI_INVOKE("ingest_files", { paths, onProgress, conversationId, folderPath })),
+	extra_headers?: { [key in string]: string } | null,
+	/**  深度思考配置。None 等同 Off。 */
+	reasoning?: ReasoningLevel | null,
+} | null, AppError>(__TAURI_INVOKE("get_verifier_provider")),
 	/**
-	 *  取消指定摄取任务（cooperative）。
-	 * 
-	 *  parser 在下一次循环边界检查到 cancel flag 后 break，返回 Cancelled。
-	 *  对底层库内部阻塞（如 lopdf::Document::load）无法立即中止——只在循环点生效。
+	 *  设置校验者 B 的独立 provider 配置（完整 SetProviderInput，与建模者表单同构）。
+	 *  保存后重建 B 的 ChatService（校验对抗 LLM 调用走 B 自己的连接）。
 	 */
-	cancelIngest: (jobId: string) => typedError<boolean, AppError>(__TAURI_INVOKE("cancel_ingest", { jobId })),
-	/**
-	 *  挂载文档到会话（`@` 挂载持久化）。幂等。
-	 *  path 必须先经 ingest 摄取（documents 表已有该 path）。
-	 */
-	mountDocument: (conversationId: string, path: string) => typedError<boolean, AppError>(__TAURI_INVOKE("mount_document", { conversationId, path })),
-	/**  卸载会话下的某篇文档（不删 documents 全文）。 */
-	unmountDocument: (conversationId: string, path: string) => typedError<boolean, AppError>(__TAURI_INVOKE("unmount_document", { conversationId, path })),
-	/**  列出会话已挂载的文档（按挂载时间排序，不含全文）。 */
-	listMountedDocuments: (conversationId: string) => typedError<MountedDocDto[], AppError>(__TAURI_INVOKE("list_mounted_documents", { conversationId })),
-	/**  列出知识库全部入库文档（不含全文，`@` 菜单选择挂载用）。 */
-	listAllDocuments: () => typedError<DocumentSummaryDto[], AppError>(__TAURI_INVOKE("list_all_documents")),
-	/**  按 path 删除知识库文档（同时清 FTS5 索引 + 所有会话的挂载关联）。 */
-	deleteDocument: (path: string) => typedError<boolean, AppError>(__TAURI_INVOKE("delete_document", { path })),
-	/**  按 id 读取文档全文（可分页，预览用）。 */
-	readDocument: (id: string, offset: number | null, limit: number | null) => typedError<{
-	path: string,
-	name: string,
-	format: string,
-	text: string,
-	char_count: number,
-} | null, AppError>(__TAURI_INVOKE("read_document", { id, offset, limit })),
-	/**  注册数据源（落 SQLite + 热注册到 SessionContext + 探测连接）。 */
-	registerDataSource: (config: DataSourceConfig_Deserialize) => typedError<DataSourceSummary_Serialize, AppError>(__TAURI_INVOKE("register_data_source", { config })),
-	/**  测试连接（临时注册探查后注销，不落库）。返回表结构快照。 */
-	testDataSource: (config: DataSourceConfig_Deserialize) => typedError<SchemaSnapshot_Serialize, AppError>(__TAURI_INVOKE("test_data_source", { config })),
-	/**
-	 *  注销数据源（删 SQLite 记录；SessionContext 内 catalog 随进程生命周期留存，
-	 *  重启不恢复——DF 54 无 deregister_catalog，见 catalog.rs）。
-	 */
-	deregisterDataSource: (id: string) => typedError<null, AppError>(__TAURI_INVOKE("deregister_data_source", { id })),
-	/**  列出所有已注册数据源（含连接状态/表数）。 */
-	listDataSources: () => typedError<DataSourceSummary_Serialize[], AppError>(__TAURI_INVOKE("list_data_sources")),
-	/**  取单个数据源配置（编辑用）。 */
-	getDataSource: (id: string) => typedError<{
-	id: string,
-	name: string,
-	connection: ConnectionConfig_Serialize,
-	/**  连接颜色标记（DBX 范式：红=生产/蓝=测试/绿=本地）。 */
-	color?: string | null,
-	/**  创建时间（unix ms）。 */
-	created_at: number,
-} | null, AppError>(__TAURI_INVOKE("get_data_source", { id })),
-	/**  浏览 catalog 下所有表结构（不含样本行，list_tables 工具）。 */
-	browseFederationSchema: (catalog: string) => typedError<SchemaSnapshot_Serialize, AppError>(__TAURI_INVOKE("browse_federation_schema", { catalog })),
-	/**  描述单表：列/类型/可空 + 前 5 行样本 + 行数估计（describe_table 工具）。 */
-	describeFederationTable: (catalog: string, table: string) => typedError<TableMeta_Serialize, AppError>(__TAURI_INVOKE("describe_federation_table", { catalog, table })),
-	/**  执行只读 SQL（三段式寻址 catalog.public.table）。自动追加 LIMIT，30s 超时。 */
-	executeFederationQuery: (sql: string, limit: number | null) => typedError<QueryResult_Serialize, AppError>(__TAURI_INVOKE("execute_federation_query", { sql, limit })),
-	/**  EXPLAIN：生成执行计划摘要（调试/审计，本身只读）。 */
-	explainFederationQuery: (sql: string) => typedError<string, AppError>(__TAURI_INVOKE("explain_federation_query", { sql })),
-	/**
-	 *  新建空文件夹（持久化到 folders 表）。
-	 *  path 如 "/曾国藩专题" 或 "/曾国藩专题/书信集"。自动推导 parent_path/name。
-	 *  已存在则忽略（幂等）。返回是否实际创建。
-	 */
-	createFolder: (path: string) => typedError<boolean, AppError>(__TAURI_INVOKE("create_folder", { path })),
-	/**
-	 *  列出文件夹树（后端已构建嵌套层级 + 排序，前端直接渲染）。
-	 * 
-	 *  替代旧版扁平 `list_folders` 返回 `Vec<String>` 的做法——
-	 *  树构建是领域逻辑，不应在前端解析 `/` 拆分。
-	 */
-	listFolders: () => typedError<FolderNodeDto[], AppError>(__TAURI_INVOKE("list_folders")),
-	/**
-	 *  列出指定文件夹下的直接子文件（Library 右栏展示）。
-	 *  folder = null 或 "/" 表示根目录散文件（folder_path IS NULL）。
-	 */
-	listDocumentsByFolder: (folder: string | null) => typedError<DocumentSummaryDto[], AppError>(__TAURI_INVOKE("list_documents_by_folder", { folder })),
-	/**  移动单个文件到目标文件夹。target_folder=null 表示根目录散文件。 */
-	moveDocument: (path: string, targetFolder: string | null) => typedError<boolean, AppError>(__TAURI_INVOKE("move_document", { path, targetFolder })),
-	/**
-	 *  重命名文件夹（递归处理子文件夹）。
-	 *  old_path 如 "/曾国藩专题", new_path 如 "/曾公研究"。
-	 */
-	renameFolder: (oldPath: string, newPath: string) => typedError<boolean, AppError>(__TAURI_INVOKE("rename_folder", { oldPath, newPath })),
-	/**
-	 *  删除文件夹及其下所有文件（含子文件夹递归）。
-	 *  每个文件走 delete_document_by_path（清 documents 行 + FTS5 索引 + conversation_documents 关联）。
-	 *  返回删除的文件数。
-	 */
-	deleteFolder: (folder: string) => typedError<number, AppError>(__TAURI_INVOKE("delete_folder", { folder })),
-	/**  读取会话激活集。 */
-	getActiveScope: (conversationId: string) => typedError<ActiveScopeDto, AppError>(__TAURI_INVOKE("get_active_scope", { conversationId })),
-	/**  设置会话激活集的文件夹部分。 */
-	setActiveFolders: (conversationId: string, folders: string[]) => typedError<null, AppError>(__TAURI_INVOKE("set_active_folders", { conversationId, folders })),
-	/**  设置会话激活集的数据源部分。 */
-	setActiveSources: (conversationId: string, sources: string[]) => typedError<null, AppError>(__TAURI_INVOKE("set_active_sources", { conversationId, sources })),
-	/**
-	 *  设置会话激活集的本体部分（@OntologyName 引用本体）。
-	 * 
-	 *  存 ontology api_name 列表。传入空 Vec 清空引用。
-	 *  会话模式挂 5 个只读 drill-in 工具，agent 按 api_name 钻取 schema（不注入全文）。
-	 */
-	setActiveOntologies: (conversationId: string, ontologies: string[]) => typedError<null, AppError>(__TAURI_INVOKE("set_active_ontologies", { conversationId, ontologies })),
+	setVerifierProvider: (input: SetProviderInput_Deserialize) => typedError<ProviderConfig_Serialize, AppError>(__TAURI_INVOKE("set_verifier_provider", { input })),
 	/**
 	 *  列出全部已发现的 skill，合并激活状态。
 	 * 
@@ -243,7 +319,6 @@ export const commands = {
 	setSkillConversationEnabled: (conversationId: string, skillName: string, source: SkillSource, enabled: boolean) => typedError<null, AppError>(__TAURI_INVOKE("set_skill_conversation_enabled", { conversationId, skillName, source, enabled })),
 	/**  设置全局 skill 禁用状态（层次 2）。 */
 	setSkillGloballyDisabled: (skillName: string, disabled: boolean) => typedError<null, AppError>(__TAURI_INVOKE("set_skill_globally_disabled", { skillName, disabled })),
-	deleteMessageAndAfter: (input: DeleteMessageAndAfterInput) => typedError<number, AppError>(__TAURI_INVOKE("delete_message_and_after", { input })),
 	/**  列出所有已存储本体（前端列表页用）。 */
 	listOntologies: () => typedError<OntologySummary[], AppError>(__TAURI_INVOKE("list_ontologies")),
 	/**
@@ -271,6 +346,13 @@ export const commands = {
 	 *  返回是否真的删除了（false=未找到该本体，幂等不报错）。
 	 */
 	deleteOntology: (ontologyApiName: string) => typedError<boolean, AppError>(__TAURI_INVOKE("delete_ontology", { ontologyApiName })),
+	/**
+	 *  列出本体的元素级证据（docs/EVIDENCE-CHAIN.md L4，前端三态展示）。
+	 * 
+	 *  `standard`："palantir"（ontology_api_name 为 Palantir api_name）
+	 *  或 "w3c"（ontology_iri 为本体 IRI）。返回 ElementEvidenceRow JSON 字符串。
+	 */
+	listElementEvidence: (standard: string, ontologyKey: string) => typedError<string, AppError>(__TAURI_INVOKE("list_element_evidence", { standard, ontologyKey })),
 	/**
 	 *  列出本体的变更历史（git commit log 式，revision 倒序）。
 	 *  返回结构化 `Vec<OntologyChangelog>`（created_at 已标 Number，无 BigInt 问题）。
@@ -303,12 +385,17 @@ export const commands = {
 	 *  `updated_by` 为 "agent" | "user"。写后不触发 ontology-changed（charter 不影响实体定义）。
 	 */
 	setOntologyCharter: (ontologyApiName: string, charter: OntologyCharter) => typedError<null, AppError>(__TAURI_INVOKE("set_ontology_charter", { ontologyApiName, charter })),
+	/**
+	 *  创建 Palantir 空本体 + 设计宪章（宪章先行，决策 24；仅宪章向导调用）。
+	 *  只建 ontologies 行（ObjectType 等后续增量补充），宪章行同步落库。
+	 */
+	createOntologyWithCharter: (apiName: string, displayName: string, description: string, charter: OntologyCharter) => typedError<null, AppError>(__TAURI_INVOKE("create_ontology_with_charter", { apiName, displayName, description, charter })),
 	/**  列出所有已存 W3C Turtle 本体（前端列表页用）。 */
 	listOntologyTtl: () => typedError<TtlOntologySummary[], AppError>(__TAURI_INVOKE("list_ontology_ttl")),
 	/**  导出指定本体 IRI 的 Turtle 文本。 */
 	exportOntologyTtl: (ontologyIri: string) => typedError<string, AppError>(__TAURI_INVOKE("export_ontology_ttl", { ontologyIri })),
 	/**  校验 Turtle（dry-run，不写库）。返回 TtlValidation（errors 非空则禁止 import）。 */
-	validateOntologyTtl: (ttlContent: string) => typedError<TtlValidation, AppError>(__TAURI_INVOKE("validate_ontology_ttl", { ttlContent })),
+	validateOntologyTtl: (ttlContent: string) => typedError<TtlValidation_Serialize, AppError>(__TAURI_INVOKE("validate_ontology_ttl", { ttlContent })),
 	/**  导入 Turtle 到存储（best-effort）。返回 TtlImportResult。 */
 	importOntologyTtl: (ttlContent: string, overwrite: boolean) => typedError<TtlImportResult, AppError>(__TAURI_INVOKE("import_ontology_ttl", { ttlContent, overwrite })),
 	/**  删除指定本体 IRI（幂等，级联清 charter/changelog）。 */
@@ -319,6 +406,12 @@ export const commands = {
 	getOntologyTtlCharter: (ontologyIri: string) => typedError<TtlCharter, AppError>(__TAURI_INVOKE("get_ontology_ttl_charter", { ontologyIri })),
 	/**  写入/更新 W3C 本体设计宪章（不变点）。只有用户明确要求调整时才调用。 */
 	setOntologyTtlCharter: (ontologyIri: string, charter: TtlCharter) => typedError<null, AppError>(__TAURI_INVOKE("set_ontology_ttl_charter", { ontologyIri, charter })),
+	/**
+	 *  创建 W3C 空骨架本体 + 设计宪章（宪章先行，决策 24；仅宪章向导调用）。
+	 *  骨架 TTL 含 owl:Ontology 头部 + 宪章四谓词（双载体一致），宪章行同步落库。
+	 *  agent 工具层无此路径：本体创建 = 用户确认宪章（import 闸门拒绝不存在的 IRI）。
+	 */
+	createOntologyTtlWithCharter: (ontologyIri: string, displayName: string, charter: TtlCharter) => typedError<null, AppError>(__TAURI_INVOKE("create_ontology_ttl_with_charter", { ontologyIri, displayName, charter })),
 	/**  列出 W3C 本体变更历史（revision 倒序）。 */
 	listOntologyTtlChangelog: (ontologyIri: string) => typedError<TtlChangelog_Serialize[], AppError>(__TAURI_INVOKE("list_ontology_ttl_changelog", { ontologyIri })),
 	/**
@@ -326,9 +419,177 @@ export const commands = {
 	 *  返回分配的 revision 序号。
 	 */
 	commitOntologyTtlChange: (ontologyIri: string, title: string, body: string, changeSummary: string, conversationId: string | null) => typedError<number, AppError>(__TAURI_INVOKE("commit_ontology_ttl_change", { ontologyIri, title, body, changeSummary, conversationId })),
+	/**
+	 *  列出本体全部属性（DatatypeProperty / ObjectProperty），散块已聚合。
+	 *  前端属性编辑 Tab 的数据源；TtlPropertyEdit 无 serde_json::Value 字段，
+	 *  无 BigInt 问题，直接结构化导出。
+	 */
+	listOntologyTtlProperties: (ontologyIri: string) => typedError<TtlPropertyEdit[], AppError>(__TAURI_INVOKE("list_ontology_ttl_properties", { ontologyIri })),
+	/**  列出本体全部类的 IRI（属性编辑表单 domain/range 下拉用）。 */
+	listOntologyTtlClassIris: (ontologyIri: string) => typedError<string[], AppError>(__TAURI_INVOKE("list_ontology_ttl_class_iris", { ontologyIri })),
+	/**  新增属性表单的默认 IRI 前缀（与既有属性 namespace 一致，导出形态统一）。 */
+	getOntologyTtlDefaultPropertyNs: (ontologyIri: string) => typedError<string, AppError>(__TAURI_INVOKE("get_ontology_ttl_default_property_ns", { ontologyIri })),
+	/**
+	 *  编辑既有属性（iri 为身份不可改，其余字段原位替换其主语块）。
+	 *  返回手术后的完整 TTL 文本（前端刷新 source 视图）。
+	 */
+	editOntologyTtlProperty: (ontologyIri: string, edit: TtlPropertyEdit) => typedError<string, AppError>(__TAURI_INVOKE("edit_ontology_ttl_property", { ontologyIri, edit })),
+	/**
+	 *  新增属性（按 edit 生成新主语块，追加在最后一个属性块之后）。
+	 *  返回手术后的完整 TTL 文本。
+	 */
+	addOntologyTtlProperty: (ontologyIri: string, edit: TtlPropertyEdit) => typedError<string, AppError>(__TAURI_INVOKE("add_ontology_ttl_property", { ontologyIri, edit })),
+	/**
+	 *  删除属性（移除其全部散块；被 owl:onProperty / subPropertyOf 引用时拒绝）。
+	 *  返回手术后的完整 TTL 文本。
+	 */
+	deleteOntologyTtlProperty: (ontologyIri: string, propertyIri: string) => typedError<string, AppError>(__TAURI_INVOKE("delete_ontology_ttl_property", { ontologyIri, propertyIri })),
+	/**
+	 *  A 对 warning 级 issue 发起答辩。两步裁决第 ① 步（counterEvidence 机械匹配）
+	 *  在此完成——匹配失败直接返回错误，不进入 argument 判定。
+	 */
+	disputeIssue: (issueId: string, argument: string, counterSourceId: string, counterQuote: string) => typedError<string, AppError>(__TAURI_INVOKE("dispute_issue", { issueId, argument, counterSourceId, counterQuote })),
+	/**
+	 *  裁决答辩（第 ② 步）。由 B 复核或人工调用——**不作为 A 的工具暴露**。
+	 *  verdict: "overruled"（撤销）| "accepted"（升级 error）；resolved_by: "verifier"|"human"。
+	 */
+	resolveDispute: (issueId: string, verdict: string, resolvedBy: string) => typedError<string, AppError>(__TAURI_INVOKE("resolve_dispute", { issueId, verdict, resolvedBy })),
+	/**
+	 *  答辩提交 + B 自动机器裁决（一步到位）。
+	 * 
+	 *  前端提交后即可离开页面：裁决在 Rust 侧完成并落库，切窗/切页不影响结果，
+	 *  回来后按 issue 状态回显（overruled/accepted 已闭环，uncertain 在仲裁队列）。
+	 */
+	disputeAndJudge: (issueId: string, argument: string, counterSourceId: string, counterQuote: string, modelB: string) => typedError<string, AppError>(__TAURI_INVOKE("dispute_and_judge", { issueId, argument, counterSourceId, counterQuote, modelB })),
+	/**
+	 *  B 自动裁决答辩（②b 机器裁决）：LLM 判定 overruled/accepted；uncertain 保持
+	 *  disputed（进入人工仲裁队列）。**resolved_by 记 verifier**——裁决权在 B。
+	 */
+	resolveDisputeLlm: (issueId: string, modelB: string) => typedError<string, AppError>(__TAURI_INVOKE("resolve_dispute_llm", { issueId, modelB })),
+	/**  查询本体的全部 issue（对抗状态展示 + 报告）。 */
+	listValidationIssues: (ontologyIri: string) => typedError<ValidationIssue_Serialize[], AppError>(__TAURI_INVOKE("list_validation_issues", { ontologyIri })),
+	/**  持久化一次 validate 的 issue 快照（前端校验完成后调用）。 */
+	persistValidationIssues: (ontologyIri: string, validationId: string, issues: ValidationIssue_Deserialize[]) => typedError<number, AppError>(__TAURI_INVOKE("persist_validation_issues", { ontologyIri, validationId, issues })),
+	/**  持久化 B 评审输出（L4.3 第 1 步产物，仲裁/审计回溯用）。 */
+	saveBReport: (reviewId: string, bReport: string) => typedError<ValidationReview, AppError>(__TAURI_INVOKE("save_b_report", { reviewId, bReport })),
+	/**  启动 L4.3 语义评审：创建 validation_reviews 行（round=1, in_progress）。 */
+	reviewOntology: (ontologyIri: string) => typedError<ValidationReview, AppError>(__TAURI_INVOKE("review_ontology", { ontologyIri })),
+	/**  A 提交修订（第 2 步）：存修订全文 + 修订说明（a_reasoning 对 B 复核不可见）。 */
+	aRevise: (reviewId: string, aRevision: string, aReasoning: string) => typedError<ValidationReview, AppError>(__TAURI_INVOKE("a_revise", { reviewId, aRevision, aReasoning })),
+	/**
+	 *  B 复核（第 3 步）：confirm=true → resolved；false → escalated（转人工仲裁）。
+	 *  （前端「跳过评审」入口——无 LLM 复核输出，b_verdict 落空串。）
+	 */
+	bRecheck: (reviewId: string, confirm: boolean) => typedError<ValidationReview, AppError>(__TAURI_INVOKE("b_recheck", { reviewId, confirm })),
+	/**  转人工仲裁（超限/分歧）。 */
+	escalateReview: (reviewId: string) => typedError<ValidationReview, AppError>(__TAURI_INVOKE("escalate_review", { reviewId })),
+	/**  查询本体的最新 review（可为 None）。 */
+	latestValidationReview: (ontologyIri: string) => typedError<{
+	/**  评审任务 ID（同一次对抗校验分组） */
+	id: string,
+	/**  归属本体 IRI */
+	ontology_iri: string,
+	/**  当前轮次（1=初始评审，2=A修订，3=B复核） */
+	round: number,
+	/**  复核轮数封顶 */
+	max_rounds: number,
+	/**  B 的评审输出（结构化建议 JSON） */
+	b_report: string,
+	/**  A 修订后的 Turtle V2 全文 */
+	a_revision: string,
+	/**  A 的修订说明（B 复核时不可见） */
+	a_reasoning: string,
+	/**
+	 *  B 复核原始输出 JSON（verdict + remaining_issues；此前不落库，仲裁时
+	 *  无从得知 B 复核到底提了哪些残留问题——v0.7 补）
+	 */
+	b_verdict?: string,
+	/**
+	 *  各环节耗时（unix ms；b_review/a_revise/b_recheck 完成时刻的耗时快照，
+	 *  0=未完成）——此前不落库，切页回来"上次会话"环节无耗时可显示
+	 */
+	step_ms?: ReviewStepMs,
+	/**  "in_progress" | "resolved" | "escalated" */
+	status: string,
+	/**  unix ms */
+	created_at: number,
+	/**  unix ms */
+	updated_at: number,
+} | null, AppError>(__TAURI_INVOKE("latest_validation_review", { ontologyIri })),
+	/**
+	 *  运行 29 句话覆盖矩阵（全量或增量 diff）。
+	 *  `diff_entities`: 增量模式传 change_summary 的实体列表；空 = 全量。
+	 */
+	coverageMatrix: (ontologyIri: string, diffEntities: string[]) => typedError<CoverageMatrix_Serialize, AppError>(__TAURI_INVOKE("coverage_matrix", { ontologyIri, diffEntities })),
+	/**  判定 A/B 模型独立性档位（前端设置页实时显示）。 */
+	independenceTier: (providerA: string, modelA: string, providerB: string, modelB: string) => typedError<string, AppError>(__TAURI_INVOKE("independence_tier", { providerA, modelA, providerB, modelB })),
+	/**
+	 *  一次性触发完整语义评审循环（后端驱动，前端零环节链）。
+	 * 
+	 *  设计动机（v0.4.2 架构修正）：此前评审流程在前端 ReviewPanel 的 async 链里
+	 *  逐步驱动——切页面组件卸载后 setState 失效、恢复逻辑误判「上次会话中断」，
+	 *  且用户点重新评审会重复跑已完成环节。改为**后端 tokio 任务**：
+	 *    startReview → B评审(run_b_review) → save_b_report → A修订(run_a_revise)
+	 *    → a_revise → B复核(run_b_recheck) → b_recheck
+	 *  每步落库，任务不随前端组件生命周期中断；前端只需触发一次，然后
+	 *  轮询 latest_validation_review 展示进度（b_report/a_revision/status
+	 *  已持久化，任何时刻重挂载都能恢复真实状态）。
+	 * 
+	 *  返回 review id（前端轮询用）。若已有 in_progress review（残留/进行中），
+	 *  复用该行继续（不重复 startReview）；review_ontology 的残留重置防护
+	 *  只对非 in_progress 生效，这里显式处理。
+	 */
+	runReviewLoop: (ontologyIri: string, ttlContent: string, charterSummary: string, issuesJson: string) => typedError<string, AppError>(__TAURI_INVOKE("run_review_loop", { ontologyIri, ttlContent, charterSummary, issuesJson })),
+	/**
+	 *  A 自动答辩（§2.1.5 完整对抗语义——答辩的发起方是 A 建模者，不是人）：
+	 * 
+	 *  对本体全部 rules 来源 open warning，后端一次跑完
+	 *  「A 构造论据+反证 → dispute_issue（机械匹配把关）→ resolve_dispute_llm
+	 *  （B 裁决三态）」。人只在阶段③ 仲裁 B 判不定的残留项。
+	 * 
+	 *  - A 无证据反驳的 warning → accept（留给纠错/人工修订，不走裁决）
+	 *  - A 摘录的 quote 没过机械匹配 → 该条维持 open（outcome=rejected_match）
+	 *    ——不降级 A 的答辩资格，也不放水匹配，如实呈现
+	 */
+	runAutoDispute: (ontologyIri: string) => typedError<AutoDisputeItem[], AppError>(__TAURI_INVOKE("run_auto_dispute", { ontologyIri })),
+	/**  读取缓存的自动答辩状态（切页/切窗回来回显用，含 running 标志）。 */
+	getAutoDisputeResult: (ontologyIri: string) => typedError<AutoDisputeState, AppError>(__TAURI_INVOKE("get_auto_dispute_result", { ontologyIri })),
+	/**
+	 *  仲裁完成后交 A 修订落盘（后端 spawn，立即返回；前端轮询 get_post_arbitration_state）。
+	 *  已裁决 issue（accepted 必须改、overruled 不用改）作为 B 建议喂 A，A 修订后
+	 *  import_ttl overwrite 落盘。
+	 */
+	runPostArbitrationRevise: (ontologyIri: string) => typedError<null, AppError>(__TAURI_INVOKE("run_post_arbitration_revise", { ontologyIri })),
+	/**  读取仲裁后 A 修订状态（切窗回来回显 + 显示耗时）。 */
+	getPostArbitrationState: (ontologyIri: string) => typedError<PostArbitrationState, AppError>(__TAURI_INVOKE("get_post_arbitration_state", { ontologyIri })),
+	/**
+	 *  运行 B 语义评审（LLM）。需要已配置的 ChatService。
+	 *  `inputs` 由前端/编排层构造（charter + 29句话 + Turtle + 报告 + evidence 上下文）。
+	 */
+	runBReviewLlm: (modelB: string, inputs: string) => typedError<BReviewOutput_Serialize, AppError>(__TAURI_INVOKE("run_b_review_llm", { modelB, inputs })),
+	/**  运行 A 修订（LLM）。返回命名结构（修订后 Turtle, 修订说明）。 */
+	runAReviseLlm: (modelA: string, ttlV1: string, bSuggestions: string) => typedError<AReviseResult, AppError>(__TAURI_INVOKE("run_a_revise_llm", { modelA, ttlV1, bSuggestions })),
+	/**  运行 B 复核（LLM）。只传修订后 Turtle（a_revision），不传修订说明。 */
+	runBRecheckLlm: (modelB: string, aRevision: string) => typedError<string, AppError>(__TAURI_INVOKE("run_b_recheck_llm", { modelB, aRevision })),
 };
 
 /* Types */
+/**  A 对 review 来源 issue 的逐条回应（统一发现池 v0.7）。 */
+export type AActionRecord = {
+	/**  "accepted" | "rejected" */
+	action: string,
+	/**  A 的理由（rejected 时 = 拒绝依据；B 复核不可见） */
+	reason: string,
+};
+
+/**  A 修订结果（命名结构，避免 specta 导出匿名 tuple）。 */
+export type AReviseResult = {
+	/**  修订后的 Turtle 全文 */
+	revised_ttl: string,
+	/**  修订说明 JSON（A 的接受/拒绝理由，对 B 复核不可见） */
+	reasoning: string,
+};
+
 /**  会话激活集快照（供前端 chip 展示 + 工具过滤）。 */
 export type ActiveScopeDto = {
 	/**  激活的文件夹路径（含子目录递归）。 */
@@ -344,6 +605,55 @@ export type ActiveScopeDto = {
 export type AppError = { kind: "Ingest"; message: string } | { kind: "Agent"; message: string } | { kind: "Memory"; message: string } | { kind: "Provider"; message: string } | { kind: "Federation"; message: string } | { kind: "Ontology"; message: string } | { kind: "Skill"; message: string } | { kind: "SkillScanTimeout"; message: string } | 
 /**  用户主动中断（§15 状态机 Cancelled）——前端静默处理 */
 { kind: "Cancelled" };
+
+/**  A 自动答辩的批量结果（run_auto_dispute 逐条汇总，前端进度展示）。 */
+export type AutoDisputeItem = {
+	/**  目标 warning 的 issue id */
+	issue_id: string,
+	/**
+	 *  "overruled"（B 撤销）| "accepted"（B 驳回升级 error）| "uncertain"
+	 *  （B 判不定进仲裁）| "accept"（A 接受不辩）| "rejected_match"（A 摘录
+	 *  未过机械匹配，维持 open）| "error"（该条处理失败）
+	 */
+	outcome: string,
+	/**  一句话说明（B 的 reason / 失败原因） */
+	detail?: string,
+};
+
+/**
+ *  最近一次 run_auto_dispute 的状态缓存（按本体 IRI）——切页/切窗回来回显，
+ *  不依赖前端组件存活。running=true 表示后端任务进行中（切窗不丢状态）。
+ *  应用重启即清（issue 状态本身已落库）。
+ */
+export type AutoDisputeState = {
+	/**  后端任务是否进行中（切窗回来据此恢复"进行中"展示，不依赖前端 mutation 状态） */
+	running: boolean,
+	/**  逐条结果（进行中已完成的条目 / 全部完成后的完整结果） */
+	items?: AutoDisputeItem[],
+};
+
+/**  B 评审输出（结构化建议清单，B prompt 规格 §4.3）。 */
+export type BReviewOutput = BReviewOutput_Serialize | BReviewOutput_Deserialize;
+
+/**  B 评审输出（结构化建议清单，B prompt 规格 §4.3）。 */
+export type BReviewOutput_Deserialize = {
+	/**  建议清单（原始 JSON 字符串；前端展示/回喂） */
+	suggestions_json: string,
+	/**  是否成功生成 */
+	ok: boolean,
+	/**  错误信息（ok=false 时） */
+	error?: string | null,
+};
+
+/**  B 评审输出（结构化建议清单，B prompt 规格 §4.3）。 */
+export type BReviewOutput_Serialize = {
+	/**  建议清单（原始 JSON 字符串；前端展示/回喂） */
+	suggestions_json: string,
+	/**  是否成功生成 */
+	ok: boolean,
+	/**  错误信息（ok=false 时） */
+	error?: string | null,
+};
 
 /**
  *  流式 chunk（对齐 §13.2 StreamChunk，由 agent-core 的 StreamChunk 映射）。
@@ -435,6 +745,76 @@ export type ConversationSummary_Serialize = {
 	/**  消息条数 */
 	message_count: number,
 } & ConversationRow;
+
+/**  单条 29 句话条目及其产物形态检查描述。 */
+export type CoverageItem = CoverageItem_Serialize | CoverageItem_Deserialize;
+
+/**  单条 29 句话条目及其产物形态检查描述。 */
+export type CoverageItem_Deserialize = {
+	/**  句号，如 "1.1" */
+	sentence_id: string,
+	/**  标准描述（来自 29-sentences.md） */
+	description: string,
+	/**  语义类别（1..=7） */
+	category: number,
+	/**  对应 Turtle 产物形态（人类可读） */
+	product_shape: string,
+	/**  是否已落地（存在性检查结果） */
+	covered: boolean,
+	/**  命中产物示例（可空） */
+	example?: string | null,
+};
+
+/**  单条 29 句话条目及其产物形态检查描述。 */
+export type CoverageItem_Serialize = {
+	/**  句号，如 "1.1" */
+	sentence_id: string,
+	/**  标准描述（来自 29-sentences.md） */
+	description: string,
+	/**  语义类别（1..=7） */
+	category: number,
+	/**  对应 Turtle 产物形态（人类可读） */
+	product_shape: string,
+	/**  是否已落地（存在性检查结果） */
+	covered: boolean,
+	/**  命中产物示例（可空） */
+	example?: string | null,
+};
+
+/**  覆盖矩阵：29 句话条目 × 落地状态。 */
+export type CoverageMatrix = CoverageMatrix_Serialize | CoverageMatrix_Deserialize;
+
+/**  覆盖矩阵：29 句话条目 × 落地状态。 */
+export type CoverageMatrix_Deserialize = {
+	/**  全部条目（按句号排序） */
+	items: CoverageItem_Deserialize[],
+	/**  覆盖率（0.0 - 1.0） */
+	coverage: number | null,
+	/**  已覆盖数 */
+	covered_count: number,
+	/**  总数 */
+	total_count: number,
+	/**  增量模式：仅检查了变更实体时 true */
+	incremental?: boolean,
+	/**  增量 diff 实体列表（incremental=true 时非空） */
+	diff_entities?: string[],
+};
+
+/**  覆盖矩阵：29 句话条目 × 落地状态。 */
+export type CoverageMatrix_Serialize = {
+	/**  全部条目（按句号排序） */
+	items: CoverageItem_Serialize[],
+	/**  覆盖率（0.0 - 1.0） */
+	coverage: number | null,
+	/**  已覆盖数 */
+	covered_count: number,
+	/**  总数 */
+	total_count: number,
+	/**  增量模式：仅检查了变更实体时 true */
+	incremental: boolean,
+	/**  增量 diff 实体列表（incremental=true 时非空） */
+	diff_entities?: string[],
+};
 
 export type CreateConversationInput = CreateConversationInput_Serialize | CreateConversationInput_Deserialize;
 
@@ -572,6 +952,18 @@ export type DeleteMessageInput = {
 	message_id: string,
 };
 
+/**  答辩记录（IssueStatus::Disputed 时非空）。 */
+export type DisputeRecord = {
+	/**  A 的辩护理由（argument，由 B 复核判定可信度） */
+	argument: string,
+	/**  反驳证据：必须引用已登记 evidence_source + 逐字原文（机械匹配） */
+	counter_evidence: ValidationEvidenceRef,
+	/**  裁决者："verifier" | "human" */
+	resolved_by?: string,
+	/**  裁决结果："overruled"（撤销） | "accepted"（驳回，升级 error） */
+	verdict?: string,
+};
+
 /**  文档全文内容（预览抽屉用）。 */
 export type DocumentContentDto = {
 	path: string,
@@ -618,6 +1010,12 @@ export type FolderNodeDto = {
 	children: FolderNodeDto[],
 };
 
+/**  POST 结果：状态码 + 响应体原文（非 2xx 由调用方按 LLM 错误格式处理）。 */
+export type HttpPostResult = {
+	status: number,
+	body: string,
+};
+
 /**  单个摄取任务的进度事件（前端 IngestStatusBoard 据此更新卡片）。 */
 export type IngestProgress = {
 	job_id: string,
@@ -661,6 +1059,26 @@ export type IngestStage = "Queued" | "Parsing" | "Done" | "Error" |
 
 /**  模型输入模态（UI 据此显隐图片上传）。对齐 pi `input` 字段。 */
 export type InputType = "text" | "image";
+
+/**  校验 issue 严重级。 */
+export type IssueSeverity = 
+/**  阻断性：非空禁止 import（L0-L2 error） */
+"error" | 
+/**  非阻断：可答辩（L3 warning） */
+"warning" | 
+/**  建议级：进入 L4.3 语义评审（B 提建议，不阻断） */
+"suggestion";
+
+/**  issue 对抗生命周期状态。 */
+export type IssueStatus = 
+/**  初始：待处理（error 直接修订；warning 可答辩） */
+"open" | 
+/**  A 已发起答辩，等待裁决（warning 专属） */
+"disputed" | 
+/**  已接受修订 / 答辩被驳回升级 error */
+"accepted" | 
+/**  答辩成功，issue 撤销（warning 专属） */
+"overruled";
 
 /**  单个 MCP server 的连接配置。 */
 export type McpServerConfig = 
@@ -869,17 +1287,12 @@ export type OntologyChangelog_Serialize = {
  *  与 changelog（变化点）分离：changelog 记每次变更随历史增长，charter 记业务
  *  本质说明不随历史变化。由独立命令 `set_ontology_charter` 写入，不进 import 流程。
  * 
- *  四字段语义（决策：本体不变点）：
  *  - `business_scenario`：业务场景（服务于什么业务目标、谁用、解决什么问题）
  *  - `business_essence`：业务本质（核心业务对象/状态/关系/动态行为的一句话本质概括）
- *  - `design_intent`：设计意图（为什么这样建模、够用且可扩展的取舍、可扩展方向）
- *  - `invariants`：补充说明（自由文本，记录不可违反的业务约束、边界条件等）
  */
 export type OntologyCharter = {
 	business_scenario?: string,
 	business_essence?: string,
-	design_intent?: string,
-	invariants?: string,
 	/**  "agent" | "user" */
 	updated_by?: string,
 	/**  unix ms */
@@ -891,6 +1304,39 @@ export type OntologySummary = {
 	api_name: string,
 	display_name: string,
 	description?: string,
+	/**
+	 *  设计宪章是否已填写（手工导入的本体可能为 false——agent 迭代前应知会用户补全，
+	 *  否则 import 时会被宪章空检测闸门拒绝）
+	 */
+	has_charter?: boolean,
+};
+
+/**
+ *  仲裁后 A 修订的状态缓存（按本体 IRI）——running 标志 + 已用时 + 结果消息，
+ *  切窗回来轮询恢复"进行中"展示 + 显示耗时（对齐答辩/评审后端驱动模式）。
+ */
+export type PostArbitrationState = {
+	/**  后端修订任务是否进行中 */
+	running: boolean,
+	/**
+	 *  任务开始时间戳 ms（进行中时前端用 now-started_at 算实时已用时；
+	 *  完成后不再用，elapsed_ms 是最终耗时）
+	 */
+	started_at?: number,
+	/**  已用时 ms（完成后写入最终耗时；进行中为 0，前端用 started_at 算） */
+	elapsed_ms?: number,
+	/**  完成后的结果消息（ok/err） */
+	msg?: string,
+	/**  ok=成功 / err=失败 / ""=进行中 */
+	kind?: string,
+};
+
+/**  原则出处引用（ValidationIssue.principle）。 */
+export type PrincipleRef = {
+	/**  出处来源："skill" | "charter" | "input" | "w3c" */
+	source?: string,
+	/**  出处定位（skill 章节 / charter 字段 / 输入文档段落 / W3C 标准条款） */
+	ref_?: string,
 };
 
 /**
@@ -1133,6 +1579,16 @@ export type QueryResult_Serialize = {
  */
 export type ReasoningLevel = "off" | "low" | "medium" | "high";
 
+/**  评审环节耗时快照（unix ms，0=未完成）。 */
+export type ReviewStepMs = {
+	/**  B 评审（环节 1）耗时 */
+	b_review?: number,
+	/**  A 修订（环节 2）耗时 */
+	a_revise?: number,
+	/**  B 复核（环节 3）耗时 */
+	b_recheck?: number,
+};
+
 /**  schema 快照（browse_schema / test_data_source 返回）。 */
 export type SchemaSnapshot = SchemaSnapshot_Serialize | SchemaSnapshot_Deserialize;
 
@@ -1152,10 +1608,12 @@ export type SendMessageInput = {
 	/**  纯文本内容（一期；多模态图片输入下一步加 image 字段） */
 	content: string,
 	/**
-	 *  本次携带的挂载文档路径列表（用户在消息中 `@fileName` 引用的文档）。
-	 *  后端不从这些文档读全文注入 prompt——而是查得每篇的 id+name，
-	 *  在 user message 尾部追加 `<mounted-documents>` 注脚，模型按需调
-	 *  `read_document(id)` 工具取全文（agentic search，cache 友好）。
+	 *  本次携带的挂载文档路径列表（用户在消息中 `@token` 引用的文档）。
+	 *  token 形态：`@文件夹/文件名`（知识库路径，决策 17 修订）/ `@文件名`（旧消息兜底）
+	 *  / `@skillName`。后端不从这些文档读全文注入 prompt——而是查得每篇的 id+name+path，
+	 *  在 user message 尾部追加 `<conversation-scope>` 注脚，模型按需调
+	 *  `read_document(id)` 工具取全文（agentic search，cache 友好）；同时对库内文件
+	 *  幂等补挂载（复制指令到新会话重放时文件未挂载的场景）。
 	 */
 	mounted_paths?: string[],
 	/**  本次携带的图片上下文（选中的已摄入图片，走 VLM）。 */
@@ -1433,10 +1891,6 @@ export type TtlCharter = {
 	business_scenario?: string,
 	/**  业务本质（核心业务对象/状态/关系/动态行为的一句话本质概括） */
 	business_essence?: string,
-	/**  设计意图（为什么这样建模、够用且可扩展的取舍、可扩展方向） */
-	design_intent?: string,
-	/**  补充说明（自由文本，记录不可违反的业务约束、边界条件等） */
-	invariants?: string,
 	/**  "agent" | "user" */
 	updated_by?: string,
 	/**  unix ms */
@@ -1459,6 +1913,8 @@ export type TtlImportResult = {
 export type TtlOntologySummary = {
 	/**  本体 IRI（主键） */
 	ontology_iri: string,
+	/**  设计宪章是否已填写（手工导入的本体可能为 false——agent 迭代前应知会用户补全） */
+	has_charter: boolean,
 	/**  版本（owl:versionInfo，可空） */
 	version: string,
 	/**  三元组数 */
@@ -1467,14 +1923,180 @@ export type TtlOntologySummary = {
 	updated_at: number,
 };
 
+/**  属性（字段/关系）的读写视图。IRI 为原文形态（可能含双 #）。 */
+export type TtlPropertyEdit = {
+	/**  属性 IRI 全形（原文，如 `https://x.cn/ont#Policy#endDate`）。不可改（身份）。 */
+	iri: string,
+	/**  "datatype" | "object"（owl:DatatypeProperty / owl:ObjectProperty）。 */
+	kind: string,
+	/**  rdfs:label（去引号去语言标签后的纯文本；空 = 未设置）。 */
+	label?: string,
+	/**  rdfs:comment（同上）。 */
+	comment?: string,
+	/**  rdfs:domain 全 IRI（空 = 未设置）。 */
+	domain?: string,
+	/**  rdfs:range 全 IRI（xsd 类型或类；空 = 未设置）。 */
+	range?: string,
+};
+
 /**  Turtle 校验结果（对应 Palantir `ImportPreview` 的 dry-run 角色）。 */
-export type TtlValidation = {
+export type TtlValidation = TtlValidation_Serialize | TtlValidation_Deserialize;
+
+/**  Turtle 校验结果（对应 Palantir `ImportPreview` 的 dry-run 角色）。 */
+export type TtlValidation_Deserialize = {
 	/**  三元组总数（解析成功后） */
 	triple_count: number,
 	/**  阻断性错误（非空则禁止 import） */
 	errors: string[],
 	/**  非阻断性警告（可继续 import） */
 	warnings: string[],
+	/**  结构化 issue 列表（向后兼容：errors/warnings 保留，issues 是结构化形态） */
+	issues?: ValidationIssue_Deserialize[],
+	/**  L4.3 多轮评审状态（默认无；review_ontology 启动后填充） */
+	review?: ValidationReview | null,
+};
+
+/**  Turtle 校验结果（对应 Palantir `ImportPreview` 的 dry-run 角色）。 */
+export type TtlValidation_Serialize = {
+	/**  三元组总数（解析成功后） */
+	triple_count: number,
+	/**  阻断性错误（非空则禁止 import） */
+	errors: string[],
+	/**  非阻断性警告（可继续 import） */
+	warnings: string[],
+	/**  结构化 issue 列表（向后兼容：errors/warnings 保留，issues 是结构化形态） */
+	issues: ValidationIssue_Serialize[],
+	/**  L4.3 多轮评审状态（默认无；review_ontology 启动后填充） */
+	review?: ValidationReview | null,
+};
+
+/**  证据引用（对应 evidence_sources 表；source_id 必须已登记）。 */
+export type ValidationEvidenceRef = {
+	/**  FK → evidence_sources.source_id（register_source 返回） */
+	source_id: string,
+	/**  原文逐字摘录（≤200 字符；答辩 counterEvidence 机械匹配用） */
+	quote: string,
+};
+
+/**  单条结构化校验 issue。 */
+export type ValidationIssue = ValidationIssue_Serialize | ValidationIssue_Deserialize;
+
+/**  单条结构化校验 issue。 */
+export type ValidationIssue_Deserialize = {
+	/**
+	 *  稳定 ID（如 "L3-3"，本体内唯一，持久化主键；
+	 *  review 来源为 "{review_id}:{B条目id}"，如 "vr-xxx:B1"）
+	 */
+	id: string,
+	/**  层级："L0" | "L1" | "L2" | "L2.5" | "L2.6" | "L3" | "L4" */
+	layer: string,
+	/**
+	 *  发现来源："rules"（阶段① 规则检查）| "review"（②a B 语义评审）
+	 *  ——统一发现池（v0.7）：两类发现并列同一生命周期，互不清除
+	 */
+	source?: string,
+	/**  严重级 */
+	severity: IssueSeverity,
+	/**
+	 *  规则 ID（check_* 函数名，如 "check_class_uses_owl_class"；
+	 *  review 来源为 "review:{dimension}"，如 "review:完整性"）
+	 */
+	rule: string,
+	/**  人类可读描述 */
+	message: string,
+	/**  定位目标（实体 IRI / Turtle 行号，可空） */
+	target?: string | null,
+	/**  证据引用（可空） */
+	evidence?: ValidationEvidenceRef | null,
+	/**  原则出处（可空） */
+	principle?: PrincipleRef | null,
+	/**  修复建议（可空） */
+	suggestion?: string | null,
+	/**  对抗生命周期状态 */
+	status?: IssueStatus,
+	/**  答辩记录（disputed 时非空） */
+	dispute?: DisputeRecord | null,
+	/**
+	 *  A 的裁决回应（②a review 来源专属）：B 建议落成 issue 后，A 修订时
+	 *  逐条回填 accepted/rejected + reason（B 复核不可见，仲裁回溯用）
+	 */
+	a_action?: AActionRecord | null,
+};
+
+/**  单条结构化校验 issue。 */
+export type ValidationIssue_Serialize = {
+	/**
+	 *  稳定 ID（如 "L3-3"，本体内唯一，持久化主键；
+	 *  review 来源为 "{review_id}:{B条目id}"，如 "vr-xxx:B1"）
+	 */
+	id: string,
+	/**  层级："L0" | "L1" | "L2" | "L2.5" | "L2.6" | "L3" | "L4" */
+	layer: string,
+	/**
+	 *  发现来源："rules"（阶段① 规则检查）| "review"（②a B 语义评审）
+	 *  ——统一发现池（v0.7）：两类发现并列同一生命周期，互不清除
+	 */
+	source: string,
+	/**  严重级 */
+	severity: IssueSeverity,
+	/**
+	 *  规则 ID（check_* 函数名，如 "check_class_uses_owl_class"；
+	 *  review 来源为 "review:{dimension}"，如 "review:完整性"）
+	 */
+	rule: string,
+	/**  人类可读描述 */
+	message: string,
+	/**  定位目标（实体 IRI / Turtle 行号，可空） */
+	target?: string | null,
+	/**  证据引用（可空） */
+	evidence?: ValidationEvidenceRef | null,
+	/**  原则出处（可空） */
+	principle?: PrincipleRef | null,
+	/**  修复建议（可空） */
+	suggestion?: string | null,
+	/**  对抗生命周期状态 */
+	status: IssueStatus,
+	/**  答辩记录（disputed 时非空） */
+	dispute?: DisputeRecord | null,
+	/**
+	 *  A 的裁决回应（②a review 来源专属）：B 建议落成 issue 后，A 修订时
+	 *  逐条回填 accepted/rejected + reason（B 复核不可见，仲裁回溯用）
+	 */
+	a_action?: AActionRecord | null,
+};
+
+/**  L4.3 多轮语义评审状态（validation_reviews 表读取视图）。 */
+export type ValidationReview = {
+	/**  评审任务 ID（同一次对抗校验分组） */
+	id: string,
+	/**  归属本体 IRI */
+	ontology_iri: string,
+	/**  当前轮次（1=初始评审，2=A修订，3=B复核） */
+	round: number,
+	/**  复核轮数封顶 */
+	max_rounds: number,
+	/**  B 的评审输出（结构化建议 JSON） */
+	b_report: string,
+	/**  A 修订后的 Turtle V2 全文 */
+	a_revision: string,
+	/**  A 的修订说明（B 复核时不可见） */
+	a_reasoning: string,
+	/**
+	 *  B 复核原始输出 JSON（verdict + remaining_issues；此前不落库，仲裁时
+	 *  无从得知 B 复核到底提了哪些残留问题——v0.7 补）
+	 */
+	b_verdict?: string,
+	/**
+	 *  各环节耗时（unix ms；b_review/a_revise/b_recheck 完成时刻的耗时快照，
+	 *  0=未完成）——此前不落库，切页回来"上次会话"环节无耗时可显示
+	 */
+	step_ms?: ReviewStepMs,
+	/**  "in_progress" | "resolved" | "escalated" */
+	status: string,
+	/**  unix ms */
+	created_at: number,
+	/**  unix ms */
+	updated_at: number,
 };
 
 /* Tauri Specta runtime */

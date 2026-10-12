@@ -84,7 +84,7 @@ metadata:
 2. **隐性知识专家补充**：业务专家依据 29 句话范式，从"有哪些对象/任务怎么做/有哪些规则"三维度萃取经验。
 3. **审核准入**：四标准——**描述清晰**（术语唯一、对齐 7+1 模板）、**逻辑正确**（无闭环冲突）、**内容完备**（串联事实-事理-行动）、**极简表达**（满足 AI 意图即可，去噪）。
 4. **协同评审**：初审（建模工程师查语义规范）+ 复核（业务专家查逻辑闭环）形成质量闭环。
-5. **29 句话产出**：每条带置信度（confirmed/high/tentative）。
+5. **29 句话产出**：每条带置信度（confirmed/high/tentative）。**实体/属性的依据 = 输入文档**：confirmed/high 直接产出，不要把候选清单抛给用户逐个确认（仅业务决策类问题汇成一次提问）；tentative 进 `open_questions` 照常建模，不阻塞。
 6. **tentative 项**：进附属 `open_questions` 文件，不写入 Turtle。
 
 ### ② AI 建模与双模型协同校验
@@ -153,20 +153,40 @@ metadata:
 
 ```
 材料输入 → 29句话抽取（7类逐条） → 审核准入 → AI生成Turtle → 双模型校验 → 自检
-         → validate_ontology_ttl（校验） → import_ontology_ttl（落库，可选）
-         → set_ontology_ttl_charter（写宪章，冷启动时） → commit_ontology_ttl_change（记变更日志）
+         → commit_ontology_ttl_change（记变更日志）
 ```
 
-### 可用工具（W3C 路线专用，8 个）
+**宪章先行（决策 24，硬闸门）**：`import_ontology_ttl` 对库内不存在的 IRI 一律拒绝——
+本体创建必须由用户在「新建本体」向导完成设计宪章（AI 不得创建本体）。
+冷启动时：输出建模思路 + 宪章两字段（业务场景/业务本质）要点（业务场景/本质/意图/约束），指引用户
+完成向导；本体建立后（list_ontology_ttl 可查到目标 IRI）再执行导入。
+
+**证据环（决策 24 后续，操作顺序——先登记后建模）**：
+
+1. 环节 ① 完成后、生成 Turtle **之前**：把本次建模依据的素材（场景描述/文档摘录）
+   调 `register_evidence_source` 登记为证据源，记下返回的 source_id。不登记就导入
+   会被闸门打回，先登记可避免返工。
+2. 环节 ② 生成 Turtle 时：**每个** owl:Class / DatatypeProperty / ObjectProperty
+   都要带 `skos:editorialNote` 证据注解；quote **从源 content 里复制粘贴原文**，
+   不要凭记忆默写（默写极易与原文有出入导致打回）。
+3. 确属抽象设计（如状态机、设计概念，用户输入中无原句可引）：先向用户说明并取得
+   确认，再用豁免注解 `evidence: none | direct | 「用户确认的理由」`，理由要写明
+   是谁、在哪个语境下确认的。
+4. **存量本体增量更新**：仅**定义未变**的存量元素被 grandfathered（不阻断）；
+   新增元素、以及**修改了定义**的存量元素（改 label/注释/约束等）都必须有证据
+   注解。更新任一对象的正确姿势是 export 全文 → 改目标对象 → 全量回导，
+   **切勿只提交改动切片**（overwrite 是整本体替换，切片会丢数据，缩水防护会拒绝）。
+
+### 可用工具（W3C 路线专用，7 个）
 
 | 工具 | 用途 | 何时调 |
 |---|---|---|
+| `register_evidence_source(kind, title, content, ontology_iri, origin_ref)` | 登记证据源，返回 source_id | **建模前**，素材到手即登记 |
 | `validate_ontology_ttl(ttl_content)` | dry-run 校验（7+1 语义规范） | import 前必调 |
-| `import_ontology_ttl(ttl_content, overwrite?)` | 落库（UPSERT，按 IRI） | validate 通过后 |
-| `export_ontology_ttl(ontology_iri)` | 取出 Turtle 文本 | 增量更新前 |
+| `import_ontology_ttl(ttl_content, overwrite?)` | 落库。**overwrite=true 是整本体替换**（非按元素合并）：增量更新必须 export 全文修改后全量回导；缩水超 20% 需 confirm_full_replace=true | validate 通过后 |
+| `export_ontology_ttl(ontology_iri, mode?)` | 取出 Turtle。**mode 默认 summary**（结构摘要，几 KB，查结构用）；**mode="full"** 才返回全文（增量更新用，全文进对话历史会拖慢后续每轮，用完勿重复） | 增量更新前用 full；看结构用 summary |
 | `list_ontology_ttl()` | 本体列表摘要 | 看有哪些本体 |
 | `query_ontology_sparql(ontology_iri, sparql)` | 跑 SPARQL 查询 | 验证/抽查 |
-| `set_ontology_ttl_charter(ontology_iri, business_scenario, business_essence, design_intent, invariants)` | 写宪章（不变点） | 冷启动时 + 用户明确要求调整时 |
 | `commit_ontology_ttl_change(ontology_iri, title, body, change_summary?, conversation_id?)` | 记变更日志 | 每次 import/delete 后 |
 | `list_ontology_ttl_changelog(ontology_iri)` | 列变更历史 | 回溯演进过程 |
 
@@ -218,7 +238,7 @@ metadata:
 - **先调 `validate_ontology_ttl(ttl_content)`**：检查 errors 是否为空。errors 非空（Turtle 语法错、类非 `owl:Class`、属性混用、XSD 非法、SWRL 词汇误用、IRI 重复、**subClassOf 主语未声明 a owl:Class**）则修正重试。
 - validate 通过后调 `import_ontology_ttl(ttl_content)`（如需落库）。返回 `ImportResult` 检查 per-entity 状态（best-effort 部分失败）。
 - SPARQL 查询模板（第 7 类 CRUD）用 `sh:select` 序列化进 .ttl 主文件（W3C SHACL 1.2 标准），不独立 `.sparql` 文件。
-- 冷启动建模时调 `set_ontology_ttl_charter` 写宪章（业务场景/本质/意图/不变点），同步用 W3C 原生词汇（`dcterms:` + `skos:`）写进 .ttl。
+- **宪章不归 AI 写**：冷启动时给出宪章要点草稿，指引用户在「设计宪章」向导/面板确认落库（宪章用户主权，决策 22/23/24）。增量建模前用 `get_ontology_ttl_charter` 读宪章作约束基线。
 - 每次 import 后调 `commit_ontology_ttl_change` 记变更日志（git commit message 式，记本次变更的为什么和整体设计）。
 - 详细闭环见 [references/modeling-workflow.md 第七节](references/modeling-workflow.md)。
 

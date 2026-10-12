@@ -8,8 +8,7 @@
 
 import { useState } from "react"
 import { FileDown, ChevronDown, FileCode, FileText, Loader2 } from "lucide-react"
-import { useConversations } from "@/hooks/useConversations"
-import { ipc } from "@/lib/ipc/commands"
+import { useConversations, useAllMessages } from "@/hooks/useConversations"
 import { saveTextFile } from "@/lib/save-file"
 import {
   extractConversation,
@@ -28,6 +27,8 @@ export function ExportConversationButton({ conversationId }: Props) {
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const { data: conversations = [] } = useConversations()
+  // 拉全部历史（null = 不限条数）——经 hook 层调用，components 不直接 import ipc
+  const { data: allMessages = [] } = useAllMessages(conversationId)
 
   const safeTitle = () => {
     const c = conversations.find((x) => x.id === conversationId)
@@ -43,8 +44,8 @@ export function ExportConversationButton({ conversationId }: Props) {
     setOpen(false)
     setBusy(true)
     try {
-      // 拉全部历史（null = 不限条数）
-      const messages: MessageRow[] = await ipc.listMessages(conversationId, null)
+      // 拉全部历史（hook 已取 null=不限条数）
+      const messages: MessageRow[] = allMessages as MessageRow[]
       const title = safeTitle()
 
       // 提取 IR（唯一碰 MessageRow 的地方），HTML/MD 两条路径共享

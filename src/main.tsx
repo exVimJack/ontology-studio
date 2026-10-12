@@ -4,6 +4,15 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { RouterProvider, createRouter } from "@tanstack/react-router"
 import { routeTree } from "@/routeTree.gen"
 import { installBrowserMock } from "@/lib/dev/mock-tauri"
+// Fira Sans / Fira Code 字体（本地 woff2，vite 打包，离线可用；对齐 Gaia Design System）
+// 仅 latin 子集（西里尔/希腊用不上）；中文回退系统字体渲染
+import "@fontsource/fira-sans/latin-400.css"
+import "@fontsource/fira-sans/latin-500.css"
+import "@fontsource/fira-sans/latin-600.css"
+import "@fontsource/fira-sans/latin-700.css"
+import "@fontsource/fira-code/latin-400.css"
+import "@fontsource/fira-code/latin-500.css"
+import "@fontsource/fira-code/latin-600.css"
 import "@/styles.css"
 
 // 浏览器开发兜底：非 Tauri 环境注入占位 invoke，避免 invoke 调用白屏崩溃。

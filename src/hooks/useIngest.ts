@@ -8,10 +8,10 @@
 // 注：图片输入一期不走 ingest 管道（图片无需"解析"，只需 base64 编码传给 VLM）。
 // 图片经 Composer 直接读文件转 base64 → context_images，见 useChat.send。
 
-import { useMutation, useQueryClient } from "@tanstack/react-query"
-import { ipc } from "@/lib/ipc/commands"
-import type { IngestProgress, IngestResultItem } from "@/lib/domain"
-import { useIngestStore } from "@/stores/ingest-store"
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { ipc } from "@/lib/ipc/commands";
+import type { IngestProgress, IngestResultItem } from "@/lib/domain";
+import { useIngestStore } from "@/stores/ingest-store";
 
 /**
  * 摄取文件并挂载到指定会话。
@@ -19,8 +19,8 @@ import { useIngestStore } from "@/stores/ingest-store"
  * @param conversationId 归属会话；未选会话时传 null（仅入库不挂载）
  */
 export function useIngest(conversationId: string | null) {
-  const upsertJob = useIngestStore((s) => s.upsertJob)
-  const qc = useQueryClient()
+  const upsertJob = useIngestStore((s) => s.upsertJob);
+  const qc = useQueryClient();
 
   const onProgress = (p: IngestProgress) => {
     upsertJob({
@@ -36,17 +36,28 @@ export function useIngest(conversationId: string | null) {
       total: p.total ?? undefined,
       fileSize: p.file_size ?? undefined,
       updatedAt: Date.now(),
-    })
-  }
+    });
+  };
 
   return useMutation({
-    mutationFn: async ({ paths: rawPaths, folderPath }: { paths: string[]; folderPath: string | null }) => {
+    mutationFn: async ({
+      paths: rawPaths,
+      folderPath,
+    }: {
+      paths: string[];
+      folderPath: string | null;
+    }) => {
       // OS 拖拽事件的 paths 顺序不保证（Windows 按文件系统枚举，常乱序），
       // 按文件名 locale 排序后传入 Rust，使 Queued 事件顺序稳定、UI 可预期。
       const paths = [...rawPaths].sort((a, b) =>
         a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }),
-      )
-      const results: IngestResultItem[] = await ipc.ingestFiles(paths, onProgress, conversationId, folderPath)
+      );
+      const results: IngestResultItem[] = await ipc.ingestFiles(
+        paths,
+        onProgress,
+        conversationId,
+        folderPath,
+      );
       // batch 部分失败不抛错（成功的已挂载，抛错会让成功项的 chip 闪烁消失），
       // 但必须留痕：控制台汇总失败文件，便于排查。
       // 失败判据只看 format 标记（后端 ingest_files 对 error/cancelled 返回对应 format），
@@ -54,47 +65,54 @@ export function useIngest(conversationId: string | null) {
       // 是否为空来决定挂载（二期大文件可能只返摘要，text 为空但文档已入库）。
       const failed = results.filter(
         (r) => r.format === "error" || r.format === "cancelled",
-      )
+      );
       if (failed.length > 0) {
         console.warn(
           `[ingest] ${failed.length}/${results.length} 个文件摄取失败：`,
           failed.map((f) => ({ file: f.file_name, format: f.format })),
-        )
+        );
       }
       // 成功项挂载到当前会话（全文已由后端 upsert 到 documents 表）。
       // mountDocument 后端会校验 documents 表存在该 path，返回 true=已挂载/false=未入库。
+      // 知识库视图缓存同步失效（修复：摄取完成后 Library 不显示、切走再切回才出现
+      // ——LibraryView 用 folders / folder-docs 两个独立 query key，此前只失效了
+      // all-documents，知识库列表读的是旧缓存）
+      qc.invalidateQueries({ queryKey: ["folders"] });
+      qc.invalidateQueries({ queryKey: ["folder-docs"] });
       if (conversationId) {
-        let mountedCount = 0
+        let mountedCount = 0;
         for (const r of results) {
-          if (r.format === "error" || r.format === "cancelled") continue
+          if (r.format === "error" || r.format === "cancelled") continue;
           try {
-            const ok = await ipc.mountDocument(conversationId, r.path)
+            const ok = await ipc.mountDocument(conversationId, r.path);
             if (ok) {
-              mountedCount += 1
+              mountedCount += 1;
             } else {
               // 未入库（罕见：ingest 成功但 upsert 失败，或 path 规范化不一致）。
               console.warn(
                 `[ingest] mountDocument 返回 false，文档未入库：${r.file_name} (path=${r.path})`,
-              )
+              );
             }
           } catch (e) {
             // 挂载失败不阻断摄取（用户可在 Library 手动挂载），但留痕便于排查。
-            console.error(`[ingest] mountDocument 抛错：${r.file_name}`, e)
+            console.error(`[ingest] mountDocument 抛错：${r.file_name}`, e);
           }
         }
         if (mountedCount > 0) {
-          console.info(`[ingest] 已挂载 ${mountedCount} 个文档到会话 ${conversationId}`)
+          console.info(
+            `[ingest] 已挂载 ${mountedCount} 个文档到会话 ${conversationId}`,
+          );
         }
         // 刷新挂载列表 + 全局文档列表缓存
-        qc.invalidateQueries({ queryKey: ["mounted-docs", conversationId] })
-        qc.invalidateQueries({ queryKey: ["all-documents"] })
+        qc.invalidateQueries({ queryKey: ["mounted-docs", conversationId] });
+        qc.invalidateQueries({ queryKey: ["all-documents"] });
       } else {
         // 无会话时只刷新全局文档列表
-        qc.invalidateQueries({ queryKey: ["all-documents"] })
+        qc.invalidateQueries({ queryKey: ["all-documents"] });
       }
-      return results
+      return results;
     },
-  })
+  });
 }
 
 /**
@@ -106,7 +124,7 @@ export function useIngest(conversationId: string | null) {
 export function useCancelIngest() {
   return useMutation({
     mutationFn: async (jobId: string) => {
-      await ipc.cancelIngest(jobId)
+      await ipc.cancelIngest(jobId);
     },
-  })
+  });
 }

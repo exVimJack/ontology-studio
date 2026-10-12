@@ -6,10 +6,10 @@
 //
 // 约束（§12.1）：经 hooks/store，不直接 invoke。
 
-import { Command, PanelLeft, Menu, Search } from "lucide-react"
+import { PanelLeft, Menu, Search } from "lucide-react"
 import { useUiStore } from "@/stores/ui-store"
-import { useProvider } from "@/hooks/useProvider"
 import { useIsMobile } from "@/hooks/useIsMobile"
+import { shortcut } from "@/lib/keyboard"
 
 export function TitleBar() {
   const isMobile = useIsMobile()
@@ -17,12 +17,11 @@ export function TitleBar() {
   const setMobileSidebarOpen = useUiStore((s) => s.setMobileSidebarOpen)
   const setPaletteOpen = useUiStore((s) => s.setCommandPaletteOpen)
   const sidebarCollapsed = useUiStore((s) => s.sidebarCollapsed)
-  const { data: provider } = useProvider()
 
   // ── 移动端：紧凑标题栏 ──
   if (isMobile) {
     return (
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border bg-bg-elevated px-2 pt-[env(safe-area-inset-top)]">
+      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border bg-bg-elevated px-2 shadow-card pt-[env(safe-area-inset-top)]">
         <button
           onClick={() => setMobileSidebarOpen(true)}
           title="菜单"
@@ -32,11 +31,6 @@ export function TitleBar() {
         </button>
         <span className="text-sm font-semibold tracking-tight select-none">onto-studio</span>
         <div className="flex-1" />
-        {provider && (
-          <span className="max-w-[120px] truncate rounded-md bg-bg-hover px-2 py-0.5 text-[11px] text-fg-muted">
-            {provider.model}
-          </span>
-        )}
         <button
           onClick={() => setPaletteOpen(true)}
           title="搜索"
@@ -52,7 +46,7 @@ export function TitleBar() {
   return (
     <div
       data-tauri-drag-region
-      className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-bg-elevated px-3"
+      className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-bg-elevated px-3 shadow-card"
     >
       {/* 左：侧栏切换 + 品牌 */}
       <button
@@ -67,21 +61,13 @@ export function TitleBar() {
       {/* 中：拖拽区（留空） */}
       <div data-tauri-drag-region className="flex-1" />
 
-      {/* 模型名 */}
-      {provider && (
-        <span className="rounded-md bg-bg-hover px-2 py-0.5 text-xs text-fg-muted">
-          {provider.model}
-        </span>
-      )}
-
-      {/* ⌘K 入口 */}
+      {/* ⌘K 入口：图标按钮（快捷键提示放 title） */}
       <button
         onClick={() => setPaletteOpen(true)}
-        title="命令面板 (⌘K)"
-        className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-fg-muted hover:bg-bg-hover"
+        title={`命令面板 (${shortcut(["mod", "K"])})`}
+        className="rounded-md border border-border p-1.5 text-fg-muted hover:bg-bg-hover hover:text-fg"
       >
-        <Command size={12} />
-        <span>K</span>
+        <Search size={13} />
       </button>
     </div>
   )

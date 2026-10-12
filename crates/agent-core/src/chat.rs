@@ -1,26 +1,26 @@
 //! 流式对话服务。
 //!
-//! 封装 Rig 0.41 的 agent + streaming，对外暴露统一的 `StreamChunk` 流。
+//! 封装 Rig 0.44 的 agent + streaming，对外暴露统一的 `StreamChunk` 流。
 //! 对齐 ARCHITECTURE.md §13.2 的 StreamChunk 契约（一期子集：TextDelta/ReasoningDelta/Done/Error）。
 //!
 //! 设计说明（provider 类型分歧）：
-//! Rig 的 `Agent<M>` / `Client<Ext,H>` 是高阶泛型，不同 provider 的具体类型不同，
-//! 无法直接 trait-object 化。采用 **`ProviderRuntime` trait** 方案：定义一个 trait 把
-//! 「构造 agent + 设采样参数 + 流式/prompt」封装为返回已擦除类型（`StreamChunk` 流 /
-//! `String`）的 method，每个 provider kind 在 `with_tools` 时构造具体 client 并立即
-//! 包成 `Box<dyn ProviderRuntime>`。`ChatService` 持 trait object，所有调用点零 match 分支。
-//! 新增 provider 只需：① with_tools 加构造分支 ② impl ProviderRuntime 一块。
+//! Rig 0.44 各 provider 的 `Model<Wire>` 具体类型不同，无法直接 trait-object 化。
+//! 采用 **`ModelFactory` trait** 方案：定义一个 trait 把「按名构造已擦除模型
+//! （`DynModel<Completion>`）」封装为唯一方法，每个 provider kind 在 `with_tools`
+//! 时构造具体 client 并立即包成 `Box<dyn ModelFactory>`。`ChatService` 持 trait
+//! object，所有调用点零 match 分支；agent 构建/流式/采样等全走同一 helper，
+//! 消除 0.41 的泛型宏样板。新增 provider 只需：① build_runtime 加构造分支
+//! ② impl ModelFactory 一块。
 
 use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt};
-use rig::client::AgentClientExt;
 use specta_typescript::Number;
-use rig::agent::{MultiTurnStreamItem, StreamingError};
-use rig::tool::server::ToolServerHandle;
+use rig::agent::tool::server::ToolServerHandle;
+use rig::agent::MultiTurnStreamItem;
 use rig::completion::message::{AssistantContent, Message, UserContent};
-use rig::providers::{anthropic, cohere, deepseek, gemini, groq, mistral, moonshot, ollama, openai, openrouter, perplexity, xai, zai};
-use rig::streaming::{StreamedAssistantContent, StreamingChat, StreamingPrompt};
+use rig::providers::{anthropic, cohere, gemini, ollama, openai};
+use rig::streaming::StreamEvent;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AgentError, AgentResult};
@@ -30,7 +30,7 @@ use crate::provider::{
 
 /// Agent 多轮工具调用的最大模型调用次数（max_turns = total model-call budget）。
 ///
-/// Rig 0.41 在未配 `default_max_turns` 时隐式预算 = 1 次模型调用（仅发 prompt，
+/// Rig 在未配 `default_max_turns` 时隐式预算 = 1 次模型调用（仅发 prompt，
 /// 不进多轮循环），带 tool 的对话第一轮工具调用后即撞 MaxTurnsError。
 ///
 /// 语义（rig 官方文档）：max_turns 含初始调用 + 每次重试/续轮。
@@ -157,70 +157,48 @@ impl Clone for AgentOpts {
     }
 }
 
-/// Provider 运行时 trait：擦除 rig client 的具体泛型类型。
+/// 模型工厂 trait：按模型名构造已擦除的 rig 模型（`DynModel<Completion>`）。
 ///
-/// 每个 provider kind 实现此 trait，把「构造 agent + 流式/prompt」封装为返回
-/// 已擦除类型的方法。`ChatService` 持 `Box<dyn ProviderRuntime>`，调用点零分支。
-trait ProviderRuntime: Send + Sync {
-    /// 流式对话（带 history，无 memory）。
-    fn stream_chat(
-        &self,
-        model: &str,
-        prompt: Message,
-        history: Vec<Message>,
-        handle: Option<ToolServerHandle>,
-        opts: &AgentOpts,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = AgentResult<ChatStream>> + Send>,
-    >;
-
-    /// 流式对话（memory 模式，按 conversation_id 挂 CompactingMemory）。
-    fn stream_with_memory(
-        &self,
-        model: &str,
-        prompt: Message,
-        conversation_id: String,
-        memory: Option<Arc<dyn rig::memory::ConversationMemory>>,
-        handle: Option<ToolServerHandle>,
-        opts: &AgentOpts,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = AgentResult<ChatStream>> + Send>,
-    >;
-
-    /// 单次非流式 prompt（供摘要/标题生成用）。
-    fn prompt_text(
-        &self,
-        model: &str,
-        prompt: String,
-        opts: &AgentOpts,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = AgentResult<String>> + Send>,
-    >;
+/// 0.44 起 AgentBuilder::new 直收模型（client.agent() 已删），client→model 由
+/// 各 provider 自己路由（Responses/Chat/Messages/GenerateContent 各异）。
+/// 擦除后 agent 构建/流式/prompt 全走同一 helper，消除 0.41 的泛型宏样板。
+trait ModelFactory: Send + Sync {
+    fn build_model(&self, name: &str) -> rig::DynModel<rig::operation::Completion>;
 }
+
+/// 保留 0.41 命名：运行时对象 = 模型工厂（方法已合并）。
+trait ProviderRuntime: ModelFactory {}
+
+impl<T: ModelFactory> ProviderRuntime for T {}
 
 /// 已擦除类型的流式输出（`StreamChunk` 流）。
 type ChatStream = std::pin::Pin<Box<dyn Stream<Item = StreamChunk> + Send>>;
 
-/// 泛型 helper：为任意 `AgentClientExt` client 构造 agent 并流式对话。
+/// 构造带 preamble 的 AgentOpts（run_llm_prompt_streamed 用）。
+fn opts_from(preamble: &str, config: &ProviderConfig) -> AgentOpts {
+    let mut opts = make_opts(None, config);
+    opts.preamble = Some(preamble.to_string());
+    opts
+}
+
+
+/// helper：为已擦除模型构造 agent 并流式对话。
 ///
-/// 调用方传入 client 引用 + 配置，函数内部构造 `AgentBuilder`、设采样参数/
-/// preamble/reasoning/memory/tool handle，build 后调 stream_chat/stream_prompt/prompt。
-/// 返回已擦除类型的流/字符串，消除 trait impl 中的重复。
+/// 调用方传入 `DynModel<Completion>`（由 ModelFactory 按名构造）+ 配置，
+/// 函数内部构造 `AgentBuilder`、设采样参数/preamble/reasoning/memory/
+/// conversation/tool handle，build 后调 stream()/await，返回已擦除类型的流/字符串。
 mod helper {
     use super::*;
 
-    /// 构造 agent builder（设 preamble/memory/采样/reasoning）。
+    /// 构造 agent builder（设 preamble/memory/conversation/采样/reasoning）。
     /// 返回的 builder 尚未 build（调用方决定是否挂 tool_server_handle）。
-    fn build_agent<C: AgentClientExt>(
-        c: &C,
-        model: &str,
+    fn build_agent(
+        model: rig::DynModel<rig::operation::Completion>,
         opts: &AgentOpts,
         memory: Option<Arc<dyn rig::memory::ConversationMemory>>,
-    ) -> rig::agent::AgentBuilder<C::CompletionModel>
-    where
-        <C as rig::client::CompletionClient>::CompletionModel: 'static,
-    {
-        let mut b = c.agent(model);
+        conversation_id: Option<String>,
+    ) -> rig::agent::AgentBuilder {
+        let mut b = rig::agent::AgentBuilder::new(model);
         if let Some(p) = &opts.preamble {
             if !p.is_empty() {
                 b = b.preamble(p);
@@ -228,6 +206,10 @@ mod helper {
         }
         if let Some(m) = memory {
             b = b.memory(m);
+        }
+        if let Some(id) = conversation_id {
+            // 0.44：conversation 从每次 prompt 调用上移到 builder
+            b = b.conversation(id);
         }
         if let Some(t) = opts.temperature {
             b = b.temperature(t);
@@ -241,79 +223,59 @@ mod helper {
         b
     }
 
+    /// build（可选挂共享 tool server）。
+    fn finish(b: rig::agent::AgentBuilder, handle: Option<ToolServerHandle>) -> rig::agent::Agent {
+        if let Some(h) = handle {
+            b.tool_server_handle(h).build()
+        } else {
+            b.build()
+        }
+    }
+
     /// 流式对话（带 history，无 memory）。
-    pub(crate) async fn stream_chat<C>(
-        c: &C,
-        model: &str,
+    pub(crate) async fn stream_chat(
+        model: rig::DynModel<rig::operation::Completion>,
         prompt: Message,
         history: Vec<Message>,
         handle: Option<ToolServerHandle>,
         opts: &AgentOpts,
-    ) -> AgentResult<ChatStream>
-    where
-        C: AgentClientExt,
-        <C as rig::client::CompletionClient>::CompletionModel: 'static,
-        <<C as rig::client::CompletionClient>::CompletionModel as rig::completion::CompletionModel>::StreamingResponse:
-            rig::completion::GetTokenUsage + Clone + Unpin + Send + 'static,
-    {
-        let b = build_agent(c, model, opts, None);
-        let inner = if let Some(h) = handle {
-            let agent = b.tool_server_handle(h).build();
-            agent.stream_chat(prompt, history).max_turns(MAX_TURNS).await
-        } else {
-            let agent = b.build();
-            agent.stream_chat(prompt, history).max_turns(MAX_TURNS).await
-        };
+    ) -> AgentResult<ChatStream> {
+        let agent = finish(build_agent(model, opts, None, None), handle);
+        let inner = agent.prompt(prompt).history(history).max_turns(MAX_TURNS).stream();
         Ok(Box::pin(map_multi_turn_stream(inner)))
     }
 
     /// 流式对话（memory 模式）。
-    pub(crate) async fn stream_with_memory<C>(
-        c: &C,
-        model: &str,
+    pub(crate) async fn stream_with_memory(
+        model: rig::DynModel<rig::operation::Completion>,
         prompt: Message,
         conversation_id: String,
         memory: Option<Arc<dyn rig::memory::ConversationMemory>>,
         handle: Option<ToolServerHandle>,
         opts: &AgentOpts,
-    ) -> AgentResult<ChatStream>
-    where
-        C: AgentClientExt,
-        <C as rig::client::CompletionClient>::CompletionModel: 'static,
-        <<C as rig::client::CompletionClient>::CompletionModel as rig::completion::CompletionModel>::StreamingResponse:
-            rig::completion::GetTokenUsage + Clone + Unpin + Send + 'static,
-    {
-        let b = build_agent(c, model, opts, memory);
-        let inner = if let Some(h) = handle {
-            let agent = b.tool_server_handle(h).build();
-            agent.stream_prompt(prompt).conversation(conversation_id).max_turns(MAX_TURNS).await
-        } else {
-            let agent = b.build();
-            agent.stream_prompt(prompt).conversation(conversation_id).max_turns(MAX_TURNS).await
-        };
+    ) -> AgentResult<ChatStream> {
+        let agent = finish(
+            build_agent(model, opts, memory, Some(conversation_id)),
+            handle,
+        );
+        // memory 模式不传 history：CompactingMemory 在 load 时裁剪 + 压缩；
+        // 显式 history 会绕过 memory（rig 语义），二者互斥。
+        let inner = agent.prompt(prompt).max_turns(MAX_TURNS).stream();
         Ok(Box::pin(map_multi_turn_stream(inner)))
     }
 
     /// 单次非流式 prompt。
-    pub(crate) async fn prompt_text<C>(
-        c: &C,
-        model: &str,
+    pub(crate) async fn prompt_text(
+        model: rig::DynModel<rig::operation::Completion>,
         prompt: String,
         opts: &AgentOpts,
-    ) -> AgentResult<String>
-    where
-        C: AgentClientExt,
-        <C as rig::client::CompletionClient>::CompletionModel: 'static,
-    {
-        use rig::completion::Prompt;
-        use std::future::IntoFuture;
-        let b = build_agent(c, model, opts, None);
-        let agent = b.build();
-        agent
-            .prompt(&prompt)
-            .into_future()
+    ) -> AgentResult<String> {
+        let agent = finish(build_agent(model, opts, None, None), None);
+        let resp = agent
+            .prompt(prompt)
             .await
-            .map_err(|e| AgentError::Provider(format!("prompt: {e}")))
+            .map_err(|e| AgentError::Provider(format!("prompt: {e}")));
+        resp.map(|r| r.output())
     }
 }
 
@@ -327,100 +289,62 @@ fn make_opts(reasoning_params: Option<serde_json::Value>, config: &ProviderConfi
     }
 }
 
-// ── ProviderRuntime 实现：每个 provider kind 一块 ──────────────
-// 用宏生成重复 impl，避免 13 个 provider × 3 方法的手写重复。
-// 每个 impl 都是「调 helper::xxx(self.client, …)」的一行转发。
-macro_rules! impl_provider_runtime {
-    ($ty:ty) => {
-        impl ProviderRuntime for $ty {
-            fn stream_chat(
-                &self,
-                model: &str,
-                prompt: Message,
-                history: Vec<Message>,
-                handle: Option<ToolServerHandle>,
-                opts: &AgentOpts,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = AgentResult<ChatStream>> + Send>,
-            > {
-                let c = self.0.clone();
-                let model = model.to_string();
-                let opts = opts.clone();
-                Box::pin(async move {
-                    helper::stream_chat(&c, &model, prompt, history, handle, &opts).await
-                })
-            }
-            fn stream_with_memory(
-                &self,
-                model: &str,
-                prompt: Message,
-                conversation_id: String,
-                memory: Option<Arc<dyn rig::memory::ConversationMemory>>,
-                handle: Option<ToolServerHandle>,
-                opts: &AgentOpts,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = AgentResult<ChatStream>> + Send>,
-            > {
-                let c = self.0.clone();
-                let model = model.to_string();
-                let opts = opts.clone();
-                Box::pin(async move {
-                    helper::stream_with_memory(
-                        &c, &model, prompt, conversation_id, memory, handle, &opts,
-                    )
-                    .await
-                })
-            }
-            fn prompt_text(
-                &self,
-                model: &str,
-                prompt: String,
-                opts: &AgentOpts,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = AgentResult<String>> + Send>,
-            > {
-                let c = self.0.clone();
-                let model = model.to_string();
-                let opts = opts.clone();
-                Box::pin(async move { helper::prompt_text(&c, &model, prompt, &opts).await })
-            }
-        }
-    };
+// ── 各 provider 的 ModelFactory 实现 ─────────────────────────────
+
+/// OpenAI 形协议 runtime（官方 + 一切兼容端点）。
+///
+/// `responses=true` 走官方 Responses API；其余兼容端点走 Chat Completions。
+/// dialect 决定 base_url/鉴权/capability quirks（DeepSeek 单 chunk tool call 等）。
+struct OpenAiShaped {
+    client: openai::OpenAI,
+    responses: bool,
 }
 
-/// 各 provider 的 client 包装（newtype 供宏 impl）。
-struct OpenAiClient(openai::Client);          // Responses API
-struct OpenAiCompletionsClient(openai::CompletionsClient); // Completions API（兼容端点）
-struct AnthropicClient(anthropic::Client);
-struct GeminiClient(gemini::Client);
-struct DeepSeekClient(deepseek::Client);
-struct XaiClient(xai::Client);
-struct GroqClient(groq::Client);
-struct OpenRouterClient(openrouter::Client);
-struct OllamaClient(ollama::Client);
-struct MoonshotClient(moonshot::Client);
-struct ZaiClient(zai::Client);
-struct MistralClient(mistral::Client);
-struct CohereClient(cohere::Client);
-struct PerplexityClient(perplexity::Client);
+impl ModelFactory for OpenAiShaped {
+    fn build_model(&self, name: &str) -> rig::DynModel<rig::operation::Completion> {
+        if self.responses {
+            self.client.responses(name).erase()
+        } else {
+            self.client.chat(name).erase()
+        }
+    }
+}
 
-impl_provider_runtime!(OpenAiClient);
-impl_provider_runtime!(OpenAiCompletionsClient);
-impl_provider_runtime!(AnthropicClient);
-impl_provider_runtime!(GeminiClient);
-impl_provider_runtime!(DeepSeekClient);
-impl_provider_runtime!(XaiClient);
-impl_provider_runtime!(GroqClient);
-impl_provider_runtime!(OpenRouterClient);
-impl_provider_runtime!(OllamaClient);
-impl_provider_runtime!(MoonshotClient);
-impl_provider_runtime!(ZaiClient);
-impl_provider_runtime!(MistralClient);
-impl_provider_runtime!(CohereClient);
-impl_provider_runtime!(PerplexityClient);
+/// Anthropic（Messages API 原生协议）。
+struct AnthropicClient(anthropic::Anthropic);
+impl ModelFactory for AnthropicClient {
+    fn build_model(&self, name: &str) -> rig::DynModel<rig::operation::Completion> {
+        self.0.completion(name).erase()
+    }
+}
+
+/// Gemini（Generative AI 原生协议）。
+struct GeminiClient(gemini::Gemini);
+impl ModelFactory for GeminiClient {
+    fn build_model(&self, name: &str) -> rig::DynModel<rig::operation::Completion> {
+        self.0.completion(name).erase()
+    }
+}
+
+/// Cohere（原生协议）。
+struct CohereClient(cohere::Cohere);
+impl ModelFactory for CohereClient {
+    fn build_model(&self, name: &str) -> rig::DynModel<rig::operation::Completion> {
+        self.0.completion(name).erase()
+    }
+}
+
+/// Ollama（本地；OpenAI 兼容 chat 路由）。
+struct OllamaClient(ollama::Ollama);
+impl ModelFactory for OllamaClient {
+    fn build_model(&self, name: &str) -> rig::DynModel<rig::operation::Completion> {
+        self.0.completion(name).erase()
+    }
+}
 
 /// 对话服务。持有一个已配置好的 provider runtime（trait object，一期单 provider）
 /// + 可选工具句柄 + 可选 memory/联邦/skill。
+#[derive(Clone)]
 pub struct ChatService {
     runtime: Arc<dyn ProviderRuntime>,
     config: ProviderConfig,
@@ -447,6 +371,9 @@ pub struct ChatService {
     /// 可选 Skill 管理器（决策 20）。set_skill_manager 后保存，
     /// stream_with_memory 时构造 preamble Tier 1 + active skill doc_paths。
     skill_manager: Option<Arc<crate::skill::SkillManager>>,
+    /// 当前压缩策略使用的上下文窗口（token）。set_memory 时记录，
+    /// 供 UI 展示用量百分比（「28k/128k tok」）。0 = 未注入 memory（未知）。
+    context_window: usize,
 }
 
 impl ChatService {
@@ -471,12 +398,70 @@ impl ChatService {
             ontology_store: None,
             ttl_store: None,
             skill_manager: None,
+            context_window: 0,
         })
     }
 
     /// 更新工具句柄（运行时动态增减 MCP server 后调用）。
     pub fn set_tool_handle(&mut self, handle: Option<ToolServerHandle>) {
         self.tool_handle = handle;
+    }
+
+    /// 单次非流式 LLM 调用（B/A 评审共用管道，即用即弃）。
+    ///
+    /// 对应 VALIDATION-DESIGN.md「编排驱动 + 多 LLM 路由」：对抗流程的每一步
+    /// 是独立上下文的一次调用——不同 role（Generator/Verifier）只换 model + prompt，
+    /// 无常驻 agent、无对话历史（保证 B 看不到 A 的思考过程）。
+    ///
+    /// `model`: provider 内的模型名（如 "glm-5.3-flash" / "deepseek-r1"）。
+    /// `preamble`: 角色系统提示词（B 用独立审计视角，不含建模方法论）。
+    /// `prompt`: 用户侧输入（评审任务 / 修订任务）。
+    pub async fn run_llm_prompt(
+        &self,
+        model: &str,
+        preamble: &str,
+        prompt: &str,
+    ) -> AgentResult<String> {
+        let mut opts = make_opts(None, &self.config);
+        opts.preamble = Some(preamble.to_string());
+        // 校验对抗的非流式长请求（整本 Turtle 进出）曾长期挂死——
+        // 改为流式接收 + 本地聚合：连接上持续有数据流动，网关不会掐；
+        // read_timeout 只要求「每 2 分钟内要有新数据」，总上限 30min。
+        self.run_llm_prompt_streamed(model, preamble, prompt).await
+    }
+
+    /// 流式单轮 prompt：与 run_llm_prompt 同参，但底层走 SSE 流式，
+    /// 逐 chunk 聚合文本后一次性返回。 reasoning 增量丢弃。
+    pub async fn run_llm_prompt_streamed(
+        &self,
+        model: &str,
+        preamble: &str,
+        prompt: &str,
+    ) -> AgentResult<String> {
+        let stream = helper::stream_chat(
+            self.runtime.build_model(model),
+            text_prompt(prompt),
+            Vec::new(),
+            None,
+            &opts_from(preamble, &self.config),
+        )
+        .await?;
+        let mut s = stream;
+        let mut out = String::new();
+        while let Some(chunk) = s.next().await {
+            match chunk.kind {
+                StreamKind::TextDelta => out.push_str(&chunk.text),
+                StreamKind::Error => {
+                    return Err(AgentError::Provider(if chunk.text.is_empty() {
+                        "provider stream error".to_string()
+                    } else {
+                        chunk.text
+                    }))
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
     }
 
     /// 注入 memory backend（带 CompactingMemory 自动压缩）。
@@ -495,6 +480,12 @@ impl ChatService {
             summarize,
         );
         self.memory = Some(std::sync::Arc::new(compacting));
+        self.context_window = context_window;
+    }
+
+    /// 当前压缩策略使用的上下文窗口（token）。0 = 未注入 memory（未知）。
+    pub fn context_window(&self) -> usize {
+        self.context_window
     }
 
     pub fn config(&self) -> &ProviderConfig {
@@ -557,9 +548,14 @@ impl ChatService {
     ) -> AgentResult<std::pin::Pin<Box<dyn Stream<Item = StreamChunk> + Send>>> {
         let handle = self.tool_handle.clone();
         let opts = make_opts(self.reasoning_params(), &self.config);
-        self.runtime
-            .stream_chat(&self.config.model, prompt, history, handle, &opts)
-            .await
+        helper::stream_chat(
+            self.runtime.build_model(&self.config.model),
+            prompt,
+            history,
+            handle,
+            &opts,
+        )
+        .await
     }
 
     /// 发起流式对话（memory 模式）。
@@ -668,10 +664,11 @@ impl ChatService {
         let handle = if !all_tools.is_empty() {
             // 复用已有 MCP handle，或新建空 ToolServer。两者都能 add_dynamic_tool。
             let h = handle.clone().unwrap_or_else(|| {
-                rig::tool::server::ToolServer::new().run()
+                rig::agent::tool::server::ToolServer::new().run()
             });
             for tool in all_tools {
-                h.add_dynamic_tool(tool).await;
+                // 0.44：add_dynamic_tool 同步（不再 async）
+                h.add_dynamic_tool(tool);
             }
             Some(h)
         } else {
@@ -696,16 +693,15 @@ impl ChatService {
         };
         let mut opts = make_opts(reasoning_params.clone(), &self.config);
         opts.preamble = if preamble.is_empty() { None } else { Some(preamble) };
-        self.runtime
-            .stream_with_memory(
-                &self.config.model,
-                prompt,
-                conv_id,
-                memory.clone(),
-                handle,
-                &opts,
-            )
-            .await
+        helper::stream_with_memory(
+            self.runtime.build_model(&self.config.model),
+            prompt,
+            conv_id,
+            memory.clone(),
+            handle,
+            &opts,
+        )
+        .await
     }
 
     /// 按 provider kind 构造开启深度思考的 additional_params。
@@ -760,8 +756,7 @@ impl ChatService {
             let model = model.clone();
             let opts = opts.clone();
             Box::pin(async move {
-                runtime
-                    .prompt_text(&model, text, &opts)
+                helper::prompt_text(runtime.build_model(&model), text, &opts)
                     .await
                     .map_err(|e| format!("summarize: {e}"))
             }) as _
@@ -781,9 +776,7 @@ impl ChatService {
              --- 对话历史 ---\n{text}"
         );
         let opts = make_opts(None, &self.config);
-        self.runtime
-            .prompt_text(&self.config.model, prompt, &opts)
-            .await
+        helper::prompt_text(self.runtime.build_model(&self.config.model), prompt, &opts).await
     }
 
     /// 用首条用户消息生成会话标题（LLM 概括，非原文截断）。
@@ -819,164 +812,139 @@ impl ChatService {
              用户消息：\n{trimmed}"
         );
         let opts = make_opts(None, &self.config);
-        let raw = self
-            .runtime
-            .prompt_text(&self.config.model, prompt, &opts)
-            .await
-            .map_err(|e| AgentError::Provider(format!("generate_title: {e}")))?;
+        let raw = helper::prompt_text(
+            self.runtime.build_model(&self.config.model),
+            prompt,
+            &opts,
+        )
+        .await
+        .map_err(|e| AgentError::Provider(format!("generate_title: {e}")))?;
         Ok(clean_title(&raw))
     }
 }
 
+
+/// 统一 HTTP 后端（带超时 + 可选默认 headers）→ rig 传输对象。
+///
+/// 整本体修订/八维度评审等非流式长请求单次可跑数分钟，默认 reqwest::Client
+/// 无超时——被网关/代理掐掉时表现为 `error sending request`。显式配：
+/// 连接 30s、读间隔 120s（流式下每个 chunk 重置）、总时长 30min。
+/// `extra_headers` 作为 reqwest 默认头合并（OpenRouter X-Title、anthropic-beta 等）。
+fn provider_transport(
+    extra_headers: Option<http::HeaderMap>,
+) -> AgentResult<rig::http_client::ReqwestClient> {
+    let mut b = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(1800));
+    if let Some(h) = extra_headers {
+        b = b.default_headers(h);
+    }
+    let client = b
+        .build()
+        .map_err(|e| AgentError::Provider(format!("http transport build: {e}")))?;
+    Ok(rig::http_client::ReqwestClient::from(client))
+}
+
+fn extra_header_map(
+    extra: &Option<std::collections::HashMap<String, String>>,
+) -> Option<http::HeaderMap> {
+    use http::HeaderMap;
+    let map = extra.as_ref()?;
+    let mut h = HeaderMap::new();
+    for (k, v) in map {
+        if let (Ok(name), Ok(val)) = (
+            http::HeaderName::from_bytes(k.as_bytes()),
+            http::HeaderValue::from_str(v),
+        ) {
+            h.insert(name, val);
+        }
+    }
+    Some(h)
+}
+
 /// 按配置构造 provider runtime（trait object）。
 ///
-/// 内部按 `kind` 路由到 rig 原生 provider client：
-///   - OpenAI 官方走 `responses_api()`，其余 OpenAI 兼容走 `completions_api()`
-///   - DeepSeek/XAI/Groq/OpenRouter/Ollama/Moonshot/Mistral/Cohere/Perplexity 各走 rig 原生 provider
-///     （自动声明 capability：SUPPORTS_TOOLS / EMITS_COMPLETE_SINGLE_CHUNK_TOOL_CALLS 等）
-///   - Gemini 走 Google Generative AI 协议
-///   - Anthropic 走 Messages API
-///   - OpenAiCompatible 兆底：用 openai::Client + completions_api + 用户自定义 base_url
+/// 内部按 `kind` 路由到 rig 0.44 原生 provider client：
+///   - OpenAI 官方走 Responses API（`.responses()`），其余 OpenAI 兼容走 Chat
+///     Completions（`.chat()`）；OpenAI 形 vendor 全部经 `OpenAIConfig::with_key(dialect)`
+///     构造（0.44 的 vendor = openai::OpenAI + Dialect，capability quirks 由 dialect 声明）
+///   - Anthropic 走 Messages API；Gemini 走 Generative AI；Cohere 原生；Ollama 本地
+///   - OpenAiCompatible 兆底：OPENAI dialect + 用户自定义 base_url + Chat 路由
 ///
-/// `extra_headers` 合并进 client builder；`base_url` 覆盖 rig 默认。
-/// `supports_developer_role=false` 对 OpenAI 兼容端点调 `with_system_instructions_as_messages()`
-/// （rig 0.41 提供，把 system 指令作为 user message 发送而非 top-level instructions）。
+/// `extra_headers` 并入 reqwest 默认头；`base_url` 覆盖 dialect 默认。
+/// `supports_developer_role=false` 时对 OpenAIConfig 调
+/// `with_system_instructions_as_messages()`（0.44 语义同 0.41：system 指令作为
+/// messages 发送而非 top-level instructions）。
 fn build_runtime(config: &ProviderConfig) -> AgentResult<Arc<dyn ProviderRuntime>> {
-    use http::HeaderMap;
     use crate::provider::ProviderKind as K;
+    use rig::providers::openai::wire as oai_wire;
 
-    // 构造自定义 headers（如有）
-    let make_headers = |extra: &Option<std::collections::HashMap<String, String>>| {
-        if let Some(map) = extra {
-            let mut h = HeaderMap::new();
-            for (k, v) in map {
-                if let (Ok(name), Ok(val)) = (
-                    http::HeaderName::from_bytes(k.as_bytes()),
-                    http::HeaderValue::from_str(v),
-                ) {
-                    h.insert(name, val);
-                }
-            }
-            Some(h)
-        } else {
-            None
+    let http = provider_transport(extra_header_map(&config.extra_headers))?;
+    let api_key = config.api_key.clone();
+    let base_url = config.base_url.clone();
+
+    // OpenAI 形协议：dialect + base_url 覆盖 + developer-role 降级。
+    let openai_shaped = |dialect: &'static oai_wire::Dialect,
+                         responses: bool|
+     -> AgentResult<OpenAiShaped> {
+        let mut cfg = oai_wire::OpenAIConfig::with_key(dialect, api_key.clone());
+        if let Some(url) = &base_url {
+            cfg = cfg.with_base_url(url);
         }
-    };
-    let headers = make_headers(&config.extra_headers);
-    let api_key = &config.api_key;
-    let base_url = config.base_url.as_deref();
-    let kind = config.kind;
-
-    macro_rules! apply_common {
-        ($b:expr) => {{
-            let mut b = $b;
-            if let Some(url) = base_url {
-                b = b.base_url(url);
-            }
-            if let Some(h) = &headers {
-                b = b.http_headers(h.clone());
-            }
-            b
-        }};
-    }
-
-    // OpenAI 协议族的 client 构造（统一返回 openai::Client，再按 kind 切 completions/responses）
-    let build_openai = |ext_kind: K| -> AgentResult<openai::Client> {
-        let builder = apply_common!(openai::Client::builder().api_key(api_key.clone()));
-        let client = builder
-            .build()
-            .map_err(|e| AgentError::Provider(format!("{} client build: {e}", ext_kind.as_str())))?;
-        // OpenAI 兼容端点不支持 developer role 时，降级为 system messages
         if !config.effective_supports_developer_role() {
-            return Ok(client.with_system_instructions_as_messages());
+            cfg = cfg.with_system_instructions_as_messages();
         }
-        Ok(client)
+        Ok(OpenAiShaped {
+            client: cfg.connect(http.clone()),
+            responses,
+        })
     };
 
-    let runtime: Arc<dyn ProviderRuntime> = match kind {
-        K::OpenAi => {
-            // 官方端点走 Responses API（rig 默认）
-            let c = build_openai(K::OpenAi)?;
-            Arc::new(OpenAiClient(c))
-        }
-        K::DeepSeek => {
-            let c = apply_common!(deepseek::Client::builder().api_key(api_key.clone()))
-                .build()
-                .map_err(|e| AgentError::Provider(format!("deepseek client build: {e}")))?;
-            Arc::new(DeepSeekClient(c))
-        }
-        K::Xai => {
-            let c = apply_common!(xai::Client::builder().api_key(api_key.clone()))
-                .build()
-                .map_err(|e| AgentError::Provider(format!("xai client build: {e}")))?;
-            Arc::new(XaiClient(c))
-        }
-        K::Groq => {
-            let c = apply_common!(groq::Client::builder().api_key(api_key.clone()))
-                .build()
-                .map_err(|e| AgentError::Provider(format!("groq client build: {e}")))?;
-            Arc::new(GroqClient(c))
-        }
-        K::OpenRouter => {
-            let c = apply_common!(openrouter::Client::builder().api_key(api_key.clone()))
-                .build()
-                .map_err(|e| AgentError::Provider(format!("openrouter client build: {e}")))?;
-            Arc::new(OpenRouterClient(c))
-        }
+    let runtime: Arc<dyn ProviderRuntime> = match config.kind {
+        // 官方端点走 Responses API（rig 默认路由）
+        K::OpenAi => Arc::new(openai_shaped(&oai_wire::OPENAI, true)?),
+        K::DeepSeek => Arc::new(openai_shaped(&oai_wire::DEEPSEEK, false)?),
+        K::Xai => Arc::new(openai_shaped(&rig::providers::xai::DIALECT, false)?),
+        K::Groq => Arc::new(openai_shaped(&oai_wire::GROQ, false)?),
+        K::OpenRouter => Arc::new(openai_shaped(&oai_wire::OPENROUTER, false)?),
+        K::Moonshot => Arc::new(openai_shaped(&oai_wire::MOONSHOT, false)?),
+        // 智谱 GLM：rig ZAI dialect，默认 base https://api.z.ai/api/paas/v4，
+        // 用户可改 base_url 指向国内 bigmodel.cn 兼容端点
+        K::Zhipu => Arc::new(openai_shaped(&oai_wire::ZAI, false)?),
+        K::Mistral => Arc::new(openai_shaped(&oai_wire::MISTRAL, false)?),
+        K::Perplexity => Arc::new(openai_shaped(&oai_wire::PERPLEXITY, false)?),
+        // 兆底：OpenAI 兼容端点，走 Chat Completions + 自定义 base_url
+        K::OpenAiCompatible => Arc::new(openai_shaped(&oai_wire::OPENAI, false)?),
         K::Ollama => {
-            let c = apply_common!(ollama::Client::builder().api_key(api_key.clone()))
-                .build()
-                .map_err(|e| AgentError::Provider(format!("ollama client build: {e}")))?;
-            Arc::new(OllamaClient(c))
-        }
-        K::Moonshot => {
-            let c = apply_common!(moonshot::Client::builder().api_key(api_key.clone()))
-                .build()
-                .map_err(|e| AgentError::Provider(format!("moonshot client build: {e}")))?;
-            Arc::new(MoonshotClient(c))
-        }
-        K::Zhipu => {
-            // 智谱 GLM：rig zai provider，默认 base https://api.z.ai/api/paas/v4
-            // 用户可改 base_url 指向国内 bigmodel.cn 兼容端点
-            let c = apply_common!(zai::Client::builder().api_key(api_key.clone()))
-                .build()
-                .map_err(|e| AgentError::Provider(format!("zhipu/zai client build: {e}")))?;
-            Arc::new(ZaiClient(c))
-        }
-        K::Mistral => {
-            let c = apply_common!(mistral::Client::builder().api_key(api_key.clone()))
-                .build()
-                .map_err(|e| AgentError::Provider(format!("mistral client build: {e}")))?;
-            Arc::new(MistralClient(c))
-        }
-        K::Cohere => {
-            let c = apply_common!(cohere::Client::builder().api_key(api_key.clone()))
-                .build()
-                .map_err(|e| AgentError::Provider(format!("cohere client build: {e}")))?;
-            Arc::new(CohereClient(c))
-        }
-        K::Perplexity => {
-            let c = apply_common!(perplexity::Client::builder().api_key(api_key.clone()))
-                .build()
-                .map_err(|e| AgentError::Provider(format!("perplexity client build: {e}")))?;
-            Arc::new(PerplexityClient(c))
+            // OllamaConfig { base_url, api_key }；默认本地 daemon，base_url 可覆盖
+            let mut cfg = ollama::OllamaConfig::new();
+            if let Some(url) = &base_url {
+                cfg.base_url = url.clone();
+            }
+            cfg.api_key = api_key.into();
+            Arc::new(OllamaClient(cfg.connect(http)))
         }
         K::Anthropic => {
-            let c = apply_common!(anthropic::Client::builder().api_key(api_key.clone()))
-                .build()
-                .map_err(|e| AgentError::Provider(format!("anthropic client build: {e}")))?;
-            Arc::new(AnthropicClient(c))
+            let mut cfg = anthropic::AnthropicConfig::new(api_key);
+            if let Some(url) = &base_url {
+                cfg = cfg.with_base_url(url);
+            }
+            Arc::new(AnthropicClient(cfg.connect(http)))
         }
         K::Gemini => {
-            let c = apply_common!(gemini::Client::builder().api_key(api_key.clone()))
-                .build()
-                .map_err(|e| AgentError::Provider(format!("gemini client build: {e}")))?;
-            Arc::new(GeminiClient(c))
+            let mut cfg = gemini::GeminiConfig::new(api_key);
+            if let Some(url) = &base_url {
+                cfg = cfg.with_base_url(url);
+            }
+            Arc::new(GeminiClient(cfg.connect(http)))
         }
-        K::OpenAiCompatible => {
-            // 兆底：OpenAI 兼容端点，走 Completions API
-            let c = build_openai(K::OpenAiCompatible)?.completions_api();
-            Arc::new(OpenAiCompletionsClient(c))
+        K::Cohere => {
+            let mut cfg = cohere::CohereConfig::new(api_key);
+            if let Some(url) = &base_url {
+                cfg = cfg.with_base_url(url);
+            }
+            Arc::new(CohereClient(cfg.connect(http)))
         }
     };
     Ok(runtime)
@@ -1021,99 +989,123 @@ fn clean_title(raw: &str) -> String {
 
 // ── 流转换：MultiTurnStreamItem → StreamChunk ──────────────────
 
-/// 把 Rig 的 `MultiTurnStreamItem` 流映射为统一的 `StreamChunk` 流。
+// ── 流转换：MultiTurnStreamItem → StreamChunk ──────────────────
+
+/// 把 Rig 0.44 的 `MultiTurnStreamItem` 流映射为统一的 `StreamChunk` 流。
 ///
-/// 一期只关心：StreamAssistantItem(Text/Reasoning delta) / FinalResponse(→Done)。
-/// ToolCall/ToolExecutionStart 属二期 ToolCallCard，当前忽略。
-fn map_multi_turn_stream<S, R>(stream: S) -> impl Stream<Item = StreamChunk> + Send
+/// 关注：
+///   - StreamAssistantItem(Item<StreamEvent>)：Text/Reasoning 增量（Text/Reasoning
+///     事件）；工具调用的最终形态在 End{content: AssistantContent::ToolCall} 一次性
+///     到达（Start 只带名字，Arguments 增量我们不外发）
+///   - ToolCall{tool_call}：turn 提交时模型已完成的调用（与 End 去重后补发 Start）
+///   - ToolExecutionCommitted / ToolResult：工具执行与结果（0.44 以 call id 关联，
+///     ToolResult 自带 is_error，不再依赖 "[tool error]" 前缀还原）
+///   - CompletionCall：provider 报告的真实 token usage
+///   - FinalResponse：正常收尾
+fn map_multi_turn_stream<S>(stream: S) -> impl Stream<Item = StreamChunk> + Send
 where
-    S: Stream<Item = Result<MultiTurnStreamItem<R>, StreamingError>> + Send + 'static,
-    R: Clone + Unpin + Send + 'static,
+    S: Stream<Item = Result<MultiTurnStreamItem, rig::completion::PromptError>> + Send + 'static,
 {
     async_stream::stream! {
+        use rig::completion::message::AssistantContent as AC;
         let mut s = Box::pin(stream);
         let mut got_final = false;
         let mut errored = false;
-        // 记录 internal_call_id → (name, arguments)，供 ToolResult 关联
+        // call_id → info，供 ToolResult 关联（Start 补发去重）
         let mut pending: std::collections::HashMap<String, ToolCallInfo> = std::collections::HashMap::new();
         while let Some(item) = s.next().await {
             match item {
-                Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => {
-                    match content {
-                        StreamedAssistantContent::Text(t) => {
-                            yield StreamChunk::text_delta(t.text);
+                Ok(MultiTurnStreamItem::StreamAssistantItem(item)) => {
+                    let rig::streaming::Item::Event(ev) = item else { continue };
+                    match ev {
+                        StreamEvent::Text { text, .. } => {
+                            yield StreamChunk::text_delta(text);
                         }
-                        StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
-                            yield StreamChunk::reasoning_delta(reasoning);
+                        StreamEvent::Reasoning { text, .. } => {
+                            yield StreamChunk::reasoning_delta(text);
                         }
-                        StreamedAssistantContent::Reasoning(r) => {
-                            for c in &r.content {
-                                if let Some(t) = reasoning_text(c) {
-                                    yield StreamChunk::reasoning_delta(t);
+                        StreamEvent::End { content, .. } => {
+                            // 文本/思考的完整内容已通过增量发出，这里只取工具调用的最终形态
+                            if let AC::ToolCall(tool_call) = content {
+                                let info = ToolCallInfo {
+                                    name: tool_call.function.name.to_string(),
+                                    arguments: serde_json::Value::Object(tool_call.function.arguments.clone()).to_string(),
+                                    call_id: tool_call.id.to_string(),
+                                    result: None,
+                                    is_error: false,
+                                };
+                                if !pending.contains_key(&info.call_id) {
+                                    pending.insert(info.call_id.clone(), info.clone());
+                                    yield StreamChunk::tool_call_start(info);
                                 }
                             }
                         }
-                        StreamedAssistantContent::ToolCall { tool_call, internal_call_id } => {
-                            // 模型决定调用工具（即将执行）。记录以便 Result 关联。
-                            let info = ToolCallInfo {
-                                name: tool_call.function.name.clone(),
-                                arguments: tool_call.function.arguments.to_string(),
-                                call_id: internal_call_id.clone(),
-                                result: None,
-                                is_error: false,
-                            };
-                            pending.insert(internal_call_id.clone(), info.clone());
-                            yield StreamChunk::tool_call_start(info);
-                        }
-                        // ToolCallDelta（参数增量）/ Final / Unknown：不向外发
+                        // Start（part 开启，仅名字）/ Arguments（参数 JSON 增量）：不外发
                         _ => {}
                     }
                 }
-                Ok(MultiTurnStreamItem::ToolExecutionCommitted { tool_call, internal_call_id, .. }) => {
-                    // Rig 已执行并提交工具调用（0.41 重命名 ToolExecutionStart → ToolExecutionCommitted）。
-                    // 对前端而言，Start 信号已在 ToolCall 时发出，这里不重复；
-                    // 但若 ToolCall 未收到（某些 provider 路径），补发。
-                    if !pending.contains_key(&internal_call_id) {
+                Ok(MultiTurnStreamItem::ToolCall { tool_call }) => {
+                    // turn 提交时模型完成的调用（End 已发过则去重）
+                    let id = tool_call.id.to_string();
+                    if !pending.contains_key(&id) {
                         let info = ToolCallInfo {
-                            name: tool_call.function.name.clone(),
-                            arguments: tool_call.function.arguments.to_string(),
-                            call_id: internal_call_id.clone(),
+                            name: tool_call.function.name.to_string(),
+                            arguments: serde_json::Value::Object(tool_call.function.arguments.clone()).to_string(),
+                            call_id: id,
                             result: None,
                             is_error: false,
                         };
-                        pending.insert(internal_call_id.clone(), info.clone());
+                        pending.insert(info.call_id.clone(), info.clone());
                         yield StreamChunk::tool_call_start(info);
                     }
                 }
-                Ok(MultiTurnStreamItem::StreamUserItem(user_content)) => {
-                    // 工具执行结果（StreamedUserContent 当前仅 ToolResult 变体）
-                    use rig::streaming::StreamedUserContent;
-                    let StreamedUserContent::ToolResult { tool_result, internal_call_id } = user_content;
+                Ok(MultiTurnStreamItem::ToolExecutionCommitted { tool_call, .. }) => {
+                    // Rig 已执行并提交该调用。Start 信号已在 End/ToolCall 时发出，这里只补漏。
+                    let id = tool_call.id.to_string();
+                    if !pending.contains_key(&id) {
+                        let info = ToolCallInfo {
+                            name: tool_call.function.name.to_string(),
+                            arguments: serde_json::Value::Object(tool_call.function.arguments.clone()).to_string(),
+                            call_id: id,
+                            result: None,
+                            is_error: false,
+                        };
+                        pending.insert(info.call_id.clone(), info.clone());
+                        yield StreamChunk::tool_call_start(info);
+                    }
+                }
+                Ok(MultiTurnStreamItem::ToolResult { tool_result }) => {
+                    // 工具执行结果（0.44 以 call id 关联，替代 0.41 的 StreamUserItem）
                     let result_text = tool_result_content_to_text(&tool_result.content);
-                    if let Some(mut info) = pending.remove(&internal_call_id) {
+                    // 0.44 ToolResult 自带 is_error，前端据此渲染红色错误卡片
+                    let is_error = tool_result.is_error;
+                    let id = tool_result.call.to_string();
+                    if let Some(mut info) = pending.remove(&id) {
                         info.result = Some(result_text.clone());
+                        info.is_error = is_error;
                         yield StreamChunk::tool_call_result(result_text, info);
                     } else {
                         // 未匹配到 Start（异常），仍发出结果
                         let info = ToolCallInfo {
-                            name: String::new(),
+                            name: tool_result.name.to_string(),
                             arguments: String::new(),
-                            call_id: internal_call_id.clone(),
+                            call_id: id,
                             result: Some(result_text.clone()),
-                            is_error: false,
+                            is_error,
                         };
                         yield StreamChunk::tool_call_result(result_text, info);
                     }
                 }
                 Ok(MultiTurnStreamItem::CompletionCall(call)) => {
-                    // 二期 B1：provider 报告的真实 token usage。
-                    // rig 的 Usage 以 0 为“未报告”哨兵（has_values() 判定），
+                    // 二期 B1：provider 报告的真实 token usage（0.44 为 Option，None=未报告）。
                     // 仅在 provider 真的报了用量时才向外发，避免落库伪 0 值。
-                    if call.usage.has_values() {
+                    if call.usage.input_tokens.is_some() || call.usage.output_tokens.is_some() {
                         yield StreamChunk::usage(TokenUsage {
-                            input_tokens: call.usage.input_tokens,
-                            output_tokens: call.usage.output_tokens,
-                            total_tokens: call.usage.total_tokens,
+                            input_tokens: call.usage.input_tokens.unwrap_or(0),
+                            output_tokens: call.usage.output_tokens.unwrap_or(0),
+                            total_tokens: call.usage.total_tokens.unwrap_or(
+                                call.usage.input_tokens.unwrap_or(0) + call.usage.output_tokens.unwrap_or(0),
+                            ),
                         });
                     }
                 }
@@ -1122,7 +1114,7 @@ where
                     yield StreamChunk::done();
                 }
                 Ok(_) => {
-                    // 其他未知变体（未来 rig 新增），安全忽略
+                    // 其他未知变体（ToolResult 已单列；ModelTurnRetried 等），安全忽略
                 }
                 Err(e) => {
                     errored = true;
@@ -1138,13 +1130,11 @@ where
     }
 }
 
-/// 把 `ToolResult.content`（OneOrMany<ToolResultContent>）拼成模型可见文本。
-fn tool_result_content_to_text(
-    content: &rig::OneOrMany<rig::completion::message::ToolResultContent>,
-) -> String {
+/// 把 `ToolResult.content`（Vec<ToolResultContent>）拼成模型可见文本。
+fn tool_result_content_to_text(content: &[rig::completion::message::ToolResultContent]) -> String {
     use rig::completion::message::ToolResultContent;
     let mut buf = String::new();
-    for c in content.iter() {
+    for c in content {
         match c {
             ToolResultContent::Text(t) => {
                 if !buf.is_empty() {
@@ -1159,7 +1149,7 @@ fn tool_result_content_to_text(
                 buf.push_str("[image]");
             }
             ToolResultContent::Json { value } => {
-                // 0.41 新增变体：结构化 JSON 结果。序列化为字符串拼入。
+                // 结构化 JSON 结果。序列化为字符串拼入。
                 if !buf.is_empty() {
                     buf.push('\n');
                 }
@@ -1169,17 +1159,6 @@ fn tool_result_content_to_text(
     }
     buf
 }
-
-/// 从 `ReasoningContent` 提取文本（Text/Summary 变体）。
-fn reasoning_text(content: &rig::completion::message::ReasoningContent) -> Option<String> {
-    use rig::completion::message::ReasoningContent;
-    match content {
-        ReasoningContent::Text { text, .. } => Some(text.clone()),
-        ReasoningContent::Summary(s) => Some(s.clone()),
-        _ => None,
-    }
-}
-
 // ── 便利：memory MessageRow → rig Message ──────────────────────
 
 /// 纯文本历史 → Rig Message 列表（跳过 system 与未完成消息）。
@@ -1201,12 +1180,11 @@ pub fn text_history_to_messages(rows: &[memory::MessageRow]) -> Vec<Message> {
         })
         .map(|m| match m.role {
             MessageRole::User => Message::User {
-                content: rig::OneOrMany::one(UserContent::Text(m.content.clone().into())),
+                content: vec![UserContent::text(m.content.clone())],
             },
-            MessageRole::Assistant => Message::Assistant {
-                id: None,
-                content: rig::OneOrMany::one(AssistantContent::Text(m.content.clone().into())),
-            },
+            MessageRole::Assistant => Message::Assistant(
+                rig::completion::message::AssistantMessage::new(vec![AssistantContent::text(m.content.clone())]),
+            ),
             MessageRole::System => Message::System {
                 content: m.content.clone(),
             },
@@ -1226,13 +1204,13 @@ pub struct ContextImage {
 /// 构造一条纯文本 user prompt（避免上层直接依赖 rig）。
 pub fn text_prompt(content: impl Into<String>) -> Message {
     Message::User {
-        content: rig::OneOrMany::one(UserContent::Text(content.into().into())),
+        content: vec![UserContent::text(content)],
     }
 }
 
 /// 构造一条多模态 user prompt（文本 + 图片）。
 ///
-/// Rig 的 `Message::User.content` 是 `OneOrMany<UserContent>`，至少含一项。
+/// Rig 0.44 的 `Message::User.content` 是 `Vec<UserContent>`。
 /// 本函数按 [文本, 图片...] 顺序组装；无图片时退化为纯文本 prompt。
 pub fn multimodal_prompt(
     content: impl Into<String>,
@@ -1243,23 +1221,18 @@ pub fn multimodal_prompt(
     if images.is_empty() {
         return text_prompt(content);
     }
+    let mut parts: Vec<UserContent> = Vec::with_capacity(1 + images.len());
     // 首项：文本（用户问题）
-    let first = UserContent::text(content);
-    let mut parts: Vec<UserContent> = Vec::with_capacity(images.len());
+    parts.push(UserContent::text(content));
     for img in images {
-        let media_type = ImageMediaType::from_mime_type(&img.mime);
+        let media_type = <ImageMediaType as MimeType>::from_mime_type(&img.mime);
         parts.push(UserContent::image_base64(
             img.data_b64.clone(),
             media_type,
             None::<ImageDetail>,
         ));
     }
-    // OneOrMany::one + 多次 push 得到 [文本, 图1, 图2, ...]
-    let mut one = rig::OneOrMany::one(first);
-    for p in parts {
-        one.push(p);
-    }
-    Message::User { content: one }
+    Message::User { content: parts }
 }
 
 /// 取历史消息列表，拆分为 (不含最后一条的历史, 最后一条作为 prompt)。

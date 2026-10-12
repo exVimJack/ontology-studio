@@ -1,6 +1,7 @@
 name: Build & Release to GitCode
 
-# 双平台 CI 提速优化验证中（Dev Drive + rust-lld + Defender + CARGO_INCREMENTAL=0）。
+# 双平台 CI 提速优化验证中（rust-lld[Windows MSVC] + Defender；Dev Drive / sccache 已实测不适用）。
+# Windows MSVC 链接器统一在根 .cargo/config.toml 配置 rust-lld（本地 + CI 共享），见下方 optim 注释。
 
 # ─────────────────────────────────────────────────────────────
 # 方案1（修正版）：GitHub 公有 runner 编译 Win/macOS 包，
@@ -32,6 +33,12 @@ on:
       - "*.md"
       - "scripts/init-standalone-repo.sh"
 
+concurrency:
+  # 同一 ref（tag 或分支）同时只保留一个 run，新触发自动取消旧 run，
+  # 避免同一 commit 多次全量编译 + 重复传 GitCode 浪费 runner 分钟。
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write # 需写权限：在 GitHub 建 Release（原来只读因不发版）
 
@@ -62,10 +69,15 @@ jobs:
           # M1 的 50-60%，Rust 编译耗时翻倍（46m vs 20m）。Intel mac 用户可
           # 通过 Rosetta 运行 arm64 包，或后续按需重新启用。
     steps:
+      # Tauri 发版只需当前 commit 快照，不需要完整 git 历史，浅克隆省一点拉取时间
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
 
+      # ⚠️ 实验性：切 nightly 验证打包时间（2026-02 临时，对比完成后回 stable）
+      # 热缓存对照 run：nightly 依赖已入 cache，本次测热编译耗时
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           targets: ${{ matrix.target }}
 
@@ -74,9 +86,15 @@ jobs:
       #（github.com/andrewdavidmackenzie/flow/pull/2908 实测单此一项省 ~8%）。
       # 纯收益零风险，这是本项目唯一实测稳定的 Windows 提速措施。
       #
-      # ⚠️ 以下优化均实测不适用本项目（含 PDFium 原生库的 Tauri 项目），勿重复尝试：
-      # - rust-lld：链接阶段卡死/超慢（20min+ 未完成，cache 命中后仍卡），
-      #   rust-lld 对大型原生静态库兼容不佳，非环境问题（Defender 已排除）
+      # ⚠️ 设计说明：Windows MSVC 链接器已在根 .cargo/config.toml 统一切换为
+      #    rust-lld（本地 + CI 共享该 config），此处不再单独设置 linker。
+      #    历史教训（commit 3feb2c1 revert）：2026-08-24 曾实测 rust-lld 在本项目
+      #    完整 Tauri + PDFium 原生库上链接卡死（29min+ 未完成，link.exe 13m37s），
+      #    已回退。2026-08-25 本地端到端重测（全 workspace release 5m46s + src-tauri
+      #    exe 链接成功）后决定重新启用。若后续 CI 出现链接卡死/超慢，优先回退为
+      #    默认 link.exe（删 .cargo/config.toml 的 [target.x86_64-pc-windows-msvc]
+      #    linker 段），勿长期阻塞发版。
+      # 其他不适用于本项目的优化（勿重复尝试）：
       # - Dev Drive (samypr100/setup-dev-drive)：CARGO_TARGET_DIR 重定向到
       #   Dev Drive 后 swatinem cache 路径失配，每次全量重编，IO 优势抵不过
       #   全量重编代价；且 VHDX 默认 2GB 不足（需 14GB）
@@ -113,10 +131,13 @@ jobs:
       # 无需 CI 下载。版本固定 chromium/7881，升级时手动替换 + 改 scripts/fetch-pdfium.sh。
       # 详见 docs/RELEASE-GUIDE.md「PDFium 版本管理」。
 
-      # tauri-action 纯构建模式：不传 tagName/releaseName/releaseDraft，
-      # 只 build + 输出本地产物，不碰 GitHub Release
+      # tauri-action v1 纯构建模式（官方支持）：不传 tagName/releaseName/releaseDraft，
+      # 按官方文档「If you only want to build the app without having the action upload any
+      # assets, simply omit tagName」，仅执行 build + 输出本地产物，不碰 GitHub Release。
+      # Release 由后面的独立步骤（GitHub + GitCode）统一发布。
+      # （v1 相比 v0：node24 runtime 更新、输入集收敛，纯构建行为一致，已验证通过）
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -199,11 +220,22 @@ jobs:
           ## macOS 安装提示
           DMG 未签名，首次打开请右键 → 打开。"
           fi
-          # 上传所有资产到 GitHub Release
+          # 并行上传所有资产到 GitHub Release（与下方 GitCode 上传风格对齐，
+          # 大安装包并发 PUT 能显著缩短整体上传耗时）
+          pids=()
           for f in "${ASSETS[@]}"; do
             echo "上传 $(basename "$f")..."
-            gh release upload "$TAG" "$f" --repo "$REPO" --clobber
+            gh release upload "$TAG" "$f" --repo "$REPO" --clobber &
+            pids+=($!)
           done
+          fail=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || fail=1
+          done
+          if [ "$fail" = "1" ]; then
+            echo "❌ 有资产上传 GitHub Release 失败"
+            exit 1
+          fi
           echo "✅ GitHub Release $TAG 发布完成"
 
       # ── 创建/更新 GitCode Release ──

@@ -31,6 +31,12 @@ pub struct AppState {
     /// provider 配置（一期存内存 + tauri-plugin-store 持久化；二期落 SQLite 加密）
     pub provider_config: RwLock<Option<agent_core::ProviderConfig>>,
 
+    /// 校验者 B 的独立 provider 配置（§4.4 独立性）。None = 未配置（兜底用建模者配置）。
+    pub verifier_config: RwLock<Option<agent_core::ProviderConfig>>,
+
+    /// 校验者 B 的对话服务（从 verifier_config 构建；validation 命令的 B 评审走此通道）。
+    pub verifier_chat: RwLock<Option<std::sync::Arc<ChatService>>>,
+
     /// 共享工具句柄：MCP server 的工具注册到此，ChatService 构建时注入 agent。
     /// 始终存在（即使无 MCP server 也是空 handle），避免 Option 包裹。
     pub tool_handle: ToolServerHandle,
@@ -78,6 +84,8 @@ impl AppState {
             memory,
             chat: RwLock::new(None),
             provider_config: RwLock::new(None),
+            verifier_config: RwLock::new(None),
+            verifier_chat: RwLock::new(None),
             tool_handle,
             mcp: RwLock::new(None),
             federation: RwLock::new(None),
@@ -105,6 +113,8 @@ impl AppState {
             memory,
             chat: RwLock::new(None),
             provider_config: RwLock::new(None),
+            verifier_config: RwLock::new(None),
+            verifier_chat: RwLock::new(None),
             tool_handle,
             mcp: RwLock::new(None),
             federation: RwLock::new(None),

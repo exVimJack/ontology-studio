@@ -9,10 +9,17 @@
 //!
 //! 二期：MCP 工具系统（rmcp）、RAG、tool call 卡片。
 
+// datafusion `SessionContext::sql()` 返回的 async future 嵌套极深，
+// 经 federation_tools 的 Box::pin + 工具闭包组合后，auto-trait(Send) 递归深度
+// 超过默认 limit(128)，触发 rust-lang/rust#159228 的 future-incompatible lint
+// `recursion_depth_exceeding_limit`（未来将变硬错误）。256 是官方建议值。
+#![recursion_limit = "256"]
+
 pub mod chat;
 pub mod context_budget;
 pub mod context_window;
 pub mod document_tools;
+pub mod validation_llm;
 pub mod error;
 pub mod federation_tools;
 pub mod mcp;
@@ -34,13 +41,34 @@ pub use context_budget::{
 };
 // re-export rig 消息类型，供上层（src-tauri）不直接依赖 rig
 pub use rig::completion::message::{Message, UserContent};
+
+/// `DynamicTool` 构造便捷封装（0.44 迁移）。
+///
+/// 0.44 的 `DynamicTool::new` 要求 `ToolName`（非空 newtype，TryFrom 转换），
+/// 且回调只收 `Value` 单参（不再传 ToolContext）。内置工具名都是静态字面量，
+/// 统一在此转换并 panic-free 兑现（非空保证）。
+pub(crate) fn dynamic_tool(
+    name: &str,
+    description: impl Into<String>,
+    parameters: serde_json::Value,
+    callback: impl Fn(serde_json::Value)
+        -> rig::wasm_compat::WasmBoxedFuture<'static, Result<rig::tool::ToolOutput, rig::tool::ToolExecutionError>>
+        + Send
+        + Sync
+        + 'static,
+) -> rig::tool::DynamicTool {
+    let tool_name = rig::message::ToolName::new(name).expect("内置工具名非空");
+    rig::tool::DynamicTool::new(tool_name, description, parameters, callback)
+}
 pub use error::{AgentError, AgentResult};
 pub use mcp::{McpManager, McpServerConfig};
-pub use memory_bridge::{build_compacting_memory, LlmCompactor, SqliteMemory, SummaryArtifact, SummaryFn};
+pub use memory_bridge::{
+    build_compacting_memory, LlmCompactor, SqliteMemory, SummaryArtifact, SummaryFn,
+};
 pub use provider::{InputType, ProviderConfig, ProviderKind, ReasoningLevel, reasoning_to_params};
 pub use skill::{SkillManager, SkillRecord, SkillSource};
-// re-export rig 工具服务类型，供上层（src-tauri）不直接依赖 rig
-pub use rig::tool::server::{ToolServer, ToolServerHandle};
+// re-export rig 工具服务类型，供上层（src-tauri）不直接依赖 rig（0.44：ToolServer 移至 rig-agent）
+pub use rig::agent::tool::server::{ToolServer, ToolServerHandle};
 // re-export 上下文窗口解析（二期 B1）
 pub use context_window::{
     resolve_context_window, resolve_known_or_default, invalidate_cache, DEFAULT_CONTEXT_WINDOW,

@@ -22,9 +22,10 @@ import { SkillPopover } from "@/components/chat/SkillPopover";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
 import { useHasProvider, useProvider } from "@/hooks/useProvider";
+import { ContextUsageInline } from "@/components/chat/ContextUsageIndicator";
 import { useIngest } from "@/hooks/useIngest";
 import { useChat } from "@/hooks/useChat";
-import { useMountedDocuments } from "@/hooks/useMountedDocuments";
+import { useAllDocuments } from "@/hooks/useMountedDocuments";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import {
   useSkillsConversation,
@@ -33,6 +34,8 @@ import {
 import { useComposerStore } from "@/stores/composer-store";
 import { useUiStore } from "@/stores/ui-store";
 import { MentionMenu } from "@/components/chat/MentionMenu";
+import { SlashMenu } from "@/components/chat/SlashMenu";
+import { ShieldCheck } from "lucide-react";
 import { getFileIcon } from "@/lib/file-icons";
 import {
   resolveMentionedPaths,
@@ -41,133 +44,12 @@ import {
 import { isSkillActive } from "@/lib/domain";
 import { resizeImageToBase64 } from "@/lib/image-resize";
 import { validateImageSize } from "@/lib/context-budget";
+import {
+  IMAGE_EXTENSIONS,
+  ALL_EXTENSIONS,
+} from "@/lib/file-extensions";
+import { shortcut } from "@/lib/keyboard";
 
-/** 文档类扩展名（走 ingest 管道，提取文本）。与后端 dispatcher 的解析路由对齐。 */
-const DOC_EXTENSIONS = [
-  // PDF / Office / eBook
-  "pdf",
-  "docx",
-  "doc",
-  "pptx",
-  "ppt",
-  "xlsx",
-  "xls",
-  "epub",
-  // 文本 / Markdown / 日志
-  "txt",
-  "md",
-  "markdown",
-  "log",
-  // 代码
-  "rs",
-  "go",
-  "py",
-  "js",
-  "ts",
-  "tsx",
-  "jsx",
-  "java",
-  "c",
-  "cpp",
-  "h",
-  "hpp",
-  "cs",
-  "rb",
-  "php",
-  "swift",
-  "kt",
-  // 脚本
-  "sh",
-  "bash",
-  "zsh",
-  "fish",
-  "ps1",
-  "bat",
-  "cmd",
-  // 配置 / 标记
-  "toml",
-  "yaml",
-  "yml",
-  "ini",
-  "cfg",
-  "conf",
-  "xml",
-  "html",
-  "css",
-  "scss",
-  "sql",
-  "env",
-  "properties",
-  "editorconfig",
-  "diff",
-  "patch",
-  "lock",
-  // 其他纯文本语言 / 文档（TextParser 直接读 UTF-8）
-  "lua",
-  "scala",
-  "dart",
-  "r",
-  "m",
-  "mm",
-  "pl",
-  "erl",
-  "ex",
-  "exs",
-  "clj",
-  "cljs",
-  "cljc",
-  "fs",
-  "fsx",
-  "groovy",
-  "gradle",
-  "v",
-  "vhdl",
-  "sv",
-  "asm",
-  "s",
-  "zig",
-  "nim",
-  "jl",
-  "sol",
-  "vue",
-  "svelte",
-  "astro",
-  "less",
-  "styl",
-  "tex",
-  "latex",
-  "graphql",
-  "gql",
-  "proto",
-  "rst",
-  "adoc",
-  "asciidoc",
-  "org",
-  "textile",
-  "svg",
-  "rss",
-  "atom",
-  // 表格 / JSON / 数据流
-  "csv",
-  "tsv",
-  "json",
-  "jsonl",
-  "ndjson",
-  // 压缩包 / 单文件 gzip
-  "zip",
-  "tar",
-  "tgz",
-  "tbz2",
-  "txz",
-  "gz",
-];
-
-/** 图片类扩展名（一期直接读 base64 → VLM，不进 ingest）。 */
-const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp", "bmp", "gif"];
-
-const ALL_EXTENSIONS = [...DOC_EXTENSIONS, ...IMAGE_EXTENSIONS];
-
-/** 已选中的待发送图片（前端临时态，不进 ingest-store）。 */
 interface PendingImage {
   id: string;
   fileName: string;
@@ -187,14 +69,16 @@ export function Composer({ conversationId }: { conversationId: string }) {
     (s) => s.reasoningEnabled[conversationId] ?? false,
   );
   const setReasoningEnabled = useComposerStore((s) => s.setReasoningEnabled);
-  const setPaletteOpen = useUiStore((s) => s.setCommandPaletteOpen);
+  const setModelSettingsOpen = useUiStore((s) => s.setModelSettingsOpen);
 
   // 待发送图片（一期不入 ingest-store，随消息发送后清空）
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   // 图片处理提示（降采样/超限跳过等），非空时在输入框上方展示内联提示条
   const [notice, setNotice] = useState<string | null>(null);
-  // 挂载文档列表（后端持久化，切走会话不丢）。发送时传 path 列表，后端读全文。
-  const { data: mountedDocs = [] } = useMountedDocuments(conversationId);
+  // 知识库全量文档列表（不含全文）。@token 解析基于全库：路径 token（`@文件夹/文件名`）
+  // 与旧消息纯 name token（`@文件名`）都能定位文件，复制指令到新会话重放不再丢挂载；
+  // 后端对命中的库内文件幂等补挂载（mount_document INSERT OR IGNORE）。
+  const { data: allDocs = [] } = useAllDocuments();
   // 可用 skill 列表（会话级）。@skillName 解析为 skill://<name> path，后端按 path 查 documents 表
   // 取 skill body（与文件全文统一 read_document 路径，决策 20）。
   const { data: skills = [] } = useSkillsConversation(conversationId);
@@ -245,14 +129,27 @@ export function Composer({ conversationId }: { conversationId: string }) {
     });
   };
 
+  /** 斜杠命令：输入以 / 开头时弹出预置命令（线框 01 屏）。 */
+  const slashOpen = /^\/\w*$/.test(text.trimStart());
+  const setActiveNav = useUiStore((s2) => s2.setActiveNav);
+  const setValidationIri = useUiStore((s2) => s2.setValidationIri);
+  const runSlashCommand = (cmd: string) => {
+    if (cmd === "validate") {
+      setValidationIri(null); // null → 工作台回落到最近本体
+      setActiveNav("validation");
+    }
+    setDraft(conversationId, "");
+  };
+
   const send = async () => {
     const content = text.trim();
     if (!content || chat.isSending || !hasProvider) return;
 
     // 收集上下文：解析文本中 `@token` 得资源 path 列表 + 待发图片。
     // 以文本里实际出现的 @ 为准（用户删掉 @token 即不引用）。
-    // @fileName → 文件 path；@skillName → skill://<name> 虚拟 path（后端按 path 查 documents 表）。
-    const mounted_paths = resolveMentionedPaths(content, mountedDocs, skills);
+    // 路径 token `@文件夹/文件名` / name token `@文件名` → 文件 path（全库匹配）；
+    // @skillName → skill://<name> 虚拟 path（后端按 path 查 documents 表）。
+    const mounted_paths = resolveMentionedPaths(content, allDocs, skills);
 
     // 手打 @skillName（未走菜单选中即激活）的兑底：发送前对引用但未激活的 skill 补激活。
     // builtin/external 默认进 preamble（isSkillActive=true）无需补；imported/dmi 默认不进，
@@ -417,6 +314,19 @@ export function Composer({ conversationId }: { conversationId: string }) {
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // 斜杠菜单开启：Enter/Tab 执行输入中的命令（按实际输入词分发，非固定第一条）
+    if (slashOpen && (e.key === "Enter" || e.key === "Tab") && !e.metaKey && !e.ctrlKey && !e.shiftKey) {
+      e.preventDefault();
+      const word = text.trimStart().replace(/^\//, "").split(/\s+/)[0];
+      runSlashCommand(word);
+      return;
+    }
+    // Esc 关闭斜杠菜单（清空命令草稿）
+    if (slashOpen && e.key === "Escape") {
+      e.preventDefault();
+      setDraft(conversationId, "");
+      return;
+    }
     // ⌘↵ / Ctrl↵ 发送
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
@@ -435,7 +345,7 @@ export function Composer({ conversationId }: { conversationId: string }) {
   // placeholder 动态带模型名（参考 DeepSeek「给 {模型} 发送消息」）
   const modelName = providerCfg?.model ?? "AI";
   const placeholder = hasProvider
-    ? `给 ${modelName} 发送消息…  (⌘↵ 发送，⌘O 添加文件，@ 挂载)`
+    ? `给 ${modelName} 发送消息…  (${shortcut(["mod", "Enter"])} 发送，${shortcut(["mod", "O"])} 添加文件，@ 挂载)`
     : "请先配置模型提供商…";
   const mobilePlaceholder = hasProvider
     ? `给 ${modelName} 发送消息…`
@@ -444,27 +354,27 @@ export function Composer({ conversationId }: { conversationId: string }) {
 
   return (
     <div className="border-t border-border bg-bg p-3 max-md:p-2 max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))]">
-      <div className="mx-auto max-w-3xl">
+      <div className="w-full">
         {!hasProvider && (
           <div className="mb-2 flex items-center gap-2 rounded-md border border-border bg-bg-elevated px-3 py-1.5 text-xs text-fg-muted">
             <span>未配置模型提供商</span>
             <button
-              onClick={() => setPaletteOpen(true)}
+              onClick={() => setModelSettingsOpen(true)}
               className="ml-auto flex items-center gap-1 text-accent hover:underline"
             >
-              <Settings size={12} /> 前往设置
+              <Settings size={12} /> 前往模型设置
             </button>
           </div>
         )}
 
         {/* 图片处理提示（降采样/超限跳过） */}
         {notice && (
-          <div className="mb-2 flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-600 dark:text-amber-400">
+          <div className="mb-2 flex items-center gap-2 rounded-md border border-warning-border bg-warning-bg px-3 py-1.5 text-xs text-warning-text">
             <AlertTriangle size={12} className="shrink-0" />
             <span className="min-w-0 flex-1">{notice}</span>
             <button
               onClick={() => setNotice(null)}
-              className="shrink-0 rounded p-0.5 hover:bg-amber-500/20"
+              className="shrink-0 rounded p-0.5 hover:bg-warning-border"
               title="关闭"
             >
               <X size={11} />
@@ -505,13 +415,16 @@ export function Composer({ conversationId }: { conversationId: string }) {
         )}
 
         {/* 输入区：textarea 独占满宽，工具行下移（参考 DeepSeek 布局） */}
-        <div className="relative rounded-lg border border-border bg-bg-elevated p-2 focus-within:border-accent">
+        <div className="relative rounded-lg border border-border bg-bg-elevated p-2">
           <MentionMenu
             conversationId={conversationId}
             textareaRef={textareaRef}
             text={text}
             onTextChange={(next) => setDraft(conversationId, next)}
           />
+          {slashOpen && (
+            <SlashMenu onPick={runSlashCommand} />
+          )}
           <textarea
             ref={textareaRef}
             value={text}
@@ -530,10 +443,21 @@ export function Composer({ conversationId }: { conversationId: string }) {
             <button
               onClick={pickFiles}
               disabled={isIngesting}
-              title="添加文件 (⌘O)"
+              title={`添加文件 (${shortcut(["mod", "O"])})`}
               className="flex shrink-0 items-center rounded-md p-1.5 text-fg-subtle hover:bg-bg-hover hover:text-fg disabled:opacity-40"
             >
               <Paperclip size={16} />
+            </button>
+            {/* 校验任务（线框 01 屏：对话命令 + 工具栏双入口；校验是任务面板不是聊天气泡） */}
+            <button
+              onClick={() => {
+                setValidationIri(null);
+                setActiveNav("validation");
+              }}
+              title="打开校验任务（/validate）"
+              className="flex shrink-0 items-center rounded-md p-1.5 text-fg-subtle hover:bg-bg-hover hover:text-fg"
+            >
+              <ShieldCheck size={16} />
             </button>
             {/* 挂载文件（动作按钮） */}
             <button
@@ -561,13 +485,25 @@ export function Composer({ conversationId }: { conversationId: string }) {
               <Brain size={14} />
               <span className="max-md:hidden">深度思考</span>
             </button>
-
-            {/* 发送/中断：右端圆形填充主色按钮（视觉权重最高） */}
-            <div className="ml-auto">
+            {/* 右侧组：模型名 + 上下文用量（借鉴 Hermes 状态栏「model · 45% · 28k/128k」）
+                —— 模型名与用量条紧挨成一体，与左侧工具按钮、右侧发送按钮均拉开间距 */}
+            <div className="ml-auto flex items-center gap-4">
+              <div className="flex items-center gap-2">
+                {providerCfg?.model && (
+                  <span
+                    className="hidden max-w-[200px] shrink-0 items-center gap-1 truncate rounded-md bg-bg-hover px-2 py-1 text-xs leading-none text-fg-muted md:flex"
+                    title={`当前模型：${providerCfg.model}`}
+                  >
+                    {providerCfg.model}
+                  </span>
+                )}
+                <ContextUsageInline conversationId={conversationId} />
+              </div>
+              {/* 发送/中断：右端圆形填充主色按钮（视觉权重最高） */}
               {isSending ? (
                 <button
                   onClick={chat.stop}
-                  title="中断 (⌘.)"
+                  title={`中断 (${shortcut(["mod", "."])})`}
                   className="flex shrink-0 items-center justify-center rounded-full border border-border p-2 text-fg-muted hover:bg-bg-hover"
                 >
                   <Square size={14} />
@@ -576,7 +512,7 @@ export function Composer({ conversationId }: { conversationId: string }) {
                 <button
                   onClick={send}
                   disabled={!text.trim() || !hasProvider}
-                  title="发送 (⌘↵)"
+                  title={`发送 (${shortcut(["mod", "Enter"])})`}
                   className="flex shrink-0 items-center justify-center rounded-full bg-accent p-2 text-accent-fg hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <ArrowUp size={16} />

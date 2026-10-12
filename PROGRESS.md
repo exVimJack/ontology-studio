@@ -1,7 +1,22 @@
 # 开发进展
 
 > 本文件记录 onto-studio 的开发进展，按阶段组织。以 `ARCHITECTURE.md` 的落地路线为准。
-> 最后更新：2026-07-30
+> 最后更新：2026-10-10
+
+---
+
+## rig 0.41 → 0.44 迁移 — ✅ 完成（2026-10）
+
+**范围**：agent-core 全部 rig 依赖面 + src-tauri 一处 API 更名。
+
+- `rig 0.41→0.44` + `rig-memory 0.41→0.44`；rmcp 保持 1.8（0.44 的 rmcp 是可选 feature 不启用，无版本共存）
+- **chat.rs**：`ProviderRuntime` trait + 宏样板（14 个 newtype × 3 方法）收敛为 `ModelFactory` trait（每 provider 一个 `build_model` → `DynModel<Completion>` 擦除）+ 单一 helper；`AgentBuilder::new(model)` 直收模型（`client.agent()` 已删）；`conversation` 上移 builder；流式走 `agent.prompt().history().max_turns().stream()`（`MultiTurnStreamItem` 非泛型化）
+- **流事件模型**：`StreamedAssistantContent` → `rig::streaming::StreamEvent`（Start/Text/Reasoning/Arguments/End）；工具调用最终形态在 `End{AssistantContent::ToolCall}` + `ToolCall`/`ToolExecutionCommitted`/`ToolResult` 变体（以 call id 关联，`ToolResult` 自带 `is_error`，`"[tool error]"` 前缀 hack 保留兼容）
+- **消息模型**：`OneOrMany<T>` → `Vec<T>`；`Message::Assistant{content}` → `Message::Assistant(AssistantMessage)`（`#[non_exhaustive]`，用 `AssistantMessage::new()`）；`ConversationMemory` 的 conversation_id 类型化为 `ConversationId`
+- **memory_bridge**：`HeuristicTokenCounter::openai()` 删（改 `new(4.0, 4, 0)` 同参数）；`MemoryPolicy` trait 移至 rig-memory
+- **MCP/工具**：`DynamicTool::new` 回调去 ToolContext 参（33 处），`add_dynamic_tool` 同步化，`get_tool_defs`→`tool_defs`（src-tauri）
+- **provider 构造**：OpenAI 形 vendor 收敛为 `OpenAIConfig::with_key(dialect,…)` + `.responses()/.chat()` 双路由；超时/headers 走自定义 reqwest → `ReqwestClient::from()` 传输注入
+- 全绿：workspace + src-tauri cargo check/test 通过；ADR（ARCHITECTURE.md 决策 1/14/16）与 AGENTS.md 决策表已同步
 
 ---
 

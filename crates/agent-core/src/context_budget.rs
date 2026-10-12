@@ -48,8 +48,8 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
                 }
             }
         }
-        Message::Assistant { content, .. } => {
-            for c in content.iter() {
+        Message::Assistant(a) => {
+            for c in a.content.iter() {
                 if let AssistantContent::Text(t) = c {
                     total += estimate_tokens(&t.text);
                 }
@@ -277,16 +277,15 @@ mod tests {
 
     fn user(text: &str) -> Message {
         Message::User {
-            content: rig::OneOrMany::one(UserContent::text(text.to_string())),
+            content: vec![UserContent::text(text.to_string())],
         }
     }
 
     fn assistant(text: &str) -> Message {
         use rig::completion::message::AssistantContent;
-        Message::Assistant {
-            id: None,
-            content: rig::OneOrMany::one(AssistantContent::text(text.to_string())),
-        }
+        Message::Assistant(rig::completion::message::AssistantMessage::new(vec![AssistantContent::text(
+            text.to_string(),
+        )]))
     }
 
     #[test]

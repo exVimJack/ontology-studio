@@ -14,6 +14,10 @@ pub struct OntologySummary {
     pub display_name: String,
     #[serde(default)]
     pub description: String,
+    /// 设计宪章是否已填写（手工导入的本体可能为 false——agent 迭代前应知会用户补全，
+    /// 否则 import 时会被宪章空检测闸门拒绝）
+    #[serde(default)]
+    pub has_charter: bool,
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -34,21 +38,14 @@ pub struct OntologySummary {
 /// 与 changelog（变化点）分离：changelog 记每次变更随历史增长，charter 记业务
 /// 本质说明不随历史变化。由独立命令 `set_ontology_charter` 写入，不进 import 流程。
 ///
-/// 四字段语义（决策：本体不变点）：
 /// - `business_scenario`：业务场景（服务于什么业务目标、谁用、解决什么问题）
 /// - `business_essence`：业务本质（核心业务对象/状态/关系/动态行为的一句话本质概括）
-/// - `design_intent`：设计意图（为什么这样建模、够用且可扩展的取舍、可扩展方向）
-/// - `invariants`：补充说明（自由文本，记录不可违反的业务约束、边界条件等）
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type, PartialEq, Default)]
 pub struct OntologyCharter {
     #[serde(default)]
     pub business_scenario: String,
     #[serde(default)]
     pub business_essence: String,
-    #[serde(default)]
-    pub design_intent: String,
-    #[serde(default)]
-    pub invariants: String,
     /// "agent" | "user"
     #[serde(default)]
     pub updated_by: String,
@@ -250,6 +247,10 @@ pub struct ObjectTypeDef {
     /// SKILL 扩展字段，非 Gaia schema——import 时剥离，仅标注产物质量。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<String>,
+    /// 证据链（docs/EVIDENCE-CHAIN.md）：本类型定义依据的输入原文引用。
+    /// SKILL 扩展字段，非 Gaia schema——空时序列化省略，不污染 Gaia payload。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<crate::evidence::Evidence>,
 }
 
 fn default_visibility() -> String {
@@ -290,6 +291,9 @@ pub struct PropertyDef {
     /// SKILL 扩展字段。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<String>,
+    /// 证据链：属性定义依据的输入原文引用（SKILL 扩展字段，空时省略）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<crate::evidence::Evidence>,
 }
 
 /// Property 只读视图（对齐 Gaia MCP `describe_object_type` 返回的 7 字段）。
@@ -319,8 +323,13 @@ impl PropertyDef {
     /// 派生 `PropertyReadView`（对齐 Gaia MCP `describe_object_type` 的 property 返回）。
     pub fn to_read_view(&self) -> PropertyReadView {
         const UNSORTABLE: &[&str] = &[
-            "ARRAY", "STRUCT", "VECTOR", "GEOPOINT", "GEOSHAPE",
-            "MEDIA_REFERENCE", "ATTACHMENT",
+            "ARRAY",
+            "STRUCT",
+            "VECTOR",
+            "GEOPOINT",
+            "GEOSHAPE",
+            "MEDIA_REFERENCE",
+            "ATTACHMENT",
         ];
         let is_pk = self.is_primary_key.unwrap_or(false);
         PropertyReadView {
@@ -382,6 +391,9 @@ pub struct LinkDef {
     /// SKILL 扩展字段。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<String>,
+    /// 证据链：LinkType 定义依据的输入原文引用（SKILL 扩展字段，空时省略）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<crate::evidence::Evidence>,
 }
 
 /// ActionType 定义（对齐 Gaia `ActionTypeCreate`）。
@@ -493,6 +505,12 @@ pub struct ImportRequest {
     /// （用于从脱敏 `***` 升级到真实凭据等场景）。
     #[serde(default)]
     pub overwrite_data_sources: Vec<String>,
+    /// 证据闸门模式（docs/EVIDENCE-CHAIN.md L3）：
+    /// "strict" = 无 evidence 的元素阻断（S1）；其它/缺省 = 不校验。
+    /// 缺省不校验是向后兼容：人工/前端导入路径（用户手输 = 真相源）不受影响；
+    /// **agent 路径由工具层硬编码 strict**，LLM 无法绕过。
+    #[serde(default)]
+    pub evidence_mode: String,
 }
 
 /// 单个实体的导入结果。

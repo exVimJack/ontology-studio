@@ -1,6 +1,6 @@
 //! MCP（Model Context Protocol）工具系统集成（二期 A3）。
 //!
-//! 封装 rmcp 1.8 客户端 + Rig 0.40 的 ToolServer，把外部 MCP server 的工具
+//! 封装 rmcp 1.8 客户端 + Rig 0.44 的 ToolServer，把外部 MCP server 的工具
 //! 注入 agent 的 ToolSet，agent loop 自动发现并调用。
 //!
 //! 架构（见 ARCHITECTURE.md 决策 1 / §九 二期 A3）：
@@ -35,8 +35,8 @@ use rmcp::model::{
 };
 use rmcp::service::{Peer, RunningService, RoleClient};
 use rmcp::ServiceExt;
-use rig::tool::server::ToolServerHandle;
-use rig::tool::{ToolContext, ToolExecutionError, ToolOutput};
+use rig::agent::tool::server::ToolServerHandle;
+use rig::tool::{ToolExecutionError, ToolOutput};
 use rig::tool::DynamicTool;
 use serde::{Deserialize, Serialize};
 use tokio::process::{ChildStdin, ChildStdout};
@@ -100,8 +100,7 @@ impl McpServerConfig {
 /// agent loop 调用 DynamicTool 的 callback 时，转成 `CallToolRequestParams`
 /// 发给 MCP server，把返回的 `CallToolResult.content` 拼成文本交给模型。
 ///
-/// 0.41 起 rig 取消 `ToolDyn` trait，改用 `DynamicTool::new(name, desc, params, callback)`。
-/// callback 签名 `Fn(&mut ToolContext, Value) -> Future<Result<ToolOutput, ToolExecutionError>>`。
+/// 0.44 起 DynamicTool 回调只收 `Value`（无 ToolContext 参）。
 fn build_dynamic_tool(tool: &Tool, peer: Peer<RoleClient>) -> DynamicTool {
     let name = tool.name.to_string();
     let description = tool
@@ -111,11 +110,12 @@ fn build_dynamic_tool(tool: &Tool, peer: Peer<RoleClient>) -> DynamicTool {
         .unwrap_or_default();
     let parameters = schema_as_json_value(&tool.input_schema);
     let tool_name = name.clone();
+    let tool_name_rig = rig::message::ToolName::new(name).expect("MCP 工具名非空");
     DynamicTool::new(
-        name,
+        tool_name_rig,
         description,
         parameters,
-        move |_ctx: &mut ToolContext, args: serde_json::Value| {
+        move |args: serde_json::Value| {
             let tool_name = tool_name.clone();
             let peer = peer.clone();
             Box::pin(async move {
@@ -397,7 +397,8 @@ impl McpManager {
         let count = tools.len();
         for tool in tools {
             let dyn_tool = build_dynamic_tool(&tool, peer.clone());
-            self.tool_handle.add_dynamic_tool(dyn_tool).await;
+            // 0.44：add_dynamic_tool 同步（不再 async）
+            self.tool_handle.add_dynamic_tool(dyn_tool);
         }
         Ok(count)
     }

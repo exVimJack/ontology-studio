@@ -41,6 +41,16 @@ import type {
   TtlImportResult,
   TtlCharter,
   TtlChangelog,
+  TtlPropertyEdit,
+  ValidationIssue,
+  ValidationReview,
+  AutoDisputeItem,
+  AutoDisputeState,
+  PostArbitrationState,
+  CoverageMatrix,
+  BReviewOutput,
+  AReviseResult,
+  SetProviderInput_Deserialize,
 } from "@/lib/ipc/bindings";
 import type {
   ActiveScopeDto,
@@ -98,6 +108,7 @@ export const ipc = {
   /** 删除指定消息及其之后的全部消息（重新生成/编辑重发用，返回删除条数）。 */
   deleteMessageAndAfter: (messageId: string) =>
     unwrap<number>(raw.deleteMessageAndAfter({ message_id: messageId })),
+
   setMessageStatus: (input: SetMessageStatusInput) =>
     unwrap<null>(raw.setMessageStatus(input as never)),
   /** 中断指定 assistant 消息的流式生成（后端 oneshot 取消信号）。 */
@@ -122,6 +133,20 @@ export const ipc = {
   setProvider: (input: SetProviderInput) =>
     unwrap<ProviderConfig>(raw.setProvider(input as never)),
   getProvider: () => unwrap<ProviderConfig | null>(raw.getProvider() as never),
+  getVerifierProvider: () => unwrap<ProviderConfig | null>(raw.getVerifierProvider() as never),
+  setVerifierProvider: (input: SetProviderInput) =>
+    unwrap<ProviderConfig>(
+      raw.setVerifierProvider(input as unknown as SetProviderInput_Deserialize) as never,
+    ),
+
+  // ── HTTP 代理（宪章 AI 建议 LLM 直连；绕 webview CORS 预检限制）──
+  httpPostJson: (url: string, headers: Record<string, string>, body: string) =>
+    unwrap<{ status: number; body: string }>(
+      raw.httpPostJson(url, headers, body) as never,
+    ),
+  /** 当前上下文窗口（token），供会话用量百分比展示。null = 未配置 provider。 */
+  getContextWindow: () =>
+    unwrap<number | null>(raw.getContextWindow() as never),
 
   // ── 文件摄入（§14.2） ──
   ingestFiles: (
@@ -273,6 +298,8 @@ export const ipc = {
     return data;
   },
   /** 执行导入（DAG 落库），返回 ImportResult JSON 字符串。 */
+  listElementEvidence: (standard: string, ontologyKey: string) =>
+    unwrap<string>(raw.listElementEvidence(standard, ontologyKey) as never),
   importOntology: async (
     payload: OntologyPayload,
     overwrite: string[],
@@ -301,6 +328,16 @@ export const ipc = {
   /** 写入/更新本体设计宪章（只有用户明确要求调整时才调用）。 */
   setOntologyCharter: (apiName: string, charter: OntologyCharter) =>
     unwrap<null>(raw.setOntologyCharter(apiName, charter)),
+  // 宪章先行（决策 24）：空骨架本体 + 宪章原子创建，仅宪章向导可达
+  createOntologyWithCharter: (
+    apiName: string,
+    displayName: string,
+    description: string,
+    charter: OntologyCharter,
+  ) =>
+    unwrap<null>(
+      raw.createOntologyWithCharter(apiName, displayName, description, charter),
+    ),
 
   // ── W3C Turtle 本体（对齐 skill ontology-modeling-w3c）──
   /** 列出所有已存 W3C Turtle 本体。 */
@@ -326,6 +363,13 @@ export const ipc = {
   /** 写入/更新 W3C 本体设计宪章（只有用户明确要求调整时才调用）。 */
   setOntologyTtlCharter: (iri: string, charter: TtlCharter) =>
     unwrap<null>(raw.setOntologyTtlCharter(iri, charter)),
+  /** 宪章先行（决策 24）：空骨架 W3C 本体 + 宪章原子创建，仅宪章向导可达。 */
+  createOntologyTtlWithCharter: (
+    iri: string,
+    displayName: string,
+    charter: TtlCharter,
+  ) =>
+    unwrap<null>(raw.createOntologyTtlWithCharter(iri, displayName, charter)),
   /** 列出 W3C 本体变更历史（revision 倒序）。 */
   listOntologyTtlChangelog: (iri: string) =>
     unwrap<TtlChangelog[]>(raw.listOntologyTtlChangelog(iri)),
@@ -346,4 +390,101 @@ export const ipc = {
         conversationId,
       ),
     ),
+
+  // ── W3C Turtle 属性结构化编辑（手动编辑 P0：属性/关系，不动类）──
+  /** 列出本体全部属性（散块已聚合），属性编辑 Tab 数据源。 */
+  listOntologyTtlProperties: (iri: string) =>
+    unwrap<TtlPropertyEdit[]>(raw.listOntologyTtlProperties(iri)),
+  /** 列出本体全部类的 IRI（domain/range 下拉用）。 */
+  listOntologyTtlClassIris: (iri: string) =>
+    unwrap<string[]>(raw.listOntologyTtlClassIris(iri)),
+  /** 新增属性表单的默认 IRI 前缀（与既有属性 namespace 一致）。 */
+  getOntologyTtlDefaultPropertyNs: (iri: string) =>
+    unwrap<string>(raw.getOntologyTtlDefaultPropertyNs(iri)),
+  /** 编辑既有属性（iri 为身份不可改），返回手术后的完整 TTL。 */
+  editOntologyTtlProperty: (iri: string, edit: TtlPropertyEdit) =>
+    unwrap<string>(raw.editOntologyTtlProperty(iri, edit)),
+  /** 新增属性，返回手术后的完整 TTL。 */
+  addOntologyTtlProperty: (iri: string, edit: TtlPropertyEdit) =>
+    unwrap<string>(raw.addOntologyTtlProperty(iri, edit)),
+  /** 删除属性（被引用时后端拒绝），返回手术后的完整 TTL。 */
+  deleteOntologyTtlProperty: (iri: string, propertyIri: string) =>
+    unwrap<string>(raw.deleteOntologyTtlProperty(iri, propertyIri)),
+
+  // ── 校验对抗（VALIDATION-DESIGN.md v0.3.1）──
+  /** A 对 warning 级 issue 发起答辩（L3 第二层，counterEvidence 机械匹配）。 */
+  disputeIssue: (
+    issueId: string,
+    argument: string,
+    counterSourceId: string,
+    counterQuote: string,
+  ) => unwrap<string>(raw.disputeIssue(issueId, argument, counterSourceId, counterQuote)),
+  /** 裁决答辩（B 复核或人工调用；不作为 A 工具暴露）。 */
+  resolveDispute: (issueId: string, verdict: string, resolvedBy: string) =>
+    unwrap<string>(raw.resolveDispute(issueId, verdict, resolvedBy)),
+  /** 自动答辩状态缓存（running + items，切窗回来恢复"进行中"展示）。 */
+  getAutoDisputeResult: (ontologyIri: string) =>
+    unwrap<AutoDisputeState>(raw.getAutoDisputeResult(ontologyIri)),
+  getPostArbitrationState: (ontologyIri: string) =>
+    unwrap<PostArbitrationState>(raw.getPostArbitrationState(ontologyIri)),
+  runPostArbitrationRevise: (ontologyIri: string) =>
+    unwrap<null>(raw.runPostArbitrationRevise(ontologyIri)),
+  resolveDisputeLlm: (issueId: string, modelB: string) =>
+    unwrap<string>(raw.resolveDisputeLlm(issueId, modelB)),
+  /** 答辩提交 + B 自动机器裁决（一步到位，Rust 侧落库，切窗安全）。 */
+  disputeAndJudge: (issueId: string, argument: string, counterSourceId: string, counterQuote: string, modelB: string) =>
+    unwrap<string>(raw.disputeAndJudge(issueId, argument, counterSourceId, counterQuote, modelB)),
+  /** A 自动答辩（对全部 rules 来源 open warning 后端跑 A 决策→提交→B 裁决）。 */
+  runAutoDispute: (ontologyIri: string) =>
+    unwrap<AutoDisputeItem[]>(raw.runAutoDispute(ontologyIri)),
+  /** 查询本体的全部 issue（对抗状态展示 + 报告）。 */
+  listValidationIssues: (ontologyIri: string) =>
+    unwrap<ValidationIssue[]>(raw.listValidationIssues(ontologyIri)),
+  /** 持久化一次 validate 的 issue 快照。 */
+  persistValidationIssues: (
+    ontologyIri: string,
+    validationId: string,
+    issues: ValidationIssue[],
+  ) => unwrap<number>(raw.persistValidationIssues(ontologyIri, validationId, issues)),
+  /** 启动 L4.3 语义评审。 */
+  reviewOntology: (ontologyIri: string) =>
+    unwrap<ValidationReview>(raw.reviewOntology(ontologyIri)),
+  /** A 提交修订（a_reasoning 对 B 复核不可见）。 */
+  aRevise: (reviewId: string, aRevision: string, aReasoning: string) =>
+    unwrap<ValidationReview>(raw.aRevise(reviewId, aRevision, aReasoning)),
+  /** B 复核：confirm=true → resolved；false → escalated。 */
+  bRecheck: (reviewId: string, confirm: boolean) =>
+    unwrap<ValidationReview>(raw.bRecheck(reviewId, confirm)),
+  /** 转人工仲裁。 */
+  escalateReview: (reviewId: string) =>
+    unwrap<ValidationReview>(raw.escalateReview(reviewId)),
+  /** 查询本体的最新 review。 */
+  latestValidationReview: (ontologyIri: string) =>
+    unwrap<ValidationReview | null>(raw.latestValidationReview(ontologyIri)),
+  /** 持久化 B 评审输出（L4.3 第 1 步产物）。 */
+  saveBReport: (reviewId: string, bReport: string) =>
+    unwrap<ValidationReview>(raw.saveBReport(reviewId, bReport)),
+  /** 29 句话覆盖矩阵（全量或增量 diff）。 */
+  coverageMatrix: (ontologyIri: string, diffEntities: string[]) =>
+    unwrap<CoverageMatrix>(raw.coverageMatrix(ontologyIri, diffEntities)),
+  /** 判定 A/B 模型独立性档位。 */
+  independenceTier: (
+    providerA: string,
+    modelA: string,
+    providerB: string,
+    modelB: string,
+  ) => unwrap<string>(raw.independenceTier(providerA, modelA, providerB, modelB)),
+  /** 运行 B 语义评审（LLM 编排）。 */
+  runBReviewLlm: (modelB: string, inputs: string) =>
+    unwrap<BReviewOutput>(raw.runBReviewLlm(modelB, inputs)),
+  /** 运行 A 修订（LLM 编排）。 */
+  runAReviseLlm: (modelA: string, ttlV1: string, bSuggestions: string) =>
+    unwrap<AReviseResult>(raw.runAReviseLlm(modelA, ttlV1, bSuggestions)),
+  /** 运行 B 复核（LLM 编排）。 */
+  runBRecheckLlm: (modelB: string, aRevision: string) =>
+    unwrap<string>(raw.runBRecheckLlm(modelB, aRevision)),
+  /** 一次性触发后端完整语义评审循环（后端驱动：B评审→A修订→B复核→裁决）。
+   *  返回 review id；进度轮询 latestValidationReview。 */
+  runReviewLoop: (ontologyIri: string, ttlContent: string, charterSummary: string, issuesJson: string) =>
+    unwrap<string>(raw.runReviewLoop(ontologyIri, ttlContent, charterSummary, issuesJson)),
 };

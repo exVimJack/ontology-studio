@@ -5,7 +5,7 @@
 // 消息渲染：MessagePrimitive.Parts 按 part 类型分派：
 //   - text → AssistantText / UserText（流式渲染 + 旋转指示）
 //   - reasoning → Reasoning（可折叠，流式时展开、结束折叠）
-//   - tool-call → ToolFallback（通用工具调用卡片）
+//   - tool-call → 不渲染（工具卡片已下线，convertMessage 不产出该 part）
 //
 // 关键：所有 components 对象和子组件都在模块作用域定义，
 // 避免流式时每次 render 新建引用导致 assistant-ui 内部 memo 失效/死循环。
@@ -25,6 +25,13 @@ import { useEffect, useRef, useState } from "react"
 import { ArrowDown, Brain, Loader2, User, Bot, Copy, Check, RotateCcw, Pencil, FileDown } from "lucide-react"
 import { MarkdownText } from "./MarkdownText"
 import { saveTextFile } from "@/lib/save-file"
+import { useChatRunStatus } from "./ChatRuntime"
+import { formatMessageTime } from "@/lib/format"
+import {
+  ELAPSED_VISIBLE_AFTER_S,
+  elapsedSeconds,
+  runPhaseText,
+} from "@/lib/chat-run-status"
 
 export function Thread() {
   // 切会话/加载历史后滚动到底部。
@@ -57,7 +64,7 @@ export function Thread() {
 
   return (
     <ThreadPrimitive.Root className="flex h-full flex-col">
-      <ThreadPrimitive.Viewport className="relative flex-1 overflow-y-auto">
+      <ThreadPrimitive.Viewport className="relative flex-1 overflow-y-auto overflow-x-hidden">
         {/* 空态 */}
         <AuiIf condition={(s) => s.thread.isEmpty}>
           <div className="flex h-full items-center justify-center text-sm text-fg-subtle">
@@ -65,12 +72,18 @@ export function Thread() {
           </div>
         </AuiIf>
 
-        <ThreadPrimitive.Messages>
-          {({ message }) => {
-            if (message.role === "user") return <UserMessage />
-            return <AssistantMessage />
-          }}
-        </ThreadPrimitive.Messages>
+        {/* 消息列自适应窗口宽度（不限宽居中），左右留白与 Composer(p-3)对齐。
+            Messages primitive 不收 className,故外包约束层。
+            min-w-0 + overflow-hidden：flex/grid 子项默认 min-width:auto，
+            宽内容（长表格/代码块）会把祖先撑出窗口右边界。 */}
+        <div className="w-full min-w-0 overflow-hidden px-3">
+          <ThreadPrimitive.Messages>
+            {({ message }) => {
+              if (message.role === "user") return <UserMessage />
+              return <AssistantMessage />
+            }}
+          </ThreadPrimitive.Messages>
+        </div>
 
         {/* 回到最新按钮：ViewportFooter sticky 钉在 viewport 底部，
             auto-scroll 系统会扣除其高度避免遮挡最后一条消息 */}
@@ -173,18 +186,68 @@ function LazyMarkdownText() {
 const ASSISTANT_PARTS_COMPONENTS = {
   Text: AssistantText,
   Reasoning: Reasoning,
-  tools: { Fallback: ToolFallback },
 } as const
 
 // ───────── 消息外壳 ─────────
 
+// 时间戳 / 阶段文案 / 静默判定等纯逻辑在 @/lib/chat-run-status.ts（含单测）。
+
+/** 每秒重渲染以刷新已耗时读数（长任务 liveness）。 */
+function useElapsed(since: number | undefined, active: boolean): number {
+  const [, tick] = useState(0)
+  useEffect(() => {
+    if (!active || since == null) return
+    const t = window.setInterval(() => tick((n) => n + 1), 1_000)
+    return () => window.clearInterval(t)
+  }, [since, active])
+  if (since == null) return 0
+  return elapsedSeconds(since, Date.now())
+}
+
+/** 空内容 assistant 消息的运行指示（发送即显示，替代空白气泡）。
+ *  spinner + 阶段文案 + 已耗时秒数，业界通用做法（ChatGPT/Claude 同款）。 */
+function RunningIndicator() {
+  const { runStatus } = useChatRunStatus()
+  const createdAt = useAuiState((s) => s.message.createdAt)
+  const since = createdAt instanceof Date ? createdAt.getTime() : undefined
+  const elapsed = useElapsed(since, true)
+  return (
+    <div className="flex min-w-[140px] items-center gap-2 rounded-lg bg-bg-elevated px-3.5 py-2.5 text-sm text-fg-subtle">
+      <Loader2 size={14} className="animate-spin text-accent" />
+      <span>{runPhaseText(runStatus.phase, runStatus.toolName)}</span>
+      {elapsed > ELAPSED_VISIBLE_AFTER_S && (
+        <span className="text-xs text-fg-muted">已 {elapsed} 秒</span>
+      )}
+    </div>
+  )
+}
+
+/** 运行中的常驻耗时提示（挂在有内容的消息下方）。
+ *  从消息创建时刻持续计时，任务结束（isRunning=false）即消失——
+ *  ChatGPT/Claude 同款：不做“静默检测”，运行期间始终可见。
+ *  （此前的 StalledHint 按静默阈值出现/消失，有新 chunk 就闪没，读数忽有忽无。） */
+function StalledHint() {
+  const { runStatus } = useChatRunStatus()
+  const createdAt = useAuiState((s) => s.message.createdAt)
+  const since = createdAt instanceof Date ? createdAt.getTime() : undefined
+  const elapsed = useElapsed(since, true)
+  return (
+    <div className="flex items-center gap-1.5 text-xs text-fg-muted">
+      <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
+      {runPhaseText(runStatus.phase, runStatus.toolName)} 已 {elapsed} 秒
+    </div>
+  )
+}
+
 function UserMessage() {
+  const createdAt = useAuiState((s) => s.message.createdAt)
   return (
     <MessagePrimitive.Root className="group flex flex-row-reverse gap-3 py-3">
       <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-bg-hover text-fg">
         <User size={15} />
       </div>
-      <div className="flex min-w-0 max-w-[85%] flex-col items-end gap-1 overflow-hidden">
+      {/* 气泡宽=容器宽-头像列(40px),右缘与 Composer 输入框右缘对齐 */}
+      <div className="flex min-w-0 max-w-[calc(100%-2.5rem)] flex-col items-end gap-1 overflow-hidden">
         {/* 编辑态：行内 textarea + 保存/取消 */}
         <ComposerPrimitive.If editing>
           <UserEditComposer />
@@ -195,22 +258,56 @@ function UserMessage() {
             <MessagePrimitive.Parts components={USER_PARTS_COMPONENTS} />
           </div>
         </ComposerPrimitive.If>
-        <UserActionBar />
+        {/* 发送时间戳与操作图标同行：时间戳常显，复制/编辑 hover 浮现 */}
+        <UserActionBar createdAt={createdAt instanceof Date ? createdAt : undefined} />
       </div>
     </MessagePrimitive.Root>
   )
 }
 
 function AssistantMessage() {
+  // 无任何 part（发送后、首 chunk 前的空占位）→ 显示运行指示而非空气泡。
+  // 注意含 tool-call part：模型直接调工具（无前导文本）时 content 只有
+  // tool-call part，也视为“有内容”——这样工具执行期间的 StalledHint
+  // （挂在 hasContent 分支下）才能显示。
+  const hasContent = useAuiState((s) => s.message.content.length > 0)
+  const isRunning = useAuiState((s) => s.message.status?.type === "running")
+  const isIncompleteError = useAuiState(
+    (s) => s.message.status?.type === "incomplete" && s.message.status.reason === "error",
+  )
+  const errorText = useAuiState((s): string => {
+    const st = s.message.status
+    if (st?.type === "incomplete" && st.reason === "error") {
+      const e = st.error ?? "出错了"
+      return typeof e === "string" ? e : JSON.stringify(e)
+    }
+    return ""
+  })
   return (
     <MessagePrimitive.Root className="group flex gap-3 py-3">
       <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-accent/15 text-accent">
         <Bot size={15} />
       </div>
-      <div className="flex min-w-0 max-w-[85%] flex-col items-start gap-1 overflow-hidden">
-        <div className="min-w-0 overflow-hidden rounded-lg bg-bg-elevated px-3.5 py-2.5">
-          <MessagePrimitive.Parts components={ASSISTANT_PARTS_COMPONENTS} />
-        </div>
+      {/* 气泡宽=容器宽-头像列(40px),左缘与 Composer 输入框左缘对齐 */}
+      <div className="flex min-w-0 max-w-[calc(100%-2.5rem)] flex-col items-start gap-1 overflow-hidden">
+        {hasContent ? (
+          <>
+            <div className="min-w-0 overflow-hidden rounded-lg bg-bg-elevated px-3.5 py-2.5">
+              <MessagePrimitive.Parts components={ASSISTANT_PARTS_COMPONENTS} />
+            </div>
+            {/* 流式中但静默超阈值：显示「仍在处理」提示，避免长任务看起来卡死 */}
+            {isRunning && <StalledHint />}
+          </>
+        ) : (
+          <RunningIndicator />
+        )}
+        {/* 消息级错误横幅：后端流 Err / stream init failed 落 status=error，
+            此前无任何渲染分支——用户只看到“不动了”，错误只在导出时才可见。 */}
+        {isIncompleteError && errorText && (
+          <div className="w-full rounded-md border border-danger/40 bg-danger/5 px-2.5 py-1.5 text-xs text-danger">
+            ⚠️ {errorText}
+          </div>
+        )}
         <AssistantActionBar />
       </div>
     </MessagePrimitive.Root>
@@ -284,18 +381,26 @@ function AssistantActionBar() {
   )
 }
 
-/** user 消息操作栏：复制 + 编辑。 */
-function UserActionBar() {
+/** user 消息操作栏：时间戳 + 复制 + 编辑（同一行）。
+ *  时间戳常显；复制/编辑由 autohide 控制（非末条消息 hover 浮现，末条常显）。 */
+function UserActionBar({ createdAt }: { createdAt?: Date }) {
   return (
-    <ActionBarPrimitive.Root
-      hideWhenRunning
-      autohide="not-last"
-      autohideFloat="always"
-      className="flex items-center gap-0.5 opacity-100 transition-opacity data-[floating]:opacity-0 data-[floating]:group-hover:opacity-100"
-    >
-      <CopyButton />
-      <EditButton />
-    </ActionBarPrimitive.Root>
+    <div className="flex items-center gap-1">
+      {createdAt && (
+        <span className="mr-1 text-[11px] leading-none text-fg-muted">
+          {formatMessageTime(createdAt)}
+        </span>
+      )}
+      <ActionBarPrimitive.Root
+        hideWhenRunning
+        autohide="not-last"
+        autohideFloat="always"
+        className="flex items-center gap-0.5 opacity-100 transition-opacity data-[floating]:opacity-0 data-[floating]:group-hover:opacity-100"
+      >
+        <CopyButton />
+        <EditButton />
+      </ActionBarPrimitive.Root>
+    </div>
   )
 }
 
@@ -304,7 +409,7 @@ function UserActionBar() {
  *  提交时 assistant-ui 调 onEdit(AppendMessage)。 */
 function UserEditComposer() {
   return (
-    <ComposerPrimitive.Root className="w-full rounded-lg border border-accent bg-bg-elevated px-3 py-2">
+    <ComposerPrimitive.Root className="w-full rounded-lg border border-border bg-bg-elevated px-3 py-2 transition-[border-color] duration-150 focus-within:border-accent focus-within:shadow-[0_0_0_2px_var(--accent-bg,rgba(30,64,175,0.08))]">
       <ComposerPrimitive.Input
         asChild
         autoFocus
@@ -342,52 +447,5 @@ function Reasoning() {
         <MessagePartPrimitive.Text />
       </div>
     </details>
-  )
-}
-
-/** 通用工具调用卡片（未注册专用 tool UI 时的 fallback）。
- *  接收 assistant-ui 传入的 ToolCallMessagePartProps（含 toolName/argsText/result 等）。 */
-function ToolFallback(part: {
-  type: string
-  toolName?: string
-  argsText?: string
-  result?: unknown
-  isError?: boolean
-  status?: { type: string }
-}) {
-  if (part.type !== "tool-call") return null
-
-  const isRunning = part.result === undefined
-  const toolName = part.toolName ?? "工具"
-  const argsText = part.argsText
-  const result = part.result
-  const isError = part.isError
-
-  return (
-    <div className="my-1.5 rounded-md border border-border bg-bg px-2.5 py-1.5 text-xs">
-      <div className="flex items-center gap-1.5 font-medium text-fg-muted">
-        {isRunning ? (
-          <Loader2 size={11} className="animate-spin text-accent" />
-        ) : null}
-        <span>🔧 {toolName}</span>
-      </div>
-      {argsText && (
-        <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all text-fg-subtle">
-          {argsText}
-        </pre>
-      )}
-      {isError && result != null && (
-        <pre className="mt-1 text-danger">
-          {typeof result === "object"
-            ? JSON.stringify(result)
-            : String(result)}
-        </pre>
-      )}
-      {!isError && result != null && typeof result === "string" && (
-        <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all text-fg-subtle">
-          {result}
-        </pre>
-      )}
-    </div>
   )
 }

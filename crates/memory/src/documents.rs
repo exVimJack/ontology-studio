@@ -206,6 +206,17 @@ impl super::Memory {
         Ok(())
     }
 
+    /// 索引积压修复：全部 indexed_at=0 的文档 id（启动时串行补索引用）。
+    pub fn pending_index_ids(&self) -> MemoryResult<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id FROM documents WHERE indexed_at = 0 ORDER BY created_at")?;
+        let ids = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     /// 按 path 查文档 id（用于判断是否已入库）。
     pub fn document_id_by_path(&self, path: &str) -> MemoryResult<Option<String>> {
         let conn = self.lock();
@@ -313,6 +324,15 @@ impl super::Memory {
             return Ok(Vec::new());
         }
         let conn = self.lock();
+        // FTS5 MATCH 查询串有自己的语法：`:` 是列过滤器、`-` 是列排除、`"`/`(`/`)`/`*`/`^`
+        // 是运算符——模型传来的原始 query（如 `skill://x`、`ontology-modeling`、括号不配对）
+        // 会直接触发 "no such column"/"syntax error"，表现为 search 工具反复报错。
+        // 统一按空白切词、每词加引号变 phrase（词间隐式 AND），词内引号剥掉，任何输入都合法。
+        let sanitized = query
+            .split_whitespace()
+            .map(|t| format!("\"{}\"", t.replace('"', " ")))
+            .collect::<Vec<_>>()
+            .join(" ");
         // JOIN documents 拿元数据，FTS5 表提供排序 + snippet。
         // bm25() 越小越相关（负数），ORDER BY rank 升序。
         // snippet(documents_fts, 1, ...) 列序号 1 = text 列。
@@ -323,11 +343,11 @@ impl super::Memory {
                     bm25(documents_fts) AS rank
              FROM documents_fts
              JOIN documents d ON d.rowid = documents_fts.rowid
-             WHERE documents_fts MATCH ? AND d.indexed_at > 0
+             WHERE documents_fts MATCH ?1 AND d.indexed_at > 0
              ORDER BY rank
-             LIMIT ?",
+             LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![query, limit as i64], |r| {
+        let rows = stmt.query_map(params![sanitized, limit as i64], |r| {
             Ok(SearchHit {
                 id: r.get(0)?,
                 path: r.get(1)?,

@@ -12,23 +12,73 @@ import { Group, Panel, Separator } from "react-resizable-panels"
 import { Outlet } from "@tanstack/react-router"
 import { X } from "lucide-react"
 import { Sidebar } from "@/components/shell/Sidebar"
+import { NavRail } from "@/components/shell/NavRail"
+import { lazy, Suspense } from "react"
+
+const FederationView = lazy(() =>
+  import("@/components/federation/FederationView").then((m) => ({ default: m.FederationView })),
+)
+const SkillView = lazy(() =>
+  import("@/components/skill/SkillView").then((m) => ({ default: m.SkillView })),
+)
+const OntologyView = lazy(() =>
+  import("@/components/ontology/OntologyView").then((m) => ({ default: m.OntologyView })),
+)
+const ValidationWorkbenchView = lazy(() =>
+  import("@/components/ontology/ValidationWorkbenchView").then((m) => ({
+    default: m.ValidationWorkbenchView,
+  })),
+)
 import { useUiStore } from "@/stores/ui-store"
 import { useIsMobile } from "@/hooks/useIsMobile"
+
+// 加载占位（懒加载视图 fallback）
+function ViewLoading() {
+  return (
+    <div className="flex h-full items-center justify-center text-xs text-fg-subtle">
+      加载中…
+    </div>
+  )
+}
 
 export function AppShell() {
   const isMobile = useIsMobile()
   const sidebarCollapsed = useUiStore((s) => s.sidebarCollapsed)
+  const activeNav = useUiStore((s) => s.activeNav)
   // 移动端 Drawer 开关（桌面端用 sidebarCollapsed 折叠，二者语义独立）
   const mobileSidebarOpen = useUiStore((s) => s.mobileSidebarOpen)
   const setMobileSidebarOpen = useUiStore((s) => s.setMobileSidebarOpen)
 
-  // ── 移动端：单栏 + Drawer ──
+  // ── 移动端：单栏 + Drawer（NavRail 恒收起模式，方案 A）──
   if (isMobile) {
     return (
-      <div className="flex h-full w-full flex-col overflow-hidden bg-bg text-fg">
-        <div className="min-h-0 flex-1">
+      <div className="flex h-full w-full flex-row-reverse overflow-hidden bg-bg text-fg">
+        {/* NavRail 收起模式恒渲染（flex-row-reverse 使它视觉上仍在左侧） */}
+        <div className="relative min-h-0 flex-1">
           <Outlet />
+          {/* 功能视图：absolute 覆盖主区，fade-in 柔化切换 */}
+          {activeNav === "federation" && (
+            <div className="fade-in absolute inset-0">
+              <Suspense fallback={<ViewLoading />}><FederationView /></Suspense>
+            </div>
+          )}
+          {activeNav === "skills" && (
+            <div className="fade-in absolute inset-0">
+              <Suspense fallback={<ViewLoading />}><SkillView /></Suspense>
+            </div>
+          )}
+          {activeNav === "ontology" && (
+            <div className="fade-in absolute inset-0">
+              <Suspense fallback={<ViewLoading />}><OntologyView /></Suspense>
+            </div>
+          )}
+          {activeNav === "validation" && (
+            <div className="fade-in absolute inset-0">
+              <Suspense fallback={<ViewLoading />}><ValidationWorkbenchView /></Suspense>
+            </div>
+          )}
         </div>
+        <NavRail />
 
         {/* Sidebar Drawer：从左侧滑出，遮罩点击关闭 */}
         {mobileSidebarOpen && (
@@ -59,11 +109,14 @@ export function AppShell() {
     )
   }
 
-  // ── 桌面端：两栏 resizable ──
+  // ── 桌面端：NavRail + （会话视图时）两栏 resizable ──
+  // 非 chat 视图：NavRail + 主区整页（知识库走路由 Outlet；本体/数据源/技能
+  // 由 __root 按 activeNav 条件渲染为覆盖层，盖住主区但不再盖住 NavRail）。
   return (
-    <div className="flex h-full w-full flex-col overflow-hidden bg-bg text-fg">
-      <Group orientation="horizontal" className="flex h-full" id="onto-studio-layout">
-        {!sidebarCollapsed && (
+    <div className="flex h-full w-full overflow-hidden bg-bg text-fg">
+      <NavRail />
+      <Group orientation="horizontal" className="flex h-full min-w-0 flex-1" id="onto-studio-layout">
+        {activeNav === "chat" && !sidebarCollapsed && (
           <>
             <Panel defaultSize="300px" minSize="260px" maxSize="440px" collapsible>
               <Sidebar />
@@ -73,7 +126,31 @@ export function AppShell() {
         )}
 
         <Panel minSize="40%">
-          <Outlet />
+          <div className="relative h-full">
+            <Outlet />
+            {/* 功能视图：absolute 覆盖主区（NavRail 仍可见可切换）。
+                知识库走路由 Outlet（library.tsx），无需覆盖层。fade-in 柔化切换。 */}
+            {activeNav === "federation" && (
+              <div className="fade-in absolute inset-0">
+                <Suspense fallback={<ViewLoading />}><FederationView /></Suspense>
+              </div>
+            )}
+            {activeNav === "skills" && (
+              <div className="fade-in absolute inset-0">
+                <Suspense fallback={<ViewLoading />}><SkillView /></Suspense>
+              </div>
+            )}
+            {activeNav === "ontology" && (
+              <div className="fade-in absolute inset-0">
+                <Suspense fallback={<ViewLoading />}><OntologyView /></Suspense>
+              </div>
+            )}
+          {activeNav === "validation" && (
+            <div className="fade-in absolute inset-0">
+              <Suspense fallback={<ViewLoading />}><ValidationWorkbenchView /></Suspense>
+            </div>
+          )}
+          </div>
         </Panel>
       </Group>
     </div>

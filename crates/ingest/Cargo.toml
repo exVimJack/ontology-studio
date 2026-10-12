@@ -47,8 +47,8 @@ pulldown-cmark = "0.13"
 serde_json.workspace = true
 
 # ── 压缩包（递归 + 深度限制 + 流式，§六 security.rs 防 zip 炸弹） ──
-# ARCHITECTURE.md 写 zip = "8"，但 crates.io 实测 8.x 已下架，最新 9.0.0-pre2。
-zip = "9.0.0-pre2"
+# ARCHITECTURE.md 曾写 zip = "8"，但 crates.io 实测 8.x 已下架；9.0.0 正式版已发布。
+zip = "9"
 tar = "0.4"
 # gzip 解压（tar.gz）；bz2/xz 一期不启用
 flate2 = "1.0"
@@ -64,5 +64,5 @@ uuid.workspace = true
 rayon = "1"
 
 [dev-dependencies]
-zip = "9.0.0-pre2"
+zip = "9"
 flate2 = "1.0"

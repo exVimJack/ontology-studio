@@ -8,19 +8,22 @@ authors.workspace = true
 
 [dependencies]
 # ── Agent 框架（ARCHITECTURE.md 决策 1/2） ──
-# 用 `rig` facade crate（v0.41，re-export rig-core，暴露 rig:: 命名空间，与官方文档示例一致）
+# 用 `rig` facade crate（v0.44，re-export rig-core，暴露 rig:: 命名空间，与官方文档示例一致）
 # 关闭 pdf/epub feature，不用 loaders（自建 ingest 是其超集）
 # default 已含 reqwest + derive + rustls，符合原则 1（rustls，禁 OpenSSL）
 # 启用 memory feature：re-export rig-memory 的历史塑形策略（SlidingWindow/TokenWindow/CompactingMemory）
-rig = { version = "0.41", default-features = false, features = ["reqwest", "derive", "rustls", "memory", "agent"] }
+# 0.44 迁移（2026-10）：AgentBuilder::new(model) 直收模型（client.agent() 已删）、
+# conversation 上移到 builder、流式走 AgentRunner::stream()、
+# OneOrMany→Vec、ToolResult 自带 is_error、DynamicTool 回调去 ToolContext 参。
+rig = { version = "0.44", default-features = false, features = ["reqwest", "derive", "rustls", "memory", "agent"] }
 
 # ── 对话记忆策略（二期 B1/B2：自动压缩复用 rig 原生能力） ──
 # rig-memory 提供 SlidingWindowMemory / TokenWindowMemory / CompactingMemory 等
 # 命名策略，避免手写 trim_history + compact_history。与 rig 同版本锁定。
-rig-memory = { version = "0.41", default-features = false }
+rig-memory = { version = "0.44", default-features = false }
 
 # ── MCP 客户端（决策 1 / 二期 A3） ──
-# rmcp 版本由 rig 0.41 锁定，保持一致以统一版本。
+# rmcp 版本由 rig 0.41 锁定，保持一致以统一版本（rig 0.44 起用 rmcp ^2，随 rig 一并迁移）。
 #   - client：客户端角色基础
 #   - transport-async-rw：通用 (AsyncRead, AsyncWrite) 传输，用于自实现 stdio 子进程 transport
 #     （不用官方 transport-child-process：其依赖 process-wrap 拉入 windows crate 重型包，
@@ -73,7 +76,7 @@ agent-skills = "0.2"
 
 # ── Skill 导入：zip 解压 + 防 zip 炸弹复用 ingest::security ──
 ingest.workspace = true
-zip = "9.0.0-pre2"
+zip = "9"
 
 # ── IPC 类型桥（决策 F5） ──
 # specta 仅用于 #[derive(Type)]，业务逻辑不依赖其运行时。

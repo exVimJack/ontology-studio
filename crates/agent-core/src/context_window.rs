@@ -84,11 +84,14 @@ pub async fn resolve_context_window(config: &ProviderConfig) -> usize {
     // 3. 通用探测（超时+错误保护，失败降级）
     let probed = probe_context_window(config).await;
 
-    // 4. 探测失败 → 内置已知模型表（DeepSeek 等 /models 不暴露 context_length 的 provider）
-    // 5. 表未命中 → 保守默认
-    let window = probed
-        .or_else(|| known_model_window(config))
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    // 4. 探测结果与内置表取大者（修复：GLM-5.3 实测 125k）。
+    //    部分端点（智谱 /models 等）把「输出上限 max_tokens≈128K」当窗口类字段
+    //    返回，探测值明显小于官方窗口时不可信——探测字段无法区分语义，
+    //    对内置表命中的模型以官方窗口为准（探测值更大时仍取探测值，
+    //    尊重 provider 实际部署的裁剪）。
+    //    仅表内模型应用此规则；表外模型维持探测值（无更优参照）。
+    let known = known_model_window(config);
+    let window = combine_probed_and_known(probed, known);
 
     // 写缓存（探测失败的默认值也缓存，避免反复打网络）
     {
@@ -128,10 +131,13 @@ struct KnownModel {
 
 /// 已知模型表（按 model 名前缀匹配）。
 ///
-/// DeepSeek V4 系列（deepseek-v4-pro / deepseek-v4-flash，官方 1M 上下文）；
-/// 旧版 deepseek-chat / deepseek-reasoner（V3.2，官方 128K）。
-/// 这些模型 `/models` 端点不返回 `context_length`，探测必失败，靠本表兜底。
+/// 覆盖探测失败（`/models` 不暴露 context_length）的主流模型，
+/// 数值取官方公开文档。官方 kind 直连时给官方窗口；
+/// `OpenAiCompatible` 第三方端点统一保守 128K（见 known_model_window 注释）。
+/// 常见官方域名供第三方判定：z.ai / bigmodel.cn（智谱）、moonshot.cn（月之暗面）、
+/// aliyuncs.com（百炼/通义）。第三方域名不在表内者仍走 THIRD_PARTY_COMPAT_WINDOW。
 static KNOWN_MODELS: &[KnownModel] = &[
+    // DeepSeek：V4 系列 1M；旧版 V3.2 128K
     KnownModel {
         kinds: &[ProviderKind::DeepSeek, ProviderKind::OpenAiCompatible],
         prefix: "deepseek-v4",
@@ -147,17 +153,134 @@ static KNOWN_MODELS: &[KnownModel] = &[
         prefix: "deepseek-reasoner",
         window: 128_000,
     },
+    // 智谱 GLM（Z.AI）：GLM-5 / 4.7 系列 1M；GLM-4.6 200K；旧 4.5 128K
+    KnownModel {
+        kinds: &[ProviderKind::Zhipu, ProviderKind::OpenAiCompatible],
+        prefix: "glm-5",
+        window: 1_000_000,
+    },
+    KnownModel {
+        kinds: &[ProviderKind::Zhipu, ProviderKind::OpenAiCompatible],
+        prefix: "glm-4.7",
+        window: 1_000_000,
+    },
+    KnownModel {
+        kinds: &[ProviderKind::Zhipu, ProviderKind::OpenAiCompatible],
+        prefix: "glm-4.6",
+        window: 200_000,
+    },
+    KnownModel {
+        kinds: &[ProviderKind::Zhipu, ProviderKind::OpenAiCompatible],
+        prefix: "glm-4",
+        window: 128_000,
+    },
+    // Kimi（月之暗面）：K2.5 1M；旧 kimi-k2 256K
+    KnownModel {
+        kinds: &[ProviderKind::Moonshot, ProviderKind::OpenAiCompatible],
+        prefix: "kimi-k2.5",
+        window: 1_000_000,
+    },
+    KnownModel {
+        kinds: &[ProviderKind::Moonshot, ProviderKind::OpenAiCompatible],
+        prefix: "kimi-k2",
+        window: 256_000,
+    },
+    // Anthropic Claude（官方 /v1/models 不暴露窗口）：Sonnet/Opus 200K
+    KnownModel {
+        kinds: &[ProviderKind::Anthropic],
+        prefix: "claude-",
+        window: 200_000,
+    },
+    // Grok（xAI）：Grok-5 2M；旧 grok-4 256K
+    KnownModel {
+        kinds: &[ProviderKind::Xai],
+        prefix: "grok-5",
+        window: 2_000_000,
+    },
+    KnownModel {
+        kinds: &[ProviderKind::Xai],
+        prefix: "grok-",
+        window: 256_000,
+    },
+    // Mistral：Large 256K；通用 128K
+    KnownModel {
+        kinds: &[ProviderKind::Mistral, ProviderKind::OpenAiCompatible],
+        prefix: "mistral-large",
+        window: 256_000,
+    },
+    KnownModel {
+        kinds: &[ProviderKind::Mistral, ProviderKind::OpenAiCompatible],
+        prefix: "mistral-",
+        window: 128_000,
+    },
 ];
 
 /// 内置已知模型表匹配（纯静态，无网络）。
 ///
 /// kind 命中 + 模型名前缀命中 → 官方窗口；否则 None（上层降级保守默认）。
-fn known_model_window(config: &ProviderConfig) -> Option<usize> {
-    KNOWN_MODELS
-        .iter()
-        .find(|m| m.kinds.contains(&config.kind) && config.model.starts_with(m.prefix))
-        .map(|m| m.window)
+///
+/// **第三方托管不套官方窗口**（回归修复）：`OpenAiCompatible` 连的可能是百炼/
+/// OpenRouter 等托管端点，实际部署的输入上限/限流策略未必等于模型官方窗口
+/// （实测：百炼托管的 deepseek-v4-flash 按官方 1M 算，导致 CompactingMemory
+/// 从不裁剪，~13 万 token/请求触发 429 insufficient_quota/token-limit）。
+/// 仅当 base_url 是官方域名（deepseek.com）或未填时才给官方窗口；
+/// 第三方域名一律保守 128K，用户可通过显式配置 context_window 覆盖。
+/// 探测值与内置表值的取舍（纯函数，可单测）。
+///
+/// - 两者都有 → 取大者：部分端点（智谱 /models 等）把「输出上限
+///   max_tokens≈128K」当窗口字段返回，探测字段无法区分语义，表内模型
+///   以官方窗口为下限；探测值更大时仍取探测值（尊重 provider 实际
+///   部署的更大窗口/裁剪）。
+/// - 仅其一时取其一；都无 → None（上层落保守默认）。
+fn combine_probed_and_known(probed: Option<usize>, known: Option<usize>) -> usize {
+    match (probed, known) {
+        (Some(p), Some(k)) => p.max(k),
+        (p, k) => p.or(k).unwrap_or(DEFAULT_CONTEXT_WINDOW),
+    }
 }
+
+fn known_model_window(config: &ProviderConfig) -> Option<usize> {
+    let model = KNOWN_MODELS
+        .iter()
+        .find(|m| m.kinds.contains(&config.kind) && config.model.starts_with(m.prefix))?;
+    if matches!(config.kind, ProviderKind::OpenAiCompatible) {
+        let host = config
+            .base_url
+            .as_deref()
+            .map(|url| {
+                url.trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        // 官方端点域名表（含子域）：deepseek.com / z.ai / bigmodel.cn /
+        // moonshot.cn / api.moonshot.ai —— 命中给官方窗口，否则保守 128K
+        let official_suffixes = [
+            "deepseek.com",
+            "z.ai",
+            "bigmodel.cn",
+            "moonshot.cn",
+            "moonshot.ai",
+            "mistral.ai",
+            "x.ai",
+        ];
+        let is_official = host.is_empty()
+            || official_suffixes
+                .iter()
+                .any(|d| host == *d || host.ends_with(&format!(".{d}")));
+        if !is_official {
+            return Some(THIRD_PARTY_COMPAT_WINDOW);
+        }
+    }
+    Some(model.window)
+}
+
+/// 第三方 OpenAI 兼容端点托管已知模型时的保守窗口（token）。
+/// 托管端点实际部署未必等于官方窗口，取主流安全值。
+const THIRD_PARTY_COMPAT_WINDOW: usize = 128_000;
 
 /// 同步解析（无网络）：用户配置 → 内置已知模型表 → 保守默认。
 ///
@@ -513,7 +636,10 @@ mod tests {
             ],
             "has_more": false
         });
-        assert_eq!(parse_anthropic_context_window(&body, "claude-sonnet-5"), Some(200_000));
+        assert_eq!(
+            parse_anthropic_context_window(&body, "claude-sonnet-5"),
+            Some(200_000)
+        );
     }
 
     #[test]
@@ -536,7 +662,10 @@ mod tests {
             ],
             "has_more": false
         });
-        assert_eq!(parse_anthropic_context_window(&body, "claude-sonnet-5"), None);
+        assert_eq!(
+            parse_anthropic_context_window(&body, "claude-sonnet-5"),
+            None
+        );
     }
 
     // ── Gemini models.get（官方 inputTokenLimit 字段） ──
@@ -553,7 +682,8 @@ mod tests {
 
     #[test]
     fn gemini_parse_missing_limit() {
-        let body = serde_json::json!({ "name": "models/gemini-3.1-pro", "description": "no limits" });
+        let body =
+            serde_json::json!({ "name": "models/gemini-3.1-pro", "description": "no limits" });
         assert_eq!(parse_gemini_input_token_limit(&body), None);
     }
 
@@ -567,9 +697,15 @@ mod tests {
         ]);
         let arr = data.as_array().unwrap();
         // 精确命中
-        assert_eq!(find_model_entry(arr, "deepseek-chat").unwrap()["id"], "deepseek-chat");
+        assert_eq!(
+            find_model_entry(arr, "deepseek-chat").unwrap()["id"],
+            "deepseek-chat"
+        );
         // id 含 model（openrouter 风格 deepseek/xxx）
-        assert_eq!(find_model_entry(arr, "deepseek-reasoner").unwrap()["id"], "deepseek/deepseek-reasoner");
+        assert_eq!(
+            find_model_entry(arr, "deepseek-reasoner").unwrap()["id"],
+            "deepseek/deepseek-reasoner"
+        );
         // 未命中
         assert_eq!(find_model_entry(arr, "gpt-4o"), None);
     }
@@ -596,8 +732,16 @@ mod tests {
 
     #[test]
     fn cache_key_differs_by_base_url() {
-        let c1 = cfg(ProviderKind::OpenAiCompatible, Some("https://a.com/v1"), "m");
-        let c2 = cfg(ProviderKind::OpenAiCompatible, Some("https://b.com/v1"), "m");
+        let c1 = cfg(
+            ProviderKind::OpenAiCompatible,
+            Some("https://a.com/v1"),
+            "m",
+        );
+        let c2 = cfg(
+            ProviderKind::OpenAiCompatible,
+            Some("https://b.com/v1"),
+            "m",
+        );
         assert_ne!(cache_key(&c1), cache_key(&c2));
     }
 
@@ -617,6 +761,112 @@ mod tests {
         let c = cfg(ProviderKind::DeepSeek, None, "deepseek-chat");
         assert_eq!(known_model_window(&c), Some(128_000));
         let c = cfg(ProviderKind::DeepSeek, None, "deepseek-reasoner");
+        assert_eq!(known_model_window(&c), Some(128_000));
+    }
+
+    #[test]
+    fn known_model_third_party_compat_uses_conservative_window() {
+        // 回归：百炼等第三方 OpenAI 兼容端点托管的 deepseek-v4-flash，
+        // 不套官方 1M 窗口（实际曾致 CompactingMemory 不裁剪 → 13 万 token/请求 429）
+        let c = cfg(
+            ProviderKind::OpenAiCompatible,
+            Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            "deepseek-v4-flash-0731",
+        );
+        assert_eq!(known_model_window(&c), Some(128_000));
+
+        // 官方域名（含子域）仍给官方窗口
+        let c = cfg(
+            ProviderKind::OpenAiCompatible,
+            Some("https://api.deepseek.com/v1"),
+            "deepseek-v4-flash",
+        );
+        assert_eq!(known_model_window(&c), Some(1_000_000));
+
+        // 未填 base_url（无法判定第三方）→ 官方窗口
+        let c = cfg(ProviderKind::OpenAiCompatible, None, "deepseek-v4-flash");
+        assert_eq!(known_model_window(&c), Some(1_000_000));
+
+        // kind=DeepSeek（预设选的官方）不受 base_url 影响
+        let c = cfg(
+            ProviderKind::DeepSeek,
+            Some("https://api.deepseek.com/v1"),
+            "deepseek-v4-flash",
+        );
+        assert_eq!(known_model_window(&c), Some(1_000_000));
+    }
+
+    // ── 探测值与内置表取舍（combine_probed_and_known） ──
+
+    #[test]
+    fn combine_probed_below_known_uses_known() {
+        // 回归（GLM-5.3 实测 125k）：智谱 /models 返回 128K 级字段
+        // （实为 max_tokens 输出上限）压不过内置表官方窗口
+        assert_eq!(combine_probed_and_known(Some(128_000), Some(1_000_000)), 1_000_000);
+    }
+
+    #[test]
+    fn combine_probed_above_known_uses_probed() {
+        // provider 实际部署了更大窗口（裁剪/升配）→ 尊重探测值
+        assert_eq!(combine_probed_and_known(Some(2_000_000), Some(1_000_000)), 2_000_000);
+    }
+
+    #[test]
+    fn combine_probed_only_uses_probed() {
+        // 表外模型（内置表 None）：维持探测值，不被默认值覆盖
+        assert_eq!(combine_probed_and_known(Some(64_000), None), 64_000);
+    }
+
+    #[test]
+    fn combine_known_only_uses_known() {
+        // 探测失败（网络/端点不暴露）：内置表兜底
+        assert_eq!(combine_probed_and_known(None, Some(200_000)), 200_000);
+    }
+
+    #[test]
+    fn combine_none_falls_to_default() {
+        // 双双缺失 → 保守默认
+        assert_eq!(combine_probed_and_known(None, None), DEFAULT_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn known_model_glm_kimi_claude_grok_mistral() {
+        // 智谱 GLM（官方 kind 直连）：GLM-5.x 1M、4.6 200K、旧 4.x 128K
+        let c = cfg(ProviderKind::Zhipu, None, "glm-5.3");
+        assert_eq!(known_model_window(&c), Some(1_000_000));
+        let c = cfg(ProviderKind::Zhipu, None, "glm-4.6");
+        assert_eq!(known_model_window(&c), Some(200_000));
+        let c = cfg(ProviderKind::Zhipu, None, "glm-4.5-air");
+        assert_eq!(known_model_window(&c), Some(128_000));
+        // 智谱官方域名走 OpenAiCompatible 也是官方窗口
+        let c = cfg(
+            ProviderKind::OpenAiCompatible,
+            Some("https://open.bigmodel.cn/api/paas/v4"),
+            "glm-5.3",
+        );
+        assert_eq!(known_model_window(&c), Some(1_000_000));
+        // Kimi K2.5 1M；旧 kimi-k2 256K
+        let c = cfg(ProviderKind::Moonshot, None, "kimi-k2.5-turbo");
+        assert_eq!(known_model_window(&c), Some(1_000_000));
+        let c = cfg(ProviderKind::Moonshot, None, "kimi-k2-0711-preview");
+        assert_eq!(known_model_window(&c), Some(256_000));
+        // Claude（Anthropic 官方）200K
+        let c = cfg(ProviderKind::Anthropic, None, "claude-sonnet-4-5");
+        assert_eq!(known_model_window(&c), Some(200_000));
+        // Grok 5 2M；旧 grok-4 256K
+        let c = cfg(ProviderKind::Xai, None, "grok-5");
+        assert_eq!(known_model_window(&c), Some(2_000_000));
+        let c = cfg(ProviderKind::Xai, None, "grok-4");
+        assert_eq!(known_model_window(&c), Some(256_000));
+        // Mistral Large 256K
+        let c = cfg(ProviderKind::Mistral, None, "mistral-large-latest");
+        assert_eq!(known_model_window(&c), Some(256_000));
+        // 百炼托管 GLM（第三方域名）→ 保守 128K
+        let c = cfg(
+            ProviderKind::OpenAiCompatible,
+            Some("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            "glm-5.3",
+        );
         assert_eq!(known_model_window(&c), Some(128_000));
     }
 
@@ -657,9 +907,11 @@ mod tests {
 
     #[test]
     fn resolve_known_or_default_ignores_zero_config() {
-        // 0 是无效输入，降级到表/默认（负数在 serde→u64 阶段已被拒绝，到不了这里）
+        // 0 是无效输入，降级到表/默认（负数在 serde→u64 阶段已被拒绝，到不了这里）。
+        // 注：cfg_with_window 是 OpenAiCompatible + example.com（第三方端点），
+        // deepseek-v4 命中表但按第三方保守窗口 128K（回归修复后行为）
         let c = cfg_with_window("deepseek-v4-pro", 0);
-        assert_eq!(resolve_known_or_default(&c), 1_000_000);
+        assert_eq!(resolve_known_or_default(&c), 128_000);
         let c = cfg_with_window("unknown-model", 0);
         assert_eq!(resolve_known_or_default(&c), DEFAULT_CONTEXT_WINDOW);
     }
@@ -688,12 +940,12 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_user_config_zero_treated_as_invalid() {
-        // 填 0（或负数）是无效输入：降级自动探测/已知表，而不是把窗口设为 0
+        // 填 0（或负数）是无效输入：降级自动探测/已知表，而不是把窗口设为 0。
+        // cfg_with_window 是第三方端点（example.com）→ deepseek-v4 按保守 128K
         invalidate_cache();
-        // 命中已知表（deepseek-v4 → 1M）
         let c = cfg_with_window("deepseek-v4-pro", 0);
         let w = resolve_context_window(&c).await;
-        assert_eq!(w, 1_000_000);
+        assert_eq!(w, 128_000);
         // 未命中表 → 保守默认
         let c = cfg_with_window("unknown-model", 0);
         let w = resolve_context_window(&c).await;

@@ -15,10 +15,8 @@ import {
 import { TitleBar } from "@/components/shell/TitleBar";
 import { AppShell } from "@/components/shell/AppShell";
 import { CommandPalette } from "@/components/shell/CommandPalette";
-import { SettingsView } from "@/components/settings/SettingsView";
-import { FederationView } from "@/components/federation/FederationView";
-import { SkillView } from "@/components/skill/SkillView";
-import { OntologyView } from "@/components/ontology/OntologyView";
+import { ModelSettingsModal } from "@/components/settings/ModelSettingsPanel";
+import { McpSettingsModal } from "@/components/settings/McpSettingsPanel";
 import { FileDropZone } from "@/components/library/FileDropZone";
 import { useUiStore, applyTheme } from "@/stores/ui-store";
 import { useCreateConversation } from "@/hooks/useConversations";
@@ -31,14 +29,13 @@ export const Route = createRootRouteWithContext()({
 
 function RootComponent() {
   const setPaletteOpen = useUiStore((s) => s.setCommandPaletteOpen);
-  const setSettingsOpen = useUiStore((s) => s.setSettingsOpen);
+  const setModelSettingsOpen = useUiStore((s) => s.setModelSettingsOpen);
+  const setMcpSettingsOpen = useUiStore((s) => s.setMcpSettingsOpen);
   const createConv = useCreateConversation();
   const navigate = useNavigate();
   const theme = useUiStore((s) => s.theme);
-  const settingsOpen = useUiStore((s) => s.settingsOpen);
-  const federationOpen = useUiStore((s) => s.federationOpen);
-  const skillsOpen = useUiStore((s) => s.skillsOpen);
-  const ontologyOpen = useUiStore((s) => s.ontologyOpen);
+  const modelSettingsOpen = useUiStore((s) => s.modelSettingsOpen);
+  const mcpSettingsOpen = useUiStore((s) => s.mcpSettingsOpen);
 
   // 切会话清理上一会话残留的已结束摄入任务（原 setCurrentConversation 副作用，
   // 现由路由派生的 id 变化触发）。
@@ -50,6 +47,21 @@ function RootComponent() {
     // 仅清 Done（看板本就不显示的瞬态态），保留 Error/Cancelled 供回看。
     useIngestStore.getState().clearFinished();
   }, [conversationId]);
+
+  // 路由 ↔ activeNav 单向同步（路由是知识库视图的真相源）：
+  // 进入 /library 高亮知识库；离开时若 activeNav 还停在 library 则回会话视图。
+  // 本体/数据源/技能不走路由，由 NavRail 直接驱动 activeNav，不在此处理。
+  useEffect(() => {
+    const u = useUiStore.getState();
+    if (location.pathname === "/library" && u.activeNav !== "library") {
+      u.setActiveNav("library");
+    } else if (
+      location.pathname !== "/library" &&
+      u.activeNav === "library"
+    ) {
+      u.setActiveNav("chat");
+    }
+  }, [location.pathname]);
 
   // 主题：初始应用 + 监听变化
   useEffect(() => {
@@ -80,18 +92,23 @@ function RootComponent() {
           e.preventDefault();
           createConv.mutate({});
         }
-      } else if (mod && e.key === ",") {
-        // ⌘, 打开设置
+      } else if (mod && e.key.toLowerCase() === "m" && !e.shiftKey) {
+        // ⌘M 打开模型设置（输入框聚焦时不抢——输入框没有 ⌘M 默认行为）
         e.preventDefault();
-        setSettingsOpen(true);
+        setModelSettingsOpen(true);
+      } else if (mod && e.shiftKey && e.key.toLowerCase() === "m") {
+        // ⌘⇧M 打开 MCP 工具服务器设置
+        e.preventDefault();
+        setMcpSettingsOpen(true);
       } else if (mod && e.key.toLowerCase() === "b") {
         // ⌘B 文件库（§16 快捷键）
         e.preventDefault();
+        useUiStore.getState().setActiveNav("library");
         navigate({ to: "/library" });
       } else if (mod && e.shiftKey && e.key.toLowerCase() === "f") {
         // ⌘Shift+F 联邦查询
         e.preventDefault();
-        useUiStore.getState().setFederationOpen(true);
+        useUiStore.getState().setActiveNav("federation");
       }
     };
     window.addEventListener("keydown", onKey);
@@ -106,10 +123,12 @@ function RootComponent() {
       </div>
       <CommandPalette />
       <FileDropZone />
-      {settingsOpen && <SettingsView onClose={() => setSettingsOpen(false)} />}
-      {federationOpen && <FederationView />}
-      {skillsOpen && <SkillView />}
-      {ontologyOpen && <OntologyView />}
+      {modelSettingsOpen && (
+        <ModelSettingsModal onClose={() => setModelSettingsOpen(false)} />
+      )}
+      {mcpSettingsOpen && (
+        <McpSettingsModal onClose={() => setMcpSettingsOpen(false)} />
+      )}
     </div>
   );
 }

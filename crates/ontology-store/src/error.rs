@@ -25,6 +25,9 @@ pub enum StoreError {
     #[error("引用完整性违反: {0}")]
     ReferentialIntegrity(String),
 
+    #[error("输入非法: {0}")]
+    InvalidInput(String),
+
     #[error("字段非法: 实体 '{entity}' 出现未知字段 '{field}'")]
     UnknownField { entity: String, field: String },
 
@@ -34,7 +37,7 @@ pub enum StoreError {
     #[error("SQLite 错误: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
-#[error("Turtle 语法错误: {0}")]
+    #[error("Turtle 语法错误: {0}")]
     TurtleSyntax(String),
 
     #[error("W3C 语义规范违反: {0}")]

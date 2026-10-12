@@ -6,14 +6,17 @@
 
 #[test]
 fn pdfium_resource_resolves_and_inits() {
-    // 模拟 pdfium::platform_lib_rel() + 兜底逻辑
+    // 模拟 pdfium::platform_lib_rel() + 兜底逻辑（按目标平台选库）
     let manifest = env!("CARGO_MANIFEST_DIR");
+    #[cfg(target_os = "macos")]
+    let rel = "pdfium/mac-arm64/libpdfium.dylib";
+    #[cfg(not(target_os = "macos"))]
     let rel = "pdfium/win-x64/pdfium.dll";
     let path = std::path::Path::new(manifest).join("resources").join(rel);
 
     if !path.exists() {
         eprintln!(
-            "[skip] {} 不存在（非 Windows x64 或未运行 fetch-pdfium），跳过",
+            "[skip] {} 不存在（非本平台资源或未运行 fetch-pdfium），跳过",
             path.display()
         );
         return;

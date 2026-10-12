@@ -10,8 +10,10 @@
 //!     （避免超长会话从 SQLite 拉全量 content 阻塞几秒）。
 //!     限额 200 条远大于 TokenWindow 裁剪窗口——足够窗口判定+压缩选则，
 //!     同时保证 SQLite 扫描量可控（单表再大也只取 200 行）。
-//!   - `CompactingMemory` 包裹 Memory + `TokenWindowMemory` policy + `LlmCompactor`：
+//!   - `CompactingMemory` 包裹 Memory + `AdaptiveWindowPolicy` + `LlmCompactor`：
 //!     load 时自动裁剪超预算的旧历史并生成滚动摘要（carry_over），splice 进返回 history。
+//!     预算按分档比例（75%/50%/85%，留刹车距离）而非 100% 窗口；
+//!     前 3 条消息（首轮任务指令）永不逐出（借鉴 Hermes 压缩机制）。
 //!     摘要仅存进程内存 state（不落 DB），重启后重新 compact（可接受）。
 //!   - `LlmCompactor` impl `Compactor`：调 LLM 把 evicted 旧历史压缩成 `TextSummary`。
 //!     因 ChatService 的 client 是泛型 enum，用 `SummaryFn` trait object 擦除。
@@ -28,11 +30,11 @@ const MESSAGE_LOAD_LIMIT: usize = 200;
 use std::sync::Arc;
 
 use rig::completion::message::{AssistantContent, Message, UserContent};
-use rig::memory::{ConversationMemory, MemoryError};
+use rig::id::ConversationId;
+use rig::memory::{CompactingMemory, ConversationMemory, HeuristicTokenCounter, MemoryError, TokenWindowMemory};
 use rig::wasm_compat::WasmBoxedFuture;
-use rig_memory::{CompactingMemory, HeuristicTokenCounter, TokenWindowMemory};
 
-use memory::{MessageRole, MessageStatus, Memory};
+use memory::{Memory, MessageRole, MessageStatus};
 
 // ── newtype 包装：绕过孤儿规则（不能为外部类型 Arc<Memory> impl 外部 trait） ──
 
@@ -54,20 +56,22 @@ impl From<Arc<Memory>> for SqliteMemory {
 impl ConversationMemory for SqliteMemory {
     fn load<'a>(
         &'a self,
-        conversation_id: &'a str,
+        conversation_id: &'a ConversationId,
     ) -> WasmBoxedFuture<'a, Result<Vec<Message>, MemoryError>> {
         Box::pin(async move {
             let rows = self
                 .0
-                .list_messages_limited(conversation_id, Some(MESSAGE_LOAD_LIMIT))
-                .map_err(|e| MemoryError::Backend(Box::new(std::io::Error::other(e.to_string()))))?;
+                .list_messages_limited(conversation_id.as_str(), Some(MESSAGE_LOAD_LIMIT))
+                .map_err(|e| {
+                    MemoryError::Backend(Box::new(std::io::Error::other(e.to_string())))
+                })?;
             Ok(rows_to_messages(&rows))
         })
     }
 
     fn append<'a>(
         &'a self,
-        conversation_id: &'a str,
+        conversation_id: &'a ConversationId,
         messages: Vec<Message>,
     ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
         // no-op：消息由 send_message 手动建（前端需预生成 message_id 做 patch）。
@@ -79,11 +83,11 @@ impl ConversationMemory for SqliteMemory {
 
     fn clear<'a>(
         &'a self,
-        conversation_id: &'a str,
+        conversation_id: &'a ConversationId,
     ) -> WasmBoxedFuture<'a, Result<(), MemoryError>> {
         Box::pin(async move {
             self.0
-                .delete_conversation_messages(conversation_id)
+                .delete_conversation_messages(conversation_id.as_str())
                 .map_err(|e| MemoryError::Backend(Box::new(std::io::Error::other(e.to_string()))))
         })
     }
@@ -99,16 +103,18 @@ fn rows_to_messages(rows: &[memory::MessageRow]) -> Vec<Message> {
         .filter(|m| {
             m.status == MessageStatus::Complete
                 && !m.content.is_empty()
-                && matches!(m.role, MessageRole::User | MessageRole::Assistant | MessageRole::System)
+                && matches!(
+                    m.role,
+                    MessageRole::User | MessageRole::Assistant | MessageRole::System
+                )
         })
         .map(|m| match m.role {
             MessageRole::User => Message::User {
-                content: rig::OneOrMany::one(UserContent::text(m.content.clone())),
+                content: vec![UserContent::text(m.content.clone())],
             },
-            MessageRole::Assistant => Message::Assistant {
-                id: None,
-                content: rig::OneOrMany::one(AssistantContent::text(m.content.clone())),
-            },
+            MessageRole::Assistant => Message::Assistant(
+                rig::completion::message::AssistantMessage::new(vec![AssistantContent::text(m.content.clone())]),
+            ),
             MessageRole::System => Message::System {
                 content: m.content.clone(),
             },
@@ -157,7 +163,7 @@ impl rig::memory::Compactor for LlmCompactor {
 
     fn compact<'a>(
         &'a self,
-        _conversation_id: &'a str,
+        _conversation_id: &'a ConversationId,
         evicted: &'a [Message],
         carry_over: Option<&'a Self::Artifact>,
     ) -> WasmBoxedFuture<'a, Result<Self::Artifact, MemoryError>> {
@@ -191,15 +197,9 @@ fn messages_to_compaction_text(messages: &[Message]) -> String {
     let mut buf = String::new();
     for m in messages {
         let (role, text) = match m {
-            Message::User { content } => {
-                ("用户", first_text(content))
-            }
-            Message::Assistant { content, .. } => {
-                ("助手", first_text_assistant(content))
-            }
-            Message::System { content } => {
-                ("系统", content.clone())
-            }
+            Message::User { content } => ("用户", first_text(content)),
+            Message::Assistant(a) => ("助手", first_text_assistant(&a.content)),
+            Message::System { content } => ("系统", content.clone()),
         };
         if text.is_empty() {
             continue;
@@ -212,7 +212,7 @@ fn messages_to_compaction_text(messages: &[Message]) -> String {
     buf
 }
 
-fn first_text(content: &rig::OneOrMany<UserContent>) -> String {
+fn first_text(content: &[UserContent]) -> String {
     for c in content.iter() {
         if let UserContent::Text(t) = c {
             return t.text.clone();
@@ -221,7 +221,7 @@ fn first_text(content: &rig::OneOrMany<UserContent>) -> String {
     String::new()
 }
 
-fn first_text_assistant(content: &rig::OneOrMany<AssistantContent>) -> String {
+fn first_text_assistant(content: &[AssistantContent]) -> String {
     for c in content.iter() {
         if let AssistantContent::Text(t) = c {
             return t.text.clone();
@@ -230,22 +230,104 @@ fn first_text_assistant(content: &rig::OneOrMany<AssistantContent>) -> String {
     String::new()
 }
 
-// ── 构造：Memory + CompactingMemory 组合 ───────────────────────
+// ── 构造：Memory + CompactingMemory 组合 ───────────────────────────
+
+/// head 保护条数：前 3 条消息（含首轮任务指令）永不逐出（借鉴 Hermes
+/// `compression.protect_first_n`）。
+///
+/// 本体建模会话的首条用户消息（建表 DDL + 遵守 charter 指令）是全链路最重要的
+/// 上下文，被摘要掉后 agent 会丢失任务约束。head 不计入裁剪预算——消息数固定
+/// 且为纯文本，体量有界，不会失控。
+const PROTECT_HEAD_N: usize = 3;
+
+/// 极小窗口阈值（token）：窗口很小 → 尽量用满再压（85%），避免频繁压缩。
+const TINY_WINDOW: usize = 32_768;
+
+/// 大窗口阈值（token）：≥ 此值 → 50% 即压，窗口足够大时更早压缩换稳定性。
+const LARGE_WINDOW: usize = 512 * 1024;
+
+/// 分档压缩触发比例（借鉴 Hermes 三档阈值，含“刹车距离”）。
+///
+/// 压缩本身要调一次 LLM 生成摘要，这个请求自己也占窗口——等 100% 满再压，
+/// 压缩请求自身就可能超限（实测：12.9 万 token 请求打到托管端点 429）。
+/// 预留 15%~50% 的刹车距离确保「当前 token + 新消息 + 压缩请求 < 100%」。
+///
+/// - 极小窗口（≤32K）：85% —— 窗口紧张，尽量用满
+/// - 大窗口（≥512K）：50% —— 窗口充裕，早压换稳定
+/// - 其他（主流 128K~200K）：75% —— 安全平衡点
+pub fn compression_ratio(context_window: usize) -> f64 {
+    if context_window <= TINY_WINDOW {
+        0.85
+    } else if context_window >= LARGE_WINDOW {
+        0.50
+    } else {
+        0.75
+    }
+}
+
+/// 压缩预算（token）= 窗口 × 分档比例。取整并至少保留 1024，防御 0 预算。
+pub fn compression_budget(context_window: usize) -> usize {
+    let budget = (context_window as f64 * compression_ratio(context_window)) as usize;
+    budget.max(1_024).min(context_window)
+}
+
+/// 分档阈值 + head 保护的窗口裁剪策略（包 rig `TokenWindowMemory`）。
+///
+/// - 预算 = `compression_budget(window)`（非 100%，留刹车距离，见分档注释）
+/// - 前 `PROTECT_HEAD_N` 条消息绕过预算直接保留，永不进 demoted
+///   （孤立 tool-result 清理等 rig 原生行为在余下消息上照常生效）
+pub struct AdaptiveWindowPolicy {
+    inner: TokenWindowMemory,
+}
+
+impl AdaptiveWindowPolicy {
+    pub fn new(context_window: usize) -> Self {
+        Self {
+            inner: TokenWindowMemory::new(
+                compression_budget(context_window),
+                // bytes/4 与 0.41 HeuristicTokenCounter::openai() 同参数（0.44 删该 ctor）
+                HeuristicTokenCounter::new(4.0, 4, 0),
+            ),
+        }
+    }
+}
+
+impl rig::memory::MemoryPolicy for AdaptiveWindowPolicy {
+    fn apply(&self, messages: Vec<Message>) -> Result<Vec<Message>, MemoryError> {
+        Ok(self.apply_with_demoted(messages)?.0)
+    }
+
+    fn apply_with_demoted(
+        &self,
+        messages: Vec<Message>,
+    ) -> Result<(Vec<Message>, Vec<Message>), MemoryError> {
+        let n = messages.len();
+        if n <= PROTECT_HEAD_N {
+            // 消息数不多于保护条数：全保留，不触发压缩
+            return Ok((messages, Vec::new()));
+        }
+        let (head, rest) = messages.split_at(PROTECT_HEAD_N);
+        let (kept, demoted) = self.inner.apply_with_demoted(rest.to_vec())?;
+        let mut window = head.to_vec();
+        window.extend(kept);
+        Ok((window, demoted))
+    }
+}
 
 /// 构造一个带自动压缩的 `ConversationMemory`。
 ///
 /// - `memory`: SQLite 后端（Arc 共享）
-/// - `context_window`: 模型上下文窗口 token 数（token 预算）
+/// - `context_window`: 模型上下文窗口 token 数（内部按分档比例留刹车距离）
 /// - `summarize`: LLM 摘要函数（provider client 提供）
 ///
 /// 返回的 `CompactingMemory` 可直接挂到 `AgentBuilder::memory()`。
-/// load 时自动裁剪超 `context_window` 的旧历史并滚动摘要。
+/// load 时自动裁剪超预算的旧历史并滚动摘要；前 3 条永不被裁。
 pub fn build_compacting_memory(
     memory: Arc<Memory>,
     context_window: usize,
     summarize: SummaryFn,
-) -> CompactingMemory<SqliteMemory, TokenWindowMemory, LlmCompactor> {
-    let policy = TokenWindowMemory::new(context_window, HeuristicTokenCounter::openai());
+) -> CompactingMemory<SqliteMemory, AdaptiveWindowPolicy, LlmCompactor> {
+    let policy = AdaptiveWindowPolicy::new(context_window);
     let compactor = LlmCompactor::new(summarize);
     CompactingMemory::new(SqliteMemory(memory), policy, compactor)
 }
@@ -262,6 +344,133 @@ pub async fn resolve_window_or_default(config: &crate::provider::ProviderConfig)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig::memory::MemoryPolicy as _; // apply_with_demoted 是 trait 方法
+
+    // ── 分档压缩阈值 + head 保护 ──
+
+    #[test]
+    fn compression_ratio_tiers() {
+        // 极小窗口：85%（尽量用满）
+        assert_eq!(compression_ratio(8_192), 0.85);
+        assert_eq!(compression_ratio(32_768), 0.85);
+        // 主流窗口（128K~200K）：75%
+        assert_eq!(compression_ratio(128_000), 0.75);
+        assert_eq!(compression_ratio(200_000), 0.75);
+        assert_eq!(compression_ratio(511_999), 0.75);
+        // 大窗口（≥512K）：50%
+        assert_eq!(compression_ratio(512 * 1024), 0.50);
+        assert_eq!(compression_ratio(1_000_000), 0.50);
+    }
+
+    #[test]
+    fn compression_budget_leaves_braking_distance() {
+        // 128K 窗口 → 75% = 96K（非 100%：压缩请求自身也占窗口）
+        assert_eq!(compression_budget(128_000), 96_000);
+        // 1M 窗口 → 50%
+        assert_eq!(compression_budget(1_000_000), 500_000);
+        // 极小窗口防 0 预算
+        assert_eq!(compression_budget(1), 1_024.min(1));
+    }
+
+    #[test]
+    fn adaptive_policy_protects_head() {
+        // 5 条消息、极小预算：前 3 条（head）永不逐出，其余被裁
+        let policy = AdaptiveWindowPolicy::new(1); // 预算压到极小
+        let msgs: Vec<Message> = (0..5)
+            .map(|i| Message::User {
+                content: vec![UserContent::text(format!("m{i}"))],
+            })
+            .collect();
+        let (window, demoted) = policy.apply_with_demoted(msgs).unwrap();
+        assert_eq!(window.len(), 3, "head 3 条保留");
+        assert_eq!(demoted.len(), 2, "余下 2 条被逐出交压缩");
+        assert!(matches!(&window[0], Message::User { content } if
+            matches!(content.first(), Some(UserContent::Text(t)) if t.text == "m0")));
+    }
+
+    #[test]
+    fn adaptive_policy_no_compact_when_short() {
+        // 消息数 ≤ 保护条数：全保留不压缩
+        let policy = AdaptiveWindowPolicy::new(1);
+        let msgs: Vec<Message> = (0..3)
+            .map(|i| Message::User {
+                content: vec![UserContent::text(format!("m{i}"))],
+            })
+            .collect();
+        let (window, demoted) = policy.apply_with_demoted(msgs).unwrap();
+        assert_eq!(window.len(), 3);
+        assert!(demoted.is_empty());
+    }
+
+    #[test]
+    fn adaptive_policy_keeps_within_budget_when_head_small() {
+        // 大预算下行为等价 TokenWindowMemory：全部保留
+        let policy = AdaptiveWindowPolicy::new(100_000);
+        let msgs: Vec<Message> = (0..10)
+            .map(|i| Message::User {
+                content: vec![UserContent::text(format!("m{i}"))],
+            })
+            .collect();
+        let (window, demoted) = policy.apply_with_demoted(msgs).unwrap();
+        assert_eq!(window.len(), 10);
+        assert!(demoted.is_empty());
+    }
+
+    #[test]
+    fn adaptive_policy_head_bypasses_budget() {
+        // head 消息即使体量巨大也不逐出（任务指令保护优先于预算）：
+        // 第 1 条 100KB 文本 + 后续小消息，预算极小 → head 全保 + 其余被裁
+        let big = "任".repeat(50_000); // 150KB UTF-8 ≈ 37.5k token，远超预算
+        let mut msgs = vec![Message::User {
+            content: vec![UserContent::text(big)],
+        }];
+        msgs.extend((0..4).map(|i| Message::User {
+            content: vec![UserContent::text(format!("m{i}"))],
+        }));
+        let policy = AdaptiveWindowPolicy::new(1);
+        let (window, demoted) = policy.apply_with_demoted(msgs).unwrap();
+        assert_eq!(window.len(), 3, "head 3 条（含巨大首条）保留");
+        assert_eq!(demoted.len(), 2);
+    }
+
+    #[test]
+    fn adaptive_policy_orphan_tool_result_cleanup_still_works() {
+        // 交互回归：head splice 后内层 TokenWindowMemory 的孤立 tool-result
+        // 清理照常生效——rig 会把「开头是 tool_result」的消息挪进 demoted。
+        // 构造：head 3 条普通消息 + 1 条孤立 tool_result + 1 条普通（预算极小，
+        // 除 head 外全部逐出 → 内层返回空 window，无孤儿可清理的退化路径），
+        // 再构造预算恰好装下 tool_result 之外的一条，验证 rig 行为不被 head 破坏。
+        let mk_tool_result = || Message::User {
+            content: vec![UserContent::ToolResult(rig::completion::message::ToolResult {
+                call: rig::completion::message::CallId::from_wire("call-1"),
+                name: "t1".try_into().expect("非空工具名"),
+                content: vec![rig::completion::message::ToolResultContent::text("result")],
+                is_error: false,
+            })],
+        };
+        // 路径 A：head 后紧跟孤立 tool_result，预算极小 → 除 head 全逐出，
+        // demoted 含 tool_result（rig 从 window 头挪进 demoted 或本就逐出）
+        let mut msgs: Vec<Message> = (0..3)
+            .map(|i| Message::User {
+                content: vec![UserContent::text(format!("h{i}"))],
+            })
+            .collect();
+        msgs.push(mk_tool_result());
+        msgs.push(Message::User {
+            content: vec![UserContent::text("tail")],
+        });
+        let policy = AdaptiveWindowPolicy::new(1);
+        let (window, demoted) = policy.apply_with_demoted(msgs).unwrap();
+        // head 全保留；内层预算极小时 window 应为空或已被 rig 清理孤立对
+        assert_eq!(window.len(), 3);
+        assert_eq!(demoted.len(), 2);
+        // demoted 中 tool_result 可存在（将被摘要吸收，不影响 head）
+        let has_tool_result = demoted.iter().any(|m| {
+            matches!(m, Message::User { content } if
+                matches!(content.first(), Some(UserContent::ToolResult(_))))
+        });
+        assert!(has_tool_result, "孤立 tool_result 应在 demoted 侧而非 head");
+    }
 
     #[test]
     fn rows_to_messages_skips_streaming_and_empty() {
@@ -307,9 +516,9 @@ mod tests {
         // append 应是 no-op，不写入
         <SqliteMemory as ConversationMemory>::append(
             &mem,
-            "nonexistent",
+            &ConversationId::new("nonexistent"),
             vec![Message::User {
-                content: rig::OneOrMany::one(UserContent::text("test")),
+                content: vec![UserContent::text("test")],
             }],
         )
         .await
@@ -322,12 +531,11 @@ mod tests {
     fn compaction_text_formats_roles() {
         let msgs = vec![
             Message::User {
-                content: rig::OneOrMany::one(UserContent::text("你好")),
+                content: vec![UserContent::text("你好")],
             },
-            Message::Assistant {
-                id: None,
-                content: rig::OneOrMany::one(AssistantContent::text("在的")),
-            },
+            Message::Assistant(rig::completion::message::AssistantMessage::new(vec![AssistantContent::text(
+                "在的",
+            )])),
         ];
         let text = messages_to_compaction_text(&msgs);
         assert!(text.contains("用户：你好"));

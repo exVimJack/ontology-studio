@@ -13,7 +13,7 @@ use crate::error::StoreResult;
 
 /// 初始化全部表 schema（幂等，可重复调用）。
 pub fn init_schema(conn: &Connection) -> StoreResult<()> {
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
     conn.execute_batch(
         r#"
         -- ═══ 本体容器 ═══
@@ -220,20 +220,116 @@ pub fn init_schema(conn: &Connection) -> StoreResult<()> {
         -- 四字段语义：
         --   business_scenario：业务场景（服务于什么业务目标、谁用、解决什么问题）
         --   business_essence：业务本质（核心业务对象/状态/关系/动态行为的一句话本质概括）
-        --   design_intent：设计意图（为什么这样建模、够用且可扩展的取舍、可扩展方向）
-        --   invariants：补充说明（自由文本，记录不可违反的业务约束、边界条件等）
         CREATE TABLE IF NOT EXISTS ontology_charter (
             ontology_api_name  TEXT PRIMARY KEY,        -- 1:1 关联 ontologies.api_name
             business_scenario  TEXT NOT NULL DEFAULT '',
             business_essence   TEXT NOT NULL DEFAULT '',
-            design_intent      TEXT NOT NULL DEFAULT '',
-            invariants         TEXT NOT NULL DEFAULT '',  -- 自由文本（非 JSON 数组）
             updated_at         INTEGER NOT NULL,
             updated_by         TEXT NOT NULL DEFAULT 'agent', -- 'agent' | 'user'
             FOREIGN KEY (ontology_api_name) REFERENCES ontologies(api_name) ON DELETE CASCADE
         );
+
+        -- ═══ 证据链源登记（docs/EVIDENCE-CHAIN.md L1，决策24后续）═══
+        -- 每个建模输入（场景描述/文档 chunk/DB schema 表列）先登记为可引用的源。
+        -- content 是登记时刻快照（不可变）：用户事后改文档/删消息不影响已有引用的有效性。
+        -- ontology_api_name 空串 = 全局共享（会话场景源先于本体建立时登记）。
+        -- content_hash（FNV-1a 64）用于幂等登记判重：同 hash 跳过。
+        CREATE TABLE IF NOT EXISTS evidence_sources (
+            source_id         TEXT PRIMARY KEY,          -- 稳定 id：src-{uuid simple}
+            ontology_api_name TEXT NOT NULL DEFAULT '',
+            kind              TEXT NOT NULL,             -- 'scenario' | 'document' | 'db_table' | 'db_column'
+            title             TEXT NOT NULL,             -- 人类可读出处：会话时间/文件名+chunk/库.表.列
+            content           TEXT NOT NULL,             -- 源文本快照
+            content_hash      TEXT NOT NULL,
+            origin_ref        TEXT NOT NULL DEFAULT '',  -- document_id / dataset_id / conversation_message_id
+            created_at        INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_evidence_sources_ont ON evidence_sources(ontology_api_name);
+
+        -- ═══ 元素级证据索引（docs/EVIDENCE-CHAIN.md L4，决策24后续）═══
+        -- Palantir 与 W3C TTL 两条路径的证据落库统一到本表：
+        --   standard='palantir'：import 时从 payload evidence 字段写入；export 时回填（round-trip）
+        --   standard='w3c'：import_ttl 时从 skos:editorialNote 注解解析写入（TTL 原文本身也存注解，双保险）
+        -- ontology_key：palantir=本体 api_name；w3c=本体 IRI
+        -- element_id：palantir=api_name；w3c=元素 IRI
+        -- matched_by：闸门校验时的匹配等级（'exact' | 'normalized'；'w3c' 侧解析注解时重算）
+        CREATE TABLE IF NOT EXISTS element_evidence (
+            id           TEXT PRIMARY KEY,
+            standard     TEXT NOT NULL,              -- 'palantir' | 'w3c'
+            ontology_key TEXT NOT NULL,
+            element_type TEXT NOT NULL,              -- palantir: object_type|property|link；w3c: class|datatype_property|object_property
+            element_id   TEXT NOT NULL,
+            source_id    TEXT NOT NULL,
+            quote        TEXT NOT NULL,
+            span         TEXT NOT NULL DEFAULT '',   -- JSON [start,end] 或空串
+            role         TEXT NOT NULL,              -- 'direct' | 'inferred'
+            matched_by   TEXT NOT NULL DEFAULT '',
+            created_at   INTEGER NOT NULL,
+            UNIQUE(standard, ontology_key, element_type, element_id, source_id, quote)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ee_lookup ON element_evidence(standard, ontology_key);
+        "#
+    )?;
+
+    // ═══ 校验对抗：issue 生命周期 + L4.3 多轮评审（VALIDATION-DESIGN.md v0.3.1）═══
+    // validation_issues：一条 issue 一次行，status 为对抗生命周期
+    //（open→disputed→accepted/overruled）；dispute 字段存储 A 的答辩（argument +
+    // counterEvidence，counterEvidence 必须引用已登记 evidence_source 并经 match_quote
+    // 机械匹配——裁决权在 B/人工，不在 A 自己）。
+    // validation_reviews：L4.3 多轮状态机（round/max_rounds=2、b_report、a_revision、
+    // a_reasoning 对 B 复核不可见、status=in_progress/resolved/escalated）。
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS validation_issues (
+            id                     TEXT PRIMARY KEY,            -- 稳定 id：vi-{uuid simple}；review 来源为 "{review_id}:{B条目id}"
+            ontology_iri           TEXT NOT NULL,               -- 归属本体 IRI
+            validation_id          TEXT NOT NULL,               -- 同一次 validate 调用分组（review 来源 = review_id）
+            layer                  TEXT NOT NULL,               -- 'L0'|'L1'|'L2'|'L2.5'|'L2.6'|'L3'|'L4'
+            source                 TEXT NOT NULL DEFAULT 'rules', -- 'rules'|'review'（统一发现池 v0.7）
+            severity               TEXT NOT NULL,               -- 'error'|'warning'|'suggestion'
+            rule                   TEXT NOT NULL,               -- check_* 函数名；review 来源 'review:{dimension}'
+            message                TEXT NOT NULL,
+            target                 TEXT,                        -- 实体 IRI / Turtle 行号（可空）
+            evidence_source_id     TEXT,                        -- FK→evidence_sources（证据引用）
+            evidence_quote         TEXT,                        -- 证据原文（denormalize 免 JOIN）
+            principle_source       TEXT,                        -- 'skill'|'charter'|'input'|'w3c'
+            principle_ref          TEXT,
+            suggestion             TEXT,
+            status                 TEXT NOT NULL DEFAULT 'open', -- open|disputed|accepted|overruled
+            a_action               TEXT,                        -- review 来源：A 的 accepted/rejected JSON（可空）
+            dispute_argument       TEXT,
+            dispute_counter_source TEXT,
+            dispute_counter_quote  TEXT,
+            dispute_resolved_by    TEXT,                        -- 'verifier'|'human'
+            dispute_verdict        TEXT,                        -- 'overruled'|'accepted'
+            created_at             INTEGER NOT NULL,
+            updated_at             INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_vi_ont ON validation_issues(ontology_iri);
+        CREATE INDEX IF NOT EXISTS idx_vi_status ON validation_issues(ontology_iri, status);
+        -- idx_vi_source 依赖 source 列，存量库该列由 migrate_validation_unified_pool
+        -- 的 ensure_columns 补齐，索引也移到那里建（在这里建会因旧库缺列直接失败）。
+
+        CREATE TABLE IF NOT EXISTS validation_reviews (
+            id            TEXT PRIMARY KEY,            -- 稳定 id：vr-{uuid simple}
+            ontology_iri  TEXT NOT NULL,
+            round         INTEGER NOT NULL DEFAULT 1,
+            max_rounds    INTEGER NOT NULL DEFAULT 2,
+            b_report      TEXT,                        -- B 的评审输出（结构化建议 JSON）
+            a_revision    TEXT,                        -- A 修订后的 Turtle V2 全文
+            a_reasoning   TEXT,                        -- A 的修订说明（B 复核不可见）
+            b_verdict     TEXT,                        -- B 复核原始输出 JSON（verdict+remaining_issues）
+            step_ms_b     INTEGER NOT NULL DEFAULT 0,  -- B 评审耗时 ms（0=未完成）
+            step_ms_a     INTEGER NOT NULL DEFAULT 0,  -- A 修订耗时 ms（0=未完成）
+            step_ms_re    INTEGER NOT NULL DEFAULT 0,  -- B 复核耗时 ms（0=未完成）
+            status        TEXT NOT NULL DEFAULT 'in_progress', -- in_progress|resolved|escalated
+            created_at    INTEGER NOT NULL,
+            updated_at    INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_vr_ont ON validation_reviews(ontology_iri);
         "#,
     )?;
+
     // 迁移：对齐 Gaia alembic `021f553a89b8_drop_direction_column_from_link_types`。
     // 历史 bug：早期本地开发版 schema.rs 曾在 link_types 定义
     // `direction TEXT NOT NULL CHECK (direction IN ('OUTGOING','INCOMING'))`，
@@ -243,6 +339,9 @@ pub fn init_schema(conn: &Connection) -> StoreResult<()> {
     // 不写该列，SQLite 报 `NOT NULL constraint failed: link_types.direction`。
     // 此迁移幂等检测并 DROP 该残留列，使旧库与新 schema 对齐。
     drop_link_types_direction_column(conn)?;
+    // 迁移：统一发现池 v0.7——validation_issues 加 source/a_action 列（review 来源
+    // B 发现与规则发现并列同一生命周期），validation_reviews 加 b_verdict/环节耗时列。
+    migrate_validation_unified_pool(conn)?;
     // 迁移：datasets / data_sources 加 ontology_api_name 列 + 联合唯一索引（决策 10 修订）。
     // 必须在主 execute_batch 之后、但引用 ontology_api_name 的索引语句已在迁移函数内建好。
     // 主 execute_batch 里不再建 idx_datasets_ontology / idx_data_sources_ontology
@@ -272,6 +371,39 @@ pub fn init_schema(conn: &Connection) -> StoreResult<()> {
 ///
 /// 旧库遗留的全局行（`ontology_api_name=''`）在重建后仍保留，语义上"无所属本体"，
 /// 导入新本体时不会复用（upsert 按 `(ontology_api_name, api_name)` 命中）。
+/// 幂等迁移（统一发现池 v0.7）：
+/// - validation_issues 加 `source`（'rules'|'review'）与 `a_action`（A 逐条裁决 JSON）
+///   列，并对存量行回填 source='rules'——旧库全是规则检查产物。
+/// - validation_reviews 加 `b_verdict`（B 复核原始输出）与三个环节耗时列。
+/// - review 来源的 issue id 形如 "{review_id}:{B条目id}"，validation_id = review_id：
+///   重跑规则检查（按 source='rules' 分域清理）不会冲掉 B 发现行。
+fn migrate_validation_unified_pool(conn: &Connection) -> StoreResult<()> {
+    ensure_columns(
+        conn,
+        "validation_issues",
+        &[
+            ("source", "TEXT NOT NULL DEFAULT 'rules'"),
+            ("a_action", "TEXT"),
+        ],
+    )?;
+    // 存量行回填（新库默认值已覆盖；旧库 ensure_columns 前的行全按 'rules'）
+    conn.execute_batch(
+        "UPDATE validation_issues SET source = 'rules' WHERE source IS NULL OR source = '';
+         CREATE INDEX IF NOT EXISTS idx_vi_source ON validation_issues(ontology_iri, source);",
+    )?;
+    ensure_columns(
+        conn,
+        "validation_reviews",
+        &[
+            ("b_verdict", "TEXT"),
+            ("step_ms_b", "INTEGER NOT NULL DEFAULT 0"),
+            ("step_ms_a", "INTEGER NOT NULL DEFAULT 0"),
+            ("step_ms_re", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+    )?;
+    Ok(())
+}
+
 fn migrate_datasets_data_sources_ontology_scoping(conn: &Connection) -> StoreResult<()> {
     ensure_columns(
         conn,
@@ -307,10 +439,7 @@ fn migrate_datasets_data_sources_ontology_scoping(conn: &Connection) -> StoreRes
 /// 则重建表去掉它（重建后新表 DDL 无列级 UNIQUE，幂等不再触发）。
 ///
 /// 幂等：重建后新表 DDL 不含列级 api_name UNIQUE，再次调用检测不命中，不重建。
-fn drop_legacy_single_column_unique_on_api_name(
-    conn: &Connection,
-    table: &str,
-) -> StoreResult<()> {
+fn drop_legacy_single_column_unique_on_api_name(conn: &Connection, table: &str) -> StoreResult<()> {
     // 表可能尚未创建（防御性，正常 init_schema 已先建）。
     let ddl: Option<String> = conn.query_row(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
@@ -325,18 +454,15 @@ fn drop_legacy_single_column_unique_on_api_name(
     // 不匹配联合 UNIQUE(ontology_api_name, api_name)——那是表级约束，不在列行。
     // 用大小写不敏感 + 忽略空白的方式匹配「api_name ... UNIQUE」且不在括号表级约束内。
     // 简单启发：DDL 里找 `api_name` 行，看该行内是否有独立的 UNIQUE 词。
-    let has_col_level_unique = ddl
-        .lines()
-        .map(|l| l.trim())
-        .any(|line| {
-            // 跳过表级 UNIQUE(...) 约束行（以 UNIQUE( 开头）
-            if line.to_uppercase().starts_with("UNIQUE(") {
-                return false;
-            }
-            // 列行：含 api_name 且含 UNIQUE
-            let up = line.to_uppercase();
-            up.contains("API_NAME") && up.contains("UNIQUE")
-        });
+    let has_col_level_unique = ddl.lines().map(|l| l.trim()).any(|line| {
+        // 跳过表级 UNIQUE(...) 约束行（以 UNIQUE( 开头）
+        if line.to_uppercase().starts_with("UNIQUE(") {
+            return false;
+        }
+        // 列行：含 api_name 且含 UNIQUE
+        let up = line.to_uppercase();
+        up.contains("API_NAME") && up.contains("UNIQUE")
+    });
     if !has_col_level_unique {
         return Ok(());
     }
@@ -355,7 +481,8 @@ fn drop_legacy_single_column_unique_on_api_name(
     // 新表 schema 与 init_schema 的 CREATE TABLE 完全一致（无单列 UNIQUE，
     // 有联合 UNIQUE(ontology_api_name, api_name) + FK + CHECK）。
     let new_ddl = match table {
-        "datasets" => r#"
+        "datasets" => {
+            r#"
             CREATE TABLE datasets__migrate (
                 id                        TEXT PRIMARY KEY,
                 ontology_api_name         TEXT NOT NULL,
@@ -372,8 +499,10 @@ fn drop_legacy_single_column_unique_on_api_name(
                 UNIQUE(ontology_api_name, api_name),
                 FOREIGN KEY (ontology_api_name) REFERENCES ontologies(api_name) ON DELETE CASCADE
             );
-        "#,
-        "data_sources" => r#"
+        "#
+        }
+        "data_sources" => {
+            r#"
             CREATE TABLE data_sources__migrate (
                 id                    TEXT PRIMARY KEY,
                 ontology_api_name     TEXT NOT NULL,
@@ -388,7 +517,8 @@ fn drop_legacy_single_column_unique_on_api_name(
                 UNIQUE(ontology_api_name, api_name),
                 FOREIGN KEY (ontology_api_name) REFERENCES ontologies(api_name) ON DELETE CASCADE
             );
-        "#,
+        "#
+        }
         _ => return Ok(()), // 防御性，只迁移这两张表
     };
     // legacy_alter_table=OFF（默认）时 RENAME 会自动修复外键引用；显式置 ON 更稳。
@@ -459,11 +589,7 @@ fn drop_link_types_direction_column(conn: &Connection) -> StoreResult<()> {
 }
 
 /// 幂等加列：检测 col 是否已存在，不存在则 ADD COLUMN。返回 true 表示新增了列。
-pub fn ensure_columns(
-    conn: &Connection,
-    table: &str,
-    cols: &[(&str, &str)],
-) -> StoreResult<bool> {
+pub fn ensure_columns(conn: &Connection, table: &str, cols: &[(&str, &str)]) -> StoreResult<bool> {
     let mut added = false;
     for (col, decl) in cols {
         let sql = format!("PRAGMA table_info({table})");
@@ -489,11 +615,52 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         init_schema(&conn).unwrap(); // 二次调用不报错
-        // 验证表存在
+                                     // 验证表存在
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='object_types'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='object_types'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn legacy_validation_issues_without_source_upgrades() {
+        // 模拟 v0.7 之前的存量库：validation_issues 无 source/a_action 列。
+        // init_schema 必须先补列再建 idx_vi_source 索引——旧实现把索引建在
+        // 主 execute_batch 里，老库缺列直接 panic（闪退根因，2026-09-23）。
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE validation_issues (
+                id            TEXT PRIMARY KEY,
+                ontology_iri  TEXT NOT NULL,
+                rule_id       TEXT NOT NULL,
+                severity      TEXT NOT NULL,
+                message       TEXT NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'open',
+                created_at    INTEGER NOT NULL,
+                updated_at    INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        // 旧库升级不应 panic
+        init_schema(&conn).unwrap();
+        // source 列已补 + 默认值回填
+        let src: String = conn
+            .query_row("SELECT source FROM validation_issues LIMIT 1", [], |r| r.get(0))
+            .unwrap_or_default();
+        assert!(src.is_empty() || src == "rules");
+        // 索引已建
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_vi_source'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
     }
 
     #[test]
@@ -503,8 +670,11 @@ mod tests {
         conn.execute("INSERT INTO ontologies (id, api_name, display_name, created_at, updated_at) VALUES ('o1','Ont','O',1,1)", []).unwrap();
         conn.execute("INSERT INTO object_types (id, ontology_id, api_name, display_name, primary_key, storage_type, capabilities, created_at, updated_at) VALUES ('ot1','o1','Supplier','供应商','supplierId','MANAGED','{}',1,1)", []).unwrap();
         // 删 ontology 应级联删 object_type
-        conn.execute("DELETE FROM ontologies WHERE id='o1'", []).unwrap();
-        let ot_count: i64 = conn.query_row("SELECT COUNT(*) FROM object_types", [], |r| r.get(0)).unwrap();
+        conn.execute("DELETE FROM ontologies WHERE id='o1'", [])
+            .unwrap();
+        let ot_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM object_types", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(ot_count, 0, "ObjectType 应被级联删除");
     }
 
@@ -523,9 +693,14 @@ mod tests {
 
     /// 辅助：检测某表是否存在指定列。
     fn column_exists(conn: &Connection, table: &str, col: &str) -> bool {
-        let mut s = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
-        let names: Vec<String> = s.query_map([], |r| r.get::<_, String>(1)).unwrap()
-            .filter_map(Result::ok).collect();
+        let mut s = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let names: Vec<String> = s
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
         names.iter().any(|c| c == col)
     }
 
@@ -561,7 +736,8 @@ mod tests {
                 FOREIGN KEY (ontology_id) REFERENCES ontologies(id) ON DELETE CASCADE
             );
             "#,
-        ).unwrap();
+        )
+        .unwrap();
         // 旧表确实带 direction 列。
         let has_dir: bool = column_exists(&conn, "link_types", "direction");
         assert!(has_dir, "旧表应有 direction 列");
@@ -577,14 +753,18 @@ mod tests {
         // 4. 用当前代码的 INSERT 形态（不写 direction）应能成功落库。
         conn.execute(
             "INSERT INTO ontologies (id, api_name, display_name, created_at, updated_at) \
-             VALUES ('o1','SupplyChain','供应链本体',1,1)", [],
-        ).unwrap();
+             VALUES ('o1','SupplyChain','供应链本体',1,1)",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO link_types (id, ontology_id, api_name, display_name, \
              source_object_type_api_name, target_object_type_api_name, cardinality, \
              created_at, updated_at) \
-             VALUES ('l1','o1','supplies','供应','Supplier','Order','MANY',1,1)", [],
-        ).unwrap();
+             VALUES ('l1','o1','supplies','供应','Supplier','Order','MANY',1,1)",
+            [],
+        )
+        .unwrap();
 
         // 5. 幂等：再跑一次 init_schema 不报错（direction 已无，迁移为 no-op）。
         init_schema(&conn).unwrap();

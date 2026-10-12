@@ -115,10 +115,7 @@ pub async fn set_provider(
     if let Some(svc) = state.federation.read().await.as_ref() {
         chat.set_federation(std::sync::Arc::new(svc.clone()));
     }
-    chat.set_ontology_store(state.ontology_store.clone());
-
-    // 4.6 注入 Skill 管理器（决策 20）：preamble Tier 1 + active skill doc_paths。
-    chat.set_skill_manager(std::sync::Arc::clone(&state.skill_manager));
+    inject_shared_stores(&mut chat, &state);
 
     // 5. 更新 AppState
     *state.chat.write().await = Some(chat);
@@ -277,6 +274,15 @@ pub async fn get_context_window(state: State<'_, AppState>) -> AppResult<Option<
     Ok(None)
 }
 
+/// 注入全局共享工具源（Palantir 本体存储 + W3C TtlStore + skill 管理器）。
+/// configure_provider / restore_provider 共用一份清单——历史上两处各自维护，
+/// 漏挂 ttl_store 导致会话工具面缺失 W3C TTL 工具组（validate/import/export_ontology_ttl）。
+fn inject_shared_stores(chat: &mut ChatService, state: &AppState) {
+    chat.set_ontology_store(state.ontology_store.clone());
+    chat.set_ttl_store(state.ttl_store.clone());
+    chat.set_skill_manager(std::sync::Arc::clone(&state.skill_manager));
+}
+
 /// 启动时调用：从 store 恢复 provider 配置并重建 ChatService。
 pub fn restore_provider(app: &AppHandle, state: &AppState) -> AppResult<()> {
     let store = app
@@ -297,11 +303,8 @@ pub fn restore_provider(app: &AppHandle, state: &AppState) -> AppResult<()> {
                 state.memory.clone(),
                 agent_core::resolve_known_or_default(&config),
             );
-            // 注入 Skill 管理器（决策 20）：preamble Tier 1 + active skill doc_paths。
-            // 启动期同步注入（skill_manager 已在 setup hook 构造）。
-            chat.set_skill_manager(std::sync::Arc::clone(&state.skill_manager));
-            // 注入本体存储（三期：本体建模作为 agent 工具，始终可用）。
-            chat.set_ontology_store(state.ontology_store.clone());
+            // 注入本体存储 + W3C TtlStore + skill 管理器（共用清单，启动期同步注入）。
+            inject_shared_stores(&mut chat, state);
             // 启动期无并发，用 try_write 同步写入 tokio::sync::RwLock（无需 runtime 句柄）
             if let Ok(mut g) = state.chat.try_write() {
                 *g = Some(chat);

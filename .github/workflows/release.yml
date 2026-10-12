@@ -116,7 +116,7 @@ jobs:
         with:
           workspaces: ". -> target"
           key: ${{ matrix.target }}
-          shared-key: ${{ hashFiles('**/Cargo.lock') }}
+          shared-key: ${{ hashFiles('Cargo.lock') }} # 仅根 lockfile：src-tauri 非成员，发版 bump 版本号不改根 lock，缓存不失效
 
       - name: Install Node
         uses: actions/setup-node@v5

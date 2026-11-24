@@ -141,7 +141,21 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: --target ${{ matrix.target }}
+          # macos-15/26 runner 上内置 bundle_dmg.sh 不可靠（hdiutil/Finder AppleScript 已知问题，
+          # macos-14 退役后无法回退镜像）→ mac 只出 .app，DMG 由下方 hdiutil 步骤直出。
+          args: --target ${{ matrix.target }} ${{ matrix.label == 'macos-arm64' && '--bundles app' || '' }}
+
+      # macos-15/26 上 bundle_dmg.sh 不可靠，改用 hdiutil 直出 UDZO（无 Finder 定制，headless 稳定）。
+      # 产物路径与原 dmg glob 一致，artifact 上传与 Release 收集无需改动。
+      - name: Create DMG (hdiutil)
+        if: runner.os == 'macOS'
+        run: |
+          VERSION=$(jq -r .version src-tauri/tauri.conf.json)
+          DMG="target/${{ matrix.target }}/release/bundle/dmg/Ontology Studio_${VERSION}_aarch64.dmg"
+          mkdir -p "$(dirname "$DMG")"
+          hdiutil create -volname "Ontology Studio" \
+            -srcfolder "target/${{ matrix.target }}/release/bundle/macos/Ontology Studio.app" \
+            -ov -format UDZO "$DMG"
 
       # 把构建出的安装包上传为 artifact（命名按平台区分，便于聚合下载）
       # 产物路径：仓库根 target/<target>/release/bundle/（.cargo/config.toml 指定）。

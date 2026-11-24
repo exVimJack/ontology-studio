@@ -11,6 +11,10 @@ pub mod adversarial;
 pub mod data_type;
 pub mod error;
 pub mod evidence;
+pub mod mapping;
+pub mod mapping_export;
+pub mod mapping_suggest;
+pub mod mapping_verify;
 pub mod naming;
 pub mod payload;
 pub mod schema;
@@ -23,12 +27,23 @@ pub mod validation;
 
 pub use error::{StoreError, StoreResult};
 pub use evidence::{Evidence, EvidenceRole, EvidenceSource};
+pub use mapping::{
+    ElementKind, ElementMapping, ElementMappingInput, ElementMappingItem, MappingCoverage,
+    MappingCoverageBucket, MappingElementRef, MappingEndpoint, MappingExportScope,
+    MappingIntegrityItem, MappingIntegrityReport, MappingRef, MappingSuggestion,
+    MappingWriteOutcome, STANDARD_PALANTIR, STANDARD_W3C,
+};
+pub use mapping_verify::{
+    PhysicalColumn, PhysicalSchemaSnapshot, PhysicalSource, PhysicalTable,
+};
 pub use payload::*;
 pub use store::OntologyStore;
 pub use ttl::{
     TtlChangelog, TtlCharter, TtlImportResult, TtlOntologySummary, TtlStore, TtlValidation,
+    TtlVersionDiff, TtlVersionSummary, PropertyChange, SubclassOfEdge, WorkspaceDiffRevokeItem,
 };
-pub use ttl_edit::TtlPropertyEdit;
+pub use ttl::VERSION_LIMIT_DEFAULT;
+pub use ttl_edit::{TtlClassMeta, TtlPropertyEdit};
 pub use validation::{
     AActionRecord, DisputeRecord, IssueSeverity, IssueStatus, PrincipleRef,
     ValidationEvidenceRef, ValidationIssue, ValidationReview,

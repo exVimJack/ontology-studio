@@ -38,7 +38,7 @@ function makePayload(overrides?: Partial<OntologyPayload>): OntologyPayload {
                         api_name: "works_in",
                         display_name: "就职于",
                         target_object_type_api_name: "Department",
-                        cardinality: "MANY_TO_ONE",
+                        cardinality: "MANY",
                     },
                 ],
             },
@@ -97,7 +97,7 @@ describe("payloadToGraphData", () => {
         expect(e!.kind).toBe("object");
         expect(e!.source).toBe("Employee");
         expect(e!.target).toBe("Department");
-        expect(e!.label).toBe("就职于（N:1）");
+        expect(e!.label).toBe("就职于（1:N）");
     });
 
     it("Palantir 语义覆盖：节点/边带 kindText，不露 RDF 术语", () => {
@@ -196,11 +196,9 @@ describe("describeObjectType", () => {
 });
 
 describe("cardinalityBadge", () => {
-    it("四种标准基数 → 紧凑标注", () => {
-        expect(cardinalityBadge("ONE_TO_ONE")).toBe("1:1");
-        expect(cardinalityBadge("ONE_TO_MANY")).toBe("1:N");
-        expect(cardinalityBadge("MANY_TO_ONE")).toBe("N:1");
-        expect(cardinalityBadge("MANY_TO_MANY")).toBe("N:N");
+    it("Gaia 两值基数 → 紧凑标注（MANY 不伪造 N:1）", () => {
+        expect(cardinalityBadge("ONE")).toBe("1:1");
+        expect(cardinalityBadge("MANY")).toBe("1:N");
     });
     it("未知值/空值原样返回", () => {
         expect(cardinalityBadge("WEIRD")).toBe("WEIRD");

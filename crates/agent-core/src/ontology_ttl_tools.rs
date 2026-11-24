@@ -53,7 +53,11 @@ pub fn ontology_ttl_tools(store: Arc<TtlStore>) -> Vec<DynamicTool> {
         list_ontology_ttl_tool(store.clone()),
         query_ontology_sparql_tool(store.clone()),
         commit_ontology_ttl_change_tool(store.clone()),
-        list_ontology_ttl_changelog_tool(store),
+        list_ontology_ttl_changelog_tool(store.clone()),
+        publish_ontology_version_tool(store.clone()),
+        list_ontology_versions_tool(store.clone()),
+        revert_ontology_version_tool(store.clone()),
+        diff_ontology_versions_tool(store),
     ]
 }
 
@@ -195,7 +199,7 @@ fn import_ontology_ttl_tool(store: Arc<TtlStore>) -> DynamicTool {
          \n\
          工作流：\n\
          - 冷启动：register_evidence_source(登记用户输入) → 生成 TTL（含证据注解）→ validate → import\n\
-         - 增量：export_ontology_ttl(iri) → 改 Turtle → validate → import_ontology_ttl(ttl, overwrite=true)\n\
+         - 增量：export_ontology_ttl(iri, mode=\"full\") → 改 Turtle → validate → import_ontology_ttl(ttl, overwrite=true)\n\
          overwrite 语义（对齐 Palantir import_ontology 的 overwrite_object_types）：\n\
          - false（默认）：同 IRI 本体已存在则 skip（保护已有成果）\n\
          - true：同 IRI 本体 UPSERT 覆盖（整块 .ttl 文本替换——增量必须 export 全文修改后全量回导，
@@ -371,7 +375,7 @@ fn import_ontology_ttl_tool(store: Arc<TtlStore>) -> DynamicTool {
                                         "导入被拒绝：提交的 TTL 只有 {} 条三元组，而库内该本体有 {} 条\n\
                                          （缩水超过 20%）。import_ontology_ttl 的 overwrite 是【整本体替换】，\n\
                                          不是按元素合并——增量更新某个对象的正确做法：\n\
-                                         1. export_ontology_ttl 取出完整原文\n\
+                                         1. export_ontology_ttl(iri, mode=\"full\") 取出完整原文\n\
                                          2. 在完整原文上修改目标对象\n\
                                          3. 全量回导\n\
                                          如确认要整体替换（例如删除大量内容），请带 confirm_full_replace=true 重试。",
@@ -412,7 +416,7 @@ fn new_ontology_gate_ttl(store: &TtlStore, ttl: &str) -> Option<String> {
         Ok(false) => Some(format!(
             "导入被拒绝：本体 {iri} 尚未建立。宪章先行（ARCHITECTURE.md 决策 24）：\
              设计宪章是本体建模的前提，本体创建必须由用户完成。\n\
-             请指引用户：在「设计宪章」页点「新建本体」，填写业务场景/业务本质/\
+             请指引用户：在「设计宪章」页点「新建本体」，填写业务场景与业务目标\
              两字段（可先用 AI 起草建议预填）并保存；\n\
              本体建立后，把你的建模思路和宪章要点作为参考给用户，再在新本体上\
              执行增量导入。在此之前不要尝试任何导入。"
@@ -439,7 +443,7 @@ fn charter_empty_gate(store: &TtlStore, ontology_iri: &str) -> Option<String> {
                 "导入被拒绝：本体 {ontology_iri} 的设计宪章为空（该本体可能由手工导入建立，                 未经过宪章向导）。\n\
                  宪章是建模的业务意图基线（决策 24）：没有它，agent 迭代 schema 时无法校验\n\
                  变更是否偏离建模初衷。请先知会用户补全宪章：在「设计宪章」面板填写\n\
-                 业务场景/业务本质两字段（你可先根据既有模型内容起草\n\
+                 业务场景/业务目标两字段（你可先根据既有模型内容起草\n\
                  建议供用户修改确认，但写入必须由用户操作），补全后再执行导入。"
             ))
         }
@@ -463,7 +467,7 @@ fn charter_guard(store: &TtlStore, ttl: &str, overwrite: bool) -> Option<String>
     }
     const FIELDS: [&str; 2] = [
         "业务场景(dcterms:description)",
-        "业务本质(skos:definition)",
+        "业务目标(skos:definition)",
     ];
     let changed: Vec<&str> = FIELDS
         .iter()
@@ -481,22 +485,20 @@ fn charter_guard(store: &TtlStore, ttl: &str, overwrite: bool) -> Option<String>
     ))
 }
 
-/// `export_ontology_ttl(ontology_iri)`：导出本体的 Turtle 文本。
+/// `export_ontology_ttl(ontology_iri)`：读生效摘要 / 或工作区全文（编辑环）。
 fn export_ontology_ttl_tool(store: Arc<TtlStore>) -> DynamicTool {
     crate::dynamic_tool(
         "export_ontology_ttl",
-        "导出指定本体的 Turtle。对齐 Palantir export_ontology 的语义。\n\
+        "读取指定本体。\n\
          \n\
-         **mode 参数（重要——影响返回体积与对话性能）**：\n\
-         - mode=\"summary\"（默认）：返回结构化摘要（类清单 + 属性清单 + 三元组统计），\n\
-           几 KB。适合「看本体现状/结构」——查本体有哪些类、属性、规模。\n\
-           **默认用 summary**：全文进对话历史会拖慢后续每轮（大本体可达 178KB）。\n\
-         - mode=\"full\"：返回完整 Turtle 文本（体积=原始文件大小）。仅在以下场景用：\n\
-           增量更新（export → 改 → validate → import）、备份迁移、确需逐行编辑。\n\
-           **用完即止，同一任务内勿重复 export full**——全文会留在对话历史里每轮重放。\n\
+         **mode 参数（重要——影响内容来源与体积）**：\n\
+         - mode=\"summary\"（默认）：返回**已发布生效版**的结构化摘要（类/属性清单）。\n\
+           若本体尚未发布，会拒绝并提示用户先发布。未发布修改不会出现在摘要中。\n\
+         - mode=\"full\"：返回**工作区草稿**完整 Turtle（供增量更新：改 → validate → import）。\n\
+           可含未发布修改。体积大，用完即止，勿在同一任务内重复 full。\n\
          \n\
          增量更新示例：export_ontology_ttl(iri, mode=\"full\") → 改 Turtle → validate → import(overwrite=true)\n\
-         查结构示例：export_ontology_ttl(iri) 或 export_ontology_ttl(iri, mode=\"summary\")\n\
+         查已发布结构：export_ontology_ttl(iri) 或 mode=\"summary\"\n\
          \n\
          参数 ontology_iri 是本体的完整 IRI（如 https://example.org/ontology/test#TestOntology），\n\
          可从 list_ontology_ttl 获取。",
@@ -510,7 +512,7 @@ fn export_ontology_ttl_tool(store: Arc<TtlStore>) -> DynamicTool {
                 "mode": {
                     "type": "string",
                     "enum": ["summary", "full"],
-                    "description": "summary=结构化摘要（默认，几 KB，查结构用）；full=完整 Turtle（增量更新/编辑用，体积大）",
+                    "description": "summary=生效版结构摘要（默认）；full=工作区草稿全文（编辑用）",
                     "default": "summary",
                 },
             },
@@ -527,27 +529,41 @@ fn export_ontology_ttl_tool(store: Arc<TtlStore>) -> DynamicTool {
                 let mode = arg_str(&args, "mode");
                 let mode = if mode.is_empty() { "summary" } else { mode.as_str() };
                 if mode == "full" {
+                    // 编辑环：读工作区草稿
                     return match store.export_ttl(&iri) {
                         Ok(ttl) => Ok(ToolOutput::text(format!(
                             "{ttl}\n\n\
-                             ——（全文已返回。此结果体积较大，已记入对话历史，后续轮次会携带。\n\
-                             同一任务内如需再次查看结构，请用 mode=\"summary\" 避免重复大结果。）"
+                             ——（工作区草稿全文。此结果体积较大，已记入对话历史。\n\
+                             查已发布结构请用 mode=\"summary\"。）"
                         ))),
                         Err(e) => Ok(ToolOutput::text(format!("错误：导出失败 - {e}"))),
                     };
                 }
-                // summary 模式：结构化摘要（复用 store 的 list_ttl_properties /
-                // list_ttl_class_iris + 元数据），几 KB——不把全文给模型，治对话膨胀
-                let classes = store.list_ttl_class_iris(&iri).unwrap_or_default();
-                let properties = store.list_ttl_properties(&iri).unwrap_or_default();
+                // summary：消费生效快照；从未发布则拒绝
+                let effective = match store.export_effective_ttl(&iri) {
+                    Ok(ttl) => ttl,
+                    Err(ontology_store::StoreError::Unpublished(_)) => {
+                        return Ok(ToolOutput::text(
+                            "错误：本体尚未发布。请先让用户发布版本后，再查看生效结构摘要。\n\
+                             若需编辑当前草稿，请使用 mode=\"full\"。",
+                        ));
+                    }
+                    Err(e) => {
+                        return Ok(ToolOutput::text(format!("错误：导出失败 - {e}")));
+                    }
+                };
+                let classes = ontology_store::ttl_edit::list_class_iris(&effective);
+                let properties = ontology_store::ttl_edit::list_properties(&effective);
                 let ontologies = store.list_ontologies().unwrap_or_default();
                 let meta = ontologies.iter().find(|o| o.ontology_iri == iri);
-                let triple_count = meta.map(|o| o.triple_count).unwrap_or(0);
-                let version = meta.map(|o| o.version.as_str()).unwrap_or("");
+                let active = meta.and_then(|o| o.active_revision).unwrap_or(0);
+                let dirty = meta.map(|o| o.workspace_dirty).unwrap_or(false);
                 let has_charter = meta.map(|o| o.has_charter).unwrap_or(false);
                 let mut out = String::new();
                 out.push_str(&format!(
-                    "# 本体摘要：{iri}\n版本：{version} | 三元组：{triple_count} | 宪章：{ch}\n\n",
+                    "# 本体摘要（生效版）：{iri}\n\
+                     生效版本：第 {active} 次发布 | 未发布修改：{dirty_zh} | 宪章：{ch}\n\n",
+                    dirty_zh = if dirty { "有（摘要不含）" } else { "无" },
                     ch = if has_charter { "已填写" } else { "未填写" }
                 ));
                 out.push_str(&format!("## 类（{} 个）\n", classes.len()));
@@ -570,10 +586,10 @@ fn export_ontology_ttl_tool(store: Arc<TtlStore>) -> DynamicTool {
                         out.push_str(&format!("    comment: {comment}\n", comment = p.comment));
                     }
                 }
-                out.push_str(&format!(
-                    "\n（结构摘要完毕。需要完整 Turtle 做增量更新时用 mode=\"full\"；\n\
-                     查具体元素的 domain/range 等详情可用 query_ontology_sparql 定向查询。）"
-                ));
+                out.push_str(
+                    "\n（生效结构摘要完毕。编辑草稿用 mode=\"full\"；\
+                     定向查询可用 query_ontology_sparql。）",
+                );
                 Ok(ToolOutput::text(out))
             })
         },
@@ -661,6 +677,230 @@ fn query_ontology_sparql_tool(store: Arc<TtlStore>) -> DynamicTool {
                 match store.query_sparql(&iri, &sparql) {
                     Ok(json) => Ok(ToolOutput::text(json)),
                     Err(e) => Ok(ToolOutput::text(format!("错误：SPARQL 查询失败 - {e}"))),
+                }
+            })
+        },
+    )
+}
+
+// ════════════════════════════════════════════════════════════════
+// 版本管理（显式发布才留快照；回退切指针不新建版本）
+// ════════════════════════════════════════════════════════════════
+
+/// `publish_ontology_version(ontology_iri, label, description)`：
+/// 发布当前内容为新版本（版本 = 里程碑）。写完整 TTL 快照 + 分配新 revision
+/// + 设 active_revision + 写 changelog。返回新 revision 号。
+fn publish_ontology_version_tool(store: Arc<TtlStore>) -> DynamicTool {
+    crate::dynamic_tool(
+        "publish_ontology_version",
+        "发布当前内容为新版本（版本 = 里程碑）。\\n\\\
+         **import/append/编辑后内容脱离已发布状态（active_revision=NULL），需要显式发布才留版本快照**。\\n\\\
+         发布时保存当前 TTL 全文快照 + 分配新 revision + 标记为当前启用版本 + 写 changelog。\\n\\\
+         - label：版本标签（如 \\\"v1.0\\\"）；**留空自动生成 v0.0.N（N=发布序号），用户显式填则以用户为准**。\\n\\\
+         - description：发布说明（如 \\\"采购本体-增加审批流\\\"）。\\n\
+         返回新分配的 revision 号。超版本上限（默认 20）时最旧版本被清理（正在启用的版本不删）。\\n\\\
+         建议在每次 import/append/编辑后、向用户交付前调用，让每个里程碑可回退。",
+        json!({
+            "type": "object",
+            "properties": {
+                "ontology_iri": { "type": "string", "description": "本体 IRI（完整 URI）" },
+                "label": { "type": "string", "description": "版本标签（如 v1.0）", "default": "" },
+                "description": { "type": "string", "description": "发布说明", "default": "" },
+            },
+            "required": ["ontology_iri"],
+            "additionalProperties": false,
+        }),
+        move |args| {
+            let store = store.clone();
+            Box::pin(async move {
+                let iri = arg_str(&args, "ontology_iri");
+                let label = arg_str(&args, "label");
+                let description = arg_str(&args, "description");
+                if iri.is_empty() {
+                    return Ok(ToolOutput::text("错误：ontology_iri 不能为空"));
+                }
+                match store.publish_version(&iri, &label, &description, "agent", None) {
+                    Ok(rev) => Ok(ToolOutput::text(format!(
+                        "已发布版本 revision={rev}（label={}）\n当前内容已标记为已发布，后续修改需重新发布。",
+                        if label.is_empty() { rev.to_string() } else { label }
+                    ))),
+                    Err(e) => Ok(ToolOutput::text(format!("错误：发布版本失败 - {e}"))),
+                }
+            })
+        },
+    )
+}
+
+/// `list_ontology_versions(ontology_iri)`：版本历史（revision 降序）。
+fn list_ontology_versions_tool(store: Arc<TtlStore>) -> DynamicTool {
+    crate::dynamic_tool(
+        "list_ontology_versions",
+        "列出本体版本历史（revision 降序，最新在前）。\\n\\\
+         返回 revision/label/description/triple_count/创建时间/发布者，不含全文。\\n\\\
+         配合 get_ontology_active_revision 判断当前启用哪个版本；配合 diff_ontology_versions 对比任意两版本。",
+        json!({
+            "type": "object",
+            "properties": {
+                "ontology_iri": { "type": "string", "description": "本体 IRI（完整 URI）" },
+            },
+            "required": ["ontology_iri"],
+            "additionalProperties": false,
+        }),
+        move |args| {
+            let store = store.clone();
+            Box::pin(async move {
+                let iri = arg_str(&args, "ontology_iri");
+                if iri.is_empty() {
+                    return Ok(ToolOutput::text("错误：ontology_iri 不能为空"));
+                }
+                match store.list_versions(&iri) {
+                    Ok(versions) => {
+                        if versions.is_empty() {
+                            return Ok(ToolOutput::text(
+                                "该本体还没有发布过版本（版本 = 显式发布的里程碑，中间过程只记 changelog）。",
+                            ));
+                        }
+                        let lines: Vec<String> = versions
+                            .iter()
+                            .map(|v| {
+                                format!(
+                                    "rev{}  label={}  triples={}  at={}  by={}  desc={}",
+                                    v.revision,
+                                    v.label,
+                                    v.triple_count,
+                                    v.created_at,
+                                    v.author,
+                                    v.description,
+                                )
+                            })
+                            .collect();
+                        Ok(ToolOutput::text(format!(
+                            "版本历史（共 {} 条）：\n{}",
+                            versions.len(),
+                            lines.join("\n")
+                        )))
+                    }
+                    Err(e) => Ok(ToolOutput::text(format!("错误：列版本失败 - {e}"))),
+                }
+            })
+        },
+    )
+}
+
+/// `revert_ontology_version(ontology_iri, revision)`：回退到指定版本（切指针）。
+fn revert_ontology_version_tool(store: Arc<TtlStore>) -> DynamicTool {
+    crate::dynamic_tool(
+        "revert_ontology_version",
+        "回退到指定历史版本（切指针，不新建版本）。\\n\\\
+         取该版本 TTL 全文覆盖当前内容 + 标记为当前启用版本 + 写 changelog。\\n\\\
+         回退可逆：所有已发布版本仍在，随时可再切回去。\\n\
+         **影响当前内容**：调用前向用户说明将覆盖当前未发布修改。",
+        json!({
+            "type": "object",
+            "properties": {
+                "ontology_iri": { "type": "string", "description": "本体 IRI（完整 URI）" },
+                "revision": { "type": "integer", "description": "目标版本号（正数，list_ontology_versions 可见）" },
+            },
+            "required": ["ontology_iri", "revision"],
+            "additionalProperties": false,
+        }),
+        move |args| {
+            let store = store.clone();
+            Box::pin(async move {
+                let iri = arg_str(&args, "ontology_iri");
+                let rev = args.get("revision").and_then(|v| v.as_i64());
+                let Some(rev) = rev else {
+                    return Ok(ToolOutput::text("错误：revision 必须是正整数"));
+                };
+                if iri.is_empty() {
+                    return Ok(ToolOutput::text("错误：ontology_iri 不能为空"));
+                }
+                match store.revert_to_version(&iri, rev, "agent", None) {
+                    Ok(()) => Ok(ToolOutput::text(format!(
+                        "已回退到版本 rev{rev}（当前内容 = 该版本快照，未发布修改被覆盖）"
+                    ))),
+                    Err(e) => Ok(ToolOutput::text(format!("错误：回退失败 - {e}"))),
+                }
+            })
+        },
+    )
+}
+
+/// `diff_ontology_versions(ontology_iri, rev_a, rev_b)`：两版本结构化对比。
+fn diff_ontology_versions_tool(store: Arc<TtlStore>) -> DynamicTool {
+    crate::dynamic_tool(
+        "diff_ontology_versions",
+        "对比两个版本的结构化差异（类/属性增删改 + 本体头变化），不逐行文本 diff。\\n\\\
+         rev 约定：0 = 当前工作区内容（可能未发布），正数 = 已发布版本 revision。\\n\
+         输出：新增/删除/修改的类与属性（含 label/comment/domain/range 变化），本体头元信息变化提示。",
+        json!({
+            "type": "object",
+            "properties": {
+                "ontology_iri": { "type": "string", "description": "本体 IRI（完整 URI）" },
+                "rev_a": { "type": "integer", "description": "基准版本（0=当前工作区）" },
+                "rev_b": { "type": "integer", "description": "对比版本（0=当前工作区）" },
+            },
+            "required": ["ontology_iri", "rev_a", "rev_b"],
+            "additionalProperties": false,
+        }),
+        move |args| {
+            let store = store.clone();
+            Box::pin(async move {
+                let iri = arg_str(&args, "ontology_iri");
+                let ra = args.get("rev_a").and_then(|v| v.as_i64());
+                let rb = args.get("rev_b").and_then(|v| v.as_i64());
+                let (Some(ra), Some(rb)) = (ra, rb) else {
+                    return Ok(ToolOutput::text("错误：rev_a/rev_b 必须是整数（0=当前工作区）"));
+                };
+                if iri.is_empty() {
+                    return Ok(ToolOutput::text("错误：ontology_iri 不能为空"));
+                }
+                match store.diff_versions(&iri, ra, rb) {
+                    Ok(d) => {
+                        let mut lines = Vec::new();
+                        lines.push(format!("rev{} vs rev{}：", d.rev_a, d.rev_b));
+                        if d.added_classes.is_empty()
+                            && d.removed_classes.is_empty()
+                            && d.modified_classes.is_empty()
+                            && d.added_properties.is_empty()
+                            && d.removed_properties.is_empty()
+                            && d.modified_properties.is_empty()
+                            && !d.ontology_meta_changed
+                        {
+                            lines.push("无差异".to_string());
+                        } else {
+                            for c in &d.added_classes {
+                                lines.push(format!("+ 类 {c}"));
+                            }
+                            for c in &d.removed_classes {
+                                lines.push(format!("- 类 {c}"));
+                            }
+                            for c in &d.modified_classes {
+                                lines.push(format!(
+                                    "~ 类 {} label: {} -> {} ; comment: {} -> {}",
+                                    c.iri, c.before.label, c.after.label, c.before.comment, c.after.comment
+                                ));
+                            }
+                            for p in &d.added_properties {
+                                lines.push(format!("+ 属性 {} (kind={})", p.iri, p.kind));
+                            }
+                            for p in &d.removed_properties {
+                                lines.push(format!("- 属性 {}", p.iri));
+                            }
+                            for p in &d.modified_properties {
+                                lines.push(format!(
+                                    "~ 属性 {} label: {} -> {} ; comment: {} -> {} ; domain: {} -> {} ; range: {} -> {}",
+                                    p.iri, p.before.label, p.after.label, p.before.comment, p.after.comment,
+                                    p.before.domain, p.after.domain, p.before.range, p.after.range
+                                ));
+                            }
+                            if d.ontology_meta_changed {
+                                lines.push("~ 本体头部元信息（本体自身 label/comment）有变化".to_string());
+                            }
+                        }
+                        Ok(ToolOutput::text(lines.join("\n")))
+                    }
+                    Err(e) => Ok(ToolOutput::text(format!("错误：对比失败 - {e}"))),
                 }
             })
         },
@@ -795,13 +1035,14 @@ mod tests {
     }
 
     #[test]
-    fn tool_group_has_seven_tools() {
+    fn tool_group_exposes_twelve_tools() {
         let store = Arc::new(TtlStore::open_in_memory().unwrap());
         let tools = ontology_ttl_tools(store);
         // 5 核心 (validate/import/export/list/query) + 2 元数据 (commit_change/list_changelog)
         // + 1 证据源登记 (register_evidence_source，P1 加入)
+        // + 4 版本管理 (publish/list/revert/diff，d0b08d15 加入)
         // set_charter 已按宪章用户主权移出 agent 工具（仅前端 CharterPanel 落库）
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 12);
         assert!(!tools.iter().any(|t| t.name() == "set_ontology_ttl_charter"));
     }
 
@@ -830,7 +1071,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn charter_empty_gate_blocks_manual_imported_ontology() {
         let store = Arc::new(TtlStore::open_in_memory().unwrap());
         // 模拟手工导入：直接 import_ttl 落库（不走宪章向导）→ 无 charter 行
@@ -839,7 +1079,7 @@ mod tests {
 @prefix : <https://example.org/manual#> .
 :Manual a owl:Ontology ; rdfs:label "手工导入"@zh .
 "#;
-        let r = store.import_ttl(ttl, false).unwrap();
+        let _r = store.import_ttl(ttl, false).unwrap();
         let (iri, _) = ontology_store::ttl::extract_ontology_meta(ttl, &mut Vec::new());
         assert!(iri.is_some(), "iri 提取失败");
         let iri = iri.unwrap();
@@ -905,7 +1145,7 @@ mod tests {
         let list = store.list_ontologies().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].version, "1.0.0");
-        // 4. export
+        // 4. export workspace
         let ttl = store
             .export_ttl("https://example.org/ontology/test#TestOntology")
             .unwrap();
@@ -918,5 +1158,34 @@ mod tests {
             )
             .unwrap();
         assert!(json.contains("Supplier"));
+    }
+
+    #[test]
+    fn export_effective_summary_refuses_unpublished_and_ignores_dirty() {
+        let store = Arc::new(TtlStore::open_in_memory().unwrap());
+        let iri = "https://example.org/ontology/test#TestOntology";
+        store.import_ttl(sample_ttl(), true).unwrap();
+        // 从未发布 → summary 路径拒绝
+        let err = store.export_effective_ttl(iri).unwrap_err();
+        assert!(matches!(
+            err,
+            ontology_store::StoreError::Unpublished(_)
+        ));
+        // full（工作区）仍可读
+        assert!(store.export_ttl(iri).unwrap().contains("供应商"));
+
+        store.publish_version(iri, "v1", "", "user", None).unwrap();
+        let v1 = store.export_effective_ttl(iri).unwrap();
+        assert!(v1.contains("供应商"));
+
+        let dirty = sample_ttl().replace("供应商", "供应商v2");
+        store.import_ttl(&dirty, true).unwrap();
+        assert!(store.get_workspace_dirty(iri).unwrap());
+        assert_eq!(store.get_active_revision(iri).unwrap(), Some(1));
+        // 生效摘要仍为 v1；工作区已脏
+        let effective = store.export_effective_ttl(iri).unwrap();
+        assert!(effective.contains("供应商"));
+        assert!(!effective.contains("供应商v2"));
+        assert!(store.export_ttl(iri).unwrap().contains("供应商v2"));
     }
 }

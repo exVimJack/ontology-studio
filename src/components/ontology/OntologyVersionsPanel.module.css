@@ -1,0 +1,434 @@
+/* OntologyVersionsPanel：本体版本管理面板（对齐工作台整体 UI：accent 蓝主按钮、中性灰框） */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 16px;
+  height: 100%;
+  overflow-y: auto;
+  box-sizing: border-box;
+  font-size: 13px;
+  color: #1d1d1a;
+}
+
+/* ── 状态行 ── */
+.statusRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #e5e5e5;
+  border-radius: 8px;
+  background: #fafafa;
+  font-size: 12.5px;
+}
+.statusRow svg {
+  color: var(--accent, #2563eb);
+}
+.statusRow b {
+  font-weight: 600;
+}
+
+/* ── 按钮（对齐工作台整体：accent 主按钮 / 中性次按钮）── */
+.publishBtn {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--accent, #2563eb);
+  border-radius: 6px;
+  background: var(--accent, #2563eb);
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.publishBtn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.ghostBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid #d9d9d9;
+  border-radius: 6px;
+  background: #fff;
+  color: #1d1d1a;
+  font-size: 12px;
+  cursor: pointer;
+}
+.ghostBtn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.iconBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: #666;
+  cursor: pointer;
+  padding: 2px;
+}
+.iconBtn:hover {
+  color: #1d1d1a;
+}
+.revertBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--accent, #2563eb);
+  border-radius: 5px;
+  background: #fff;
+  color: var(--accent, #2563eb);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.revertBtn:hover {
+  background: var(--accent-bg, #eff6ff);
+}
+.deleteBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 6px;
+  border: 1px solid #d9d9d9;
+  border-radius: 5px;
+  background: #fff;
+  color: #666;
+  font-size: 12px;
+  cursor: pointer;
+}
+.deleteBtn:hover:not(:disabled) {
+  border-color: #dc2626;
+  color: #dc2626;
+  background: #fef2f2;
+}
+.deleteBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ── 区块标题 ── */
+.sectionTitle {
+  margin-top: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #666;
+  border-bottom: 1px solid #eaeaea;
+  padding-bottom: 4px;
+}
+
+/* ── 空态 ── */
+.empty {
+  padding: 8px 2px;
+  color: #999;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+/* ── 版本列表 ── */
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.item {
+  padding: 8px 10px;
+  border: 1px solid #e5e5e5;
+  border-radius: 8px;
+  background: #fff;
+}
+.itemActive {
+  /* 线框与整体一致（无红色）；启用态仅背景轻区分 */
+  border-color: #e5e5e5;
+  background: #f7faff;
+}
+.itemHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.rev {
+  font-weight: 600;
+  font-size: 12.5px;
+}
+.label {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: #f0f0f0;
+  font-size: 11.5px;
+  color: #444;
+}
+.badge {
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: var(--accent, #2563eb);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+}
+.meta {
+  margin-left: auto;
+  color: #999;
+  font-size: 11.5px;
+}
+.desc {
+  margin-top: 4px;
+  color: #666;
+  font-size: 12px;
+}
+
+/* ── 发布弹窗 ── */
+.modalMask {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.modal {
+  width: 360px;
+  max-width: 90vw;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+}
+.modalHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid #eaeaea;
+  font-weight: 600;
+  font-size: 13px;
+}
+.modalBody {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+}
+.fieldLabel {
+  font-size: 12px;
+  color: #666;
+  margin-top: 4px;
+}
+.input,
+.textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border: 1px solid #d9d9d9;
+  border-radius: 6px;
+  font-size: 12.5px;
+  font-family: inherit;
+  outline: none;
+  background: #fff;
+}
+.input:focus,
+.textarea:focus {
+  border-color: #c00000;
+}
+.textarea {
+  resize: vertical;
+}
+.modalFoot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+.err {
+  color: #c00000;
+  font-size: 12px;
+}
+
+/* ── 版本对比（行内修改点：发布时落库的 diff_summary）── */
+.diffInline {
+  margin-top: 6px;
+  font-size: 12px;
+}
+.diffInlineSummary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  color: #666;
+  user-select: none;
+  list-style-position: inside;
+}
+.diffInlineTag {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--accent-bg, #eff6ff);
+  color: var(--accent, #2563eb);
+  font-size: 11px;
+  font-weight: 600;
+}
+.diffInlineBody {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid #e5e5e5;
+  border-radius: 8px;
+  background: #fafafa;
+}
+.diffInlineBody .diff {
+  border: none;
+  background: transparent;
+  padding: 0;
+}
+.diffInlineEmpty {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: #999;
+}
+.diff {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid #e5e5e5;
+  border-radius: 8px;
+  background: #fff;
+  font-size: 12.5px;
+}
+.diffTitle {
+  font-weight: 600;
+  color: #444;
+  margin-bottom: 2px;
+}
+.diffEmpty {
+  padding: 8px 2px;
+  color: #666;
+  font-size: 12.5px;
+}
+.diffSection {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+}
+.diffSection:first-of-type {
+  margin-top: 0;
+}
+.diffSectionTitle {
+  font-size: 11px;
+  font-weight: 600;
+  color: #666;
+  letter-spacing: 0.02em;
+  margin-top: 2px;
+}
+.diffLine {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+.diffLineRow {
+  align-items: center;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: 0 -4px;
+  outline: none;
+}
+.diffLineRow:hover,
+.diffLineRow:focus-within {
+  background: #f5f5f5;
+}
+.diffMain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  flex: 1;
+  min-width: 0;
+}
+.diffSecondary {
+  color: #888;
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+}
+.revokeBtnWrap {
+  margin-left: auto;
+  flex-shrink: 0;
+  opacity: 0;
+  pointer-events: none;
+  display: inline-flex;
+}
+/* 仅悬停行显示；勿用行上 focus-within（点击行会吸焦，移走后按钮不消失） */
+.diffLineRow:hover .revokeBtnWrap,
+.revokeBtnWrap:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+.revokeBtn {
+  border: 1px solid #e5e5e5;
+  border-radius: 4px;
+  background: #fff;
+  color: #444;
+  font-size: 11px;
+  padding: 1px 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.revokeBtn:hover:not(:disabled) {
+  border-color: #c00000;
+  color: #c00000;
+}
+.revokeBtn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.op {
+  font-weight: 700;
+  font-family: ui-monospace, monospace;
+}
+.add {
+  color: #1d7a3d;
+}
+.del {
+  color: #c00000;
+}
+.mod {
+  color: #a16207;
+}
+.detail {
+  color: #888;
+  font-size: 11.5px;
+}
+
+/* ── 版本上限 ── */
+.limitRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.inputSmall {
+  width: 72px;
+  padding: 5px 8px;
+  border: 1px solid #d9d9d9;
+  border-radius: 6px;
+  font-size: 12.5px;
+  background: #fff;
+  color: #1d1d1a;
+}
+.hint {
+  color: #999;
+  font-size: 11.5px;
+}

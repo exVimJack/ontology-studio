@@ -3,13 +3,13 @@
 // 结构（自上而下）：
 //   ① 顶层标题栏（瘦）：标题 + 独立性档位徽章 + 历史/报告图标（抽屉）
 //   ② 校验对象行：本体下拉与"当前本体"合一（v0.4.2：从顶层标题栏下沉）
-//   ③ 主流程一条线：① 规则检查（含 warning 答辩） → ② 对抗验证（多轮语义评审） → ③ 人工仲裁 + 出口检查点
+//   ③ 主流程一条线：① 规则检查（error 纠错 + warning 待评审） → ② 对抗验证（多轮语义评审） → ③ 人工仲裁 + 出口检查点
 //      ——子菜单栏移除，流程线即导航，节点可点击（done/active/blocked 三态）
 //   ④ 阶段内容区：先「子流程示意条」（本步在干什么 + 实时状态），再完整功能
 //
 // 流程语义（VALIDATION-DESIGN v0.7）：全部显式触发；人只出现在最后。
-// 答辩在阶段①（规则检查产出 warning 即可逐条反驳，不依赖语义评审先行——
-// 语义评审在阶段②做本体级大清洗，两者并行不互锁）。
+// 合并方案 v0.8：独立答辩通道已并入语义评审——规则 warning 的异议在阶段②
+// A 修订时统一表态（带证据引用，机械匹配把关），B 复核裁决。
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Clock, FileText, Loader2, Play, ShieldCheck, X } from "lucide-react";
@@ -26,15 +26,18 @@ import {
   useCoverageMatrix,
   useRunValidation,
   useRunAReviseLlm,
-  useRunAutoDispute,
   useRunReviewLoop,
   useLatestValidationReview,
-  useAutoDisputeResult,
+  useReviewRounds,
   useIndependenceTier,
-  type AutoDisputeItem,
   layerLabel,
   type ValidationIssue,
 } from "@/hooks/useOntologyValidation";
+import {
+  reviewFlowTag,
+  reviewStage,
+  reviewVerdictTag,
+} from "@/lib/review-outcome";
 import { IssueCard } from "./ValidationPanel";
 import { ReviewPanel } from "./ReviewPanel";
 import { ArbitrationPanel } from "./ArbitrationPanel";
@@ -64,26 +67,15 @@ export function ValidationWorkbenchView() {
   const issues = useValidationIssues(iri);
   const rulesRun = issues.data != null; // ① 是否已运行过（落库快照存在）
 
-  // 流程状态从持久化 review 推导（切页/重启不丢）：有未收敛评审 → 阶段②；
-  // 评审已结束（resolved/escalated）→ 阶段③；否则阶段①。用户点击 FlowLine 可改。
+  // 流程状态从持久化 review 推导（切页/重启不丢）：in_progress / interrupted → 阶段②；
+  // resolved / escalated → 阶段③；其余 → 阶段①。用户点击 FlowLine 可改。推导收在
+  // lib/review-outcome.reviewStage：interrupted 归②（下一步是重跑，不是去仲裁）。
   const reviewQ = useLatestValidationReview(iri);
   const reviewStatus = reviewQ.data?.status ?? null;
-  const [stage, setStage] = useState<Stage>(() =>
-    reviewStatus === "in_progress"
-      ? 2
-      : reviewStatus === "resolved" || reviewStatus === "escalated"
-        ? 3
-        : 1,
-  );
+  const [stage, setStage] = useState<Stage>(() => reviewStage(reviewStatus));
   useEffect(() => {
     if (stage !== 1) return; // 用户已手动选过阶段，不覆盖
-    setStage(
-      reviewStatus === "in_progress"
-        ? 2
-        : reviewStatus === "resolved" || reviewStatus === "escalated"
-          ? 3
-          : 1,
-    );
+    setStage(reviewStage(reviewStatus));
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 只在初始推导
   }, [reviewStatus]);
 
@@ -218,7 +210,6 @@ function FlowLine({
         className={`${styles.fstage} ${stage === 1 ? styles.active : rulesRun ? styles.done : ""}`}
         onClick={() => onSelect(1)}
       >
-        <span className={styles.fsTag}>检测零 LLM</span>
         <div className={styles.fsNum}>阶段 ①</div>
         <div className={styles.fsTitle}>规则检查</div>
         <div className={styles.fsSub}>语法 · 结构 · 逻辑 · 覆盖矩阵 · 纠错 · 答辩</div>
@@ -231,7 +222,9 @@ function FlowLine({
         {stage !== 2 && rulesRun && reviewStatus === "resolved" && (
           <span className={styles.fsTag}>已收敛</span>
         )}
-        {stage === 2 && reviewStatus === "in_progress" && <span className={styles.fsTag}>进行中</span>}
+        {stage === 2 && reviewFlowTag(reviewStatus) && (
+          <span className={styles.fsTag}>{reviewFlowTag(reviewStatus)}</span>
+        )}
         <div className={styles.fsNum}>阶段 ②</div>
         <div className={styles.fsTitle}>对抗验证</div>
         <div className={styles.fsSub}>多轮语义评审 · B 裁决</div>
@@ -368,26 +361,27 @@ function StageRule({
           {ruleIssues.map((issue: ValidationIssue) => (
             <IssueCard key={issue.id} issue={issue} onJumpToSource={undefined} />
           ))}
+
+          {/* 覆盖矩阵：校验结果的一部分（名词级机械比对打底） */}
+          <div className="mt-2 border-t border-border pt-3">
+            <div className="mb-2 text-xs font-medium" style={{ color: "var(--fg)" }}>
+              覆盖矩阵（29 句话覆盖
+              {coverage.data
+                ? `：${coverage.data.covered_count}/${coverage.data.total_count} · 缺失 ${coverage.data.total_count - coverage.data.covered_count}`
+                : "：尚未计算"}
+              ）
+            </div>
+            {coverageOn && coverage.isPending && (
+              <p className="text-xs text-fg-subtle">覆盖矩阵计算中…</p>
+            )}
+            {coverage.data && <CoverageView iri={iri} />}
+          </div>
         </div>
       </details>
 
-      {/* 覆盖矩阵折叠框：跑过就有，缺失明细收在框内 */}
-      {coverageOn && coverage.isPending && <p className="mt-3 text-xs text-fg-subtle">覆盖矩阵计算中…</p>}
-      {coverage.data && (
-        <details className={styles.fold} open>
-          <summary className={styles.foldSummary}>
-            覆盖矩阵（{coverage.data.covered_count}/{coverage.data.total_count} · 缺失{" "}
-            {coverage.data.total_count - coverage.data.covered_count}）
-          </summary>
-          <div className={styles.foldBody}>
-            <CoverageView iri={iri} />
-          </div>
-        </details>
-      )}
-
-      {/* 答辩（阶段①内）：交 A 修复 + 交 A 答辩都在这里；对 warning 逐条反驳，B 机器裁决，判不定升级仲裁（阶段③） */}
+      {/* 规则处理（阶段①内）：error 纠错循环；warning 待语义评审 A 修订环节统一处理（合并方案 v0.8） */}
       <div className="mt-4 border-t border-border pt-4">
-        <StageDispute iri={iri} content={content} modelA={modelA} modelB={modelB} />
+        <StageRules iri={iri} content={content} modelA={modelA} modelB={modelB} />
       </div>
     </div>
   );
@@ -401,10 +395,12 @@ function StageAdversarial({ iri }: { iri: string }) {
   const charterQ = useOntologyTtlCharter(iri);
   const charter = charterQ.data;
   const charterSummary = charter
-    ? `业务场景：${charter.business_scenario || "（未填写）"}\n业务本质：${charter.business_essence || "（未填写）"}`
+    ? `业务场景：${charter.business_scenario || "（未填写）"}\n业务目标：${charter.business_essence || "（未填写）"}`
     : "（宪章加载中）";
   const modelA = provider.data?.model ?? "";
   const modelB = verifierQ.data?.model || modelA;
+  // 轮次清单数据源：最新评审 id
+  const latestReviewId = useLatestValidationReview(iri).data?.id ?? null;
 
   return (
     <div>
@@ -428,8 +424,80 @@ function StageAdversarial({ iri }: { iri: string }) {
       </div>
 
       <ReviewPanel ontologyIri={iri} modelA={modelA} modelB={modelB} onEscalated={() => undefined} />
+
+      {/* 轮次清单（合并方案 v0.8）：每轮 发现/已修改/异议/裁决，可查看 */}
+      <RoundList reviewId={latestReviewId} />
     </div>
   );
+}
+
+/** 轮次清单（合并方案 v0.8）：按轮次展示该评审的 issue 快照 + 统计。 */
+function RoundList({ reviewId }: { reviewId: string | null }) {
+  const roundsQ = useReviewRounds(reviewId);
+  const rounds = roundsQ.data ?? [];
+  if (!reviewId || rounds.length === 0) return null;
+  return (
+    <details className={styles.fold} open>
+      <summary className={styles.foldSummary}>
+        轮次清单（{rounds.length} 轮 · 每轮 发现/已修改/异议/裁决）
+      </summary>
+      <div className={styles.foldBody}>
+        <div className="space-y-2">
+          {rounds.map((r) => (
+            <div key={r.id} className="rounded border border-border p-2 text-xs">
+              <div className="mb-1 text-fg">
+                第 {r.round} 轮 · 发现 {r.found_count} · 已修改 {r.accepted_count} · 异议{" "}
+                {r.disputed_count} · 结果{" "}
+                {reviewVerdictTag(r.verdict)}
+              </div>
+              <ul className="m-0 list-none space-y-0.5 p-0 pl-3 text-fg-subtle">
+                {parseSnapshot(r.snapshot_json).map((it, idx) => (
+                  <li key={idx}>
+                    [{it.severity}] {it.rule} →{" "}
+                    {it.status === "accepted"
+                      ? "已修改"
+                      : it.status === "disputed"
+                        ? "异议待裁决"
+                        : it.status === "overruled"
+                          ? "异议成立·撤销"
+                          : it.status === "open"
+                            ? "未处理"
+                            : it.status}
+                    {it.a_action ? `（A：${it.a_action}）` : ""}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      </div>
+    </details>
+  );
+}
+
+/** 容错解析轮次快照 JSON。 */
+function parseSnapshot(json: string): Array<{
+  severity: string;
+  rule: string;
+  status: string;
+  a_action: string | null;
+}> {
+  try {
+    const arr = JSON.parse(json) as Array<{
+      severity?: string;
+      rule?: string;
+      status?: string;
+      a_action?: string | null;
+    }>;
+    return arr.map((it) => ({
+      severity: it.severity ?? "",
+      rule: it.rule ?? "",
+      status: it.status ?? "",
+      a_action: it.a_action ?? null,
+    }));
+  } catch {
+    return [];
+  }
 }
 
 /** 「启动/重新评审」按钮（阶段②唯一入口，放子流程条最前——同阶段①「运行校验」位次）。
@@ -495,11 +563,10 @@ function ReviewLaunchButton({
   );
 }
 
-/* ── 答辩（阶段①内）：A 逐条决策（自动）+ 人工精修入口（弹窗）──
-   完整对抗语义：答辩发起方是 A（建模者）——A 构造论据+反证，B 裁决；
-   「交 A 答辩」按钮一键跑完后端链（A 决策 → 机械匹配 → B 三态裁决），
-   人只在阶段③ 仲裁 B 判不定的残留。 */
-function StageDispute({
+/* ── 规则处理（阶段①内）：error 纠错 + warning 说明 ──
+   合并方案 v0.8：独立答辩通道已并入语义评审——规则告警的异议在阶段② A 修订时
+   统一表态（带证据引用，机械匹配把关），这里只保留 error 单方纠错循环。 */
+function StageRules({
   iri,
   content,
   modelA,
@@ -510,29 +577,19 @@ function StageDispute({
   modelA: string;
   modelB: string;
 }) {
-  const autoDispute = useRunAutoDispute();
-  const cachedResult = useAutoDisputeResult(iri);
-  // 后端驱动进度（对齐 ReviewPanel）：running 由缓存 running 标志驱动，不依赖
-  // 前端 mutation 状态——切窗/切页回来轮询到 running=true 即恢复"进行中"展示。
-  // issue 状态逐条落库，pollWhen=true 让 warnings/settled 统计实时刷新（Bug 2 修复）。
-  const disputeRunning = !!cachedResult.data?.running;
-  const issues = useValidationIssues(iri, disputeRunning);
+  const issues = useValidationIssues(iri);
   const runValidation = useRunValidation();
   const runARevise = useRunAReviseLlm();
   const importTtl = useImportOntologyTtl();
   const coverage = useCoverageMatrix(iri, [], true);
   const ruleIssues = (issues.data ?? []).filter((i: ValidationIssue) => i.source !== "review");
-  const warnings = ruleIssues.filter(
-    (i: ValidationIssue) =>
-      i.severity === "warning" &&
-      (!i.status || i.status === "open" || i.status === "disputed"),
-  );
   const settled = ruleIssues.filter((i: ValidationIssue) =>
     ["accepted", "overruled"].includes(String(i.status)),
   );
-  // 展示用结果：后端缓存 items（进行中已完成的条目 / 完成后的完整结果）
-  const disputeResult: AutoDisputeItem[] | null =
-    cachedResult.data?.items?.length ? cachedResult.data.items : null;
+  const openWarnings = ruleIssues.filter(
+    (i: ValidationIssue) =>
+      i.severity === "warning" && (!i.status || i.status === "open" || i.status === "disputed"),
+  );
 
   // ── 交 A 修复：error 纠错循环（≤3 轮）——error 是确定性违反、无辩空间，
   // A 单方修订；中间稿不落库（修好才进库），覆盖缺失一并交给 A。──
@@ -594,12 +651,12 @@ function StageDispute({
 
   return (
     <div className={vp.wrap}>
-      {/* 头部：与语义评审同构（标题 + 统计 + 两个动作按钮） */}
+      {/* 头部：规则处理（标题 + 统计 + error 纠错按钮；答辩已并入语义评审） */}
       <div className={vp.head}>
-        <div className={vp.title}>答辩</div>
+        <div className={vp.title}>规则处理</div>
         <div className={vp.stats}>
-          <span className={vp.statWarning}>待答辩 {warnings.length}</span>
-          <span className={vp.statSug}>已裁决 {settled.length}</span>
+          <span className={vp.statWarning}>待评审 warning {openWarnings.length}</span>
+          <span className={vp.statSug}>已闭环 {settled.length}</span>
           <span className={vp.statSug}>A: {modelA || "未配置"}</span>
           <span className={vp.statWarning}>B: {modelB || "未配置"}</span>
         </div>
@@ -617,24 +674,6 @@ function StageDispute({
           >
             {fixing ? <Loader2 size={13} className="animate-spin" /> : <ShieldCheck size={13} />}
             交 A 修复（{unclosed.length} error）
-          </button>
-          <button
-            type="button"
-            className={vp.btnPrimary}
-            disabled={warnings.length === 0 || disputeRunning || fixing}
-            title={
-              warnings.length === 0
-                ? "没有待答辩的 warning"
-                : "A 逐条决策（答辩/接受）→ 机械匹配 → B 机器裁决，一键全自动；切页/切窗不中断"
-            }
-            onClick={() => autoDispute.mutate(iri)}
-          >
-            {disputeRunning ? (
-              <Loader2 size={13} className="animate-spin" />
-            ) : (
-              <Play size={13} />
-            )}
-            交 A 答辩（{warnings.length} warning）
           </button>
         </div>
       </div>
@@ -658,57 +697,14 @@ function StageDispute({
           </details>
         )}
 
-        {disputeRunning && (
-          <p className="mb-2 text-xs text-fg-subtle">
-            ⏳ A 逐条决策中（选证据源 → 摘录原文 → 构造论据）→ 机械匹配 → B 裁决…（整链后端跑，切页不中断）
-          </p>
-        )}
-        {disputeResult && !disputeRunning && (
-          <details className={styles.fold} open>
-            <summary className={styles.foldSummary}>
-              答辩结果（
-              {disputeResult.filter((d) => d.outcome === "overruled").length} 撤销 ·{" "}
-              {disputeResult.filter((d) => d.outcome === "accepted").length} B 驳回 ·{" "}
-              {disputeResult.filter((d) => d.outcome === "uncertain").length} 待人工 ·{" "}
-              {disputeResult.filter((d) => d.outcome === "accept").length} A 接受
-              {disputeResult.some((d) => d.outcome === "rejected_match")
-                ? ` · ${disputeResult.filter((d) => d.outcome === "rejected_match").length} 摘录未匹配`
-                : ""}
-              ）
-            </summary>
-            <div className={styles.foldBody}>
-              <ul className="m-0 list-none space-y-1 p-0 text-xs text-fg-subtle">
-                {disputeResult.map((d) => (
-                  <li key={d.issue_id}>
-                    <b className="text-fg">{d.issue_id}</b> —{" "}
-                    {d.outcome === "overruled"
-                      ? "✅ B 撤销"
-                      : d.outcome === "accepted"
-                        ? "❌ B 驳回（升级 error）"
-                        : d.outcome === "uncertain"
-                          ? "⚖ B 判不定 → 人工仲裁"
-                          : d.outcome === "rejected_match"
-                            ? "⚠ 摘录未过机械匹配，维持 open"
-                            : d.outcome === "error"
-                              ? "✗ 处理失败"
-                              : "A 接受"}
-                    {d.detail ? `：${d.detail}` : ""}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </details>
-        )}
-
-        {warnings.length === 0 && unclosed.length === 0 && !disputeRunning && !disputeResult && (
+        {openWarnings.length > 0 && (
           <div className={vp.hint}>
-            没有待处理的 warning 与 error（先运行上方「运行校验」）
+            待评审 warning {openWarnings.length} 条——将在阶段② 语义评审的 A 修订环节统一处理（接受即改 / 带证据异议，B 复核裁决）。
           </div>
         )}
-        {warnings.length > 0 && !disputeResult && !disputeRunning && (
+        {unclosed.length === 0 && openWarnings.length === 0 && (
           <div className={vp.hint}>
-            待答辩 warning 的明细见上方「校验结果」折叠框（卡片右侧有「答辩」按钮可人工精修）；
-            点「交 A 答辩」让 A 全自动逐条处理。
+            没有未闭环的 error 与待评审 warning（先运行上方「运行校验」）
           </div>
         )}
       </div>

@@ -57,8 +57,8 @@ fn describe_ontology_tool(store: Arc<OntologyStore>) -> DynamicTool {
         "describe_ontology",
         "获取本体的轻量目录视图（summary）。返回每个 ObjectType 的 api_name/display_name/primary_key/storage_type/property_count，\u{a}
          以及 link_type/action_type 的计数（不展开定义）。体积小（~2-5KB），适合会话中快速了解本体有哪些实体。\u{a}
-         **返回同时携带 `charter`（本体设计宪章，不变点）：business_scenario（业务场景）/ business_essence（业务本质）/\u{a}
-         这是「向 AI 说明业务本质」的结构化业务认知——\u{a}
+         **返回同时携带 `charter`（本体设计宪章，不变点）：business_scenario（业务场景）/ business_essence（业务目标）/\u{a}
+         这是「向 AI 说明业务目标」的结构化业务认知——\u{a}
          增量更新本体前必读 charter，确保变更不违背建模初衷和业务约束；除非用户明确要求调整 charter，否则不要修改它。**\u{a}
          需要某 OT 的完整 schema 时调 describe_object_type，需要某 link 详情时调 describe_link_type。\u{a}
          不要调 export_ontology 获取完整 payload——那是建模专用，体积可达 100KB+。\u{a}
@@ -558,7 +558,7 @@ fn charter_empty_gate_palantir(store: &OntologyStore, api_name: &str) -> Option<
                 "导入被拒绝：本体 {api_name} 的设计宪章为空（该本体可能由手工导入建立，\n\
                  未经过宪章向导）。\n\
                  宪章是建模的业务意图基线（决策 24）。请先知会用户补全宪章：在「设计宪章」\n\
-                 面板填写业务场景/业务本质/两字段（你可先起草建议供用户\n\
+                 面板填写业务场景与业务目标两字段（你可先起草建议供用户\n\
                  修改确认，但写入必须由用户操作），补全后再执行导入。"
             ))
         }
@@ -573,7 +573,7 @@ fn new_ontology_gate_palantir(store: &OntologyStore, api_name: &str) -> Option<S
         Ok(false) => Some(format!(
             "导入被拒绝：本体 {api_name} 尚未建立。宪章先行（ARCHITECTURE.md 决策 24）：\
              设计宪章是本体建模的前提，本体创建必须由用户完成。\n\
-             请指引用户：在「Palantir标准」页点「新建本体」，填写业务场景/业务本质/\
+             请指引用户：在「Palantir标准」页点「新建本体」，填写业务场景与业务目标\
              两字段（可先用 AI 起草建议预填）并保存；\n\
              本体建立后，把你的建模思路和宪章要点作为参考给用户，再在新本体上\
              执行增量导入。在此之前不要尝试任何导入。"

@@ -43,6 +43,10 @@ pub enum StoreError {
     #[error("W3C 语义规范违反: {0}")]
     SemanticRule(String),
 
+    /// 消费面（导出/联邦/Agent 读生效内容）在从未发布时拒绝。
+    #[error("本体尚未发布，请先发布版本: {0}")]
+    Unpublished(String),
+
     #[error("其他: {0}")]
     Other(#[from] anyhow::Error),
 }

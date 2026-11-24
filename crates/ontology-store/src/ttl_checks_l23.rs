@@ -34,6 +34,8 @@ const OWL_SYMMETRIC_PROPERTY: &str = "http://www.w3.org/2002/07/owl#SymmetricPro
 const OWL_TRANSITIVE_PROPERTY: &str = "http://www.w3.org/2002/07/owl#TransitiveProperty";
 const OWL_IMPORTS: &str = "http://www.w3.org/2002/07/owl#imports";
 const SWRL_IMP: &str = "http://www.w3.org/2003/11/swrl#Imp";
+const SWRL_BODY: &str = "http://www.w3.org/2003/11/swrl#body";
+const SWRL_HEAD: &str = "http://www.w3.org/2003/11/swrl#head";
 
 // ════════════════════════════════════════════════════════════════
 // L2 逻辑一致性（5 条，SPARQL 模板）
@@ -430,26 +432,45 @@ pub fn check_l3_many_to_many_split(store: &Store, issues: &mut Vec<ValidationIss
     }
 }
 
-/// L3-6 SWRL 原子完备（error）：swrl:Imp 的 body/head 引用的变量均有绑定价。
-/// 简化实现：swrl:Imp 必须声明 body 与 head（不空）。
+/// L3-6 SWRL 原子完备（error）：swrl:Imp 必须同时声明非空 `swrl:body` 与 `swrl:head`。
+///
+/// 只对**真正缺 body/head** 的规则报错。历史上这里是"见到 swrl:Imp 就 error"，
+/// 会把结构完全合法的规则也判死，进而让 `surgery_import` 的校验闸门
+/// 拒绝该本体上的一切编辑（改 label / 改属性 / 删类全部失败）。
 pub fn check_l3_swrl_atomic_completeness(store: &Store, issues: &mut Vec<ValidationIssue>) {
     let q = format!(
-        "SELECT ?imp WHERE {{\n\
+        "SELECT ?imp ?body ?head WHERE {{\n\
             ?imp <{RDF_TYPE}> <{SWRL_IMP}> .\n\
             FILTER(isIRI(?imp))\n\
+            OPTIONAL {{ ?imp <{SWRL_BODY}> ?body }}\n\
+            OPTIONAL {{ ?imp <{SWRL_HEAD}> ?head }}\n\
         }}"
     );
     for row in run_sparql_solutions(store, &q) {
         let Some(imp) = row.get("imp").map(|s| strip_term(s)) else {
             continue;
         };
-        // 检查该 imp 是否有 body/head（这里简单检查：存在至少一条以 imp 为主语的谓词）
-        // 完整原子性需解析 swrl:body/head 内部结构，此处降级为"主体存在"检查
+        let has_body = row
+            .get("body")
+            .map(|s| !strip_term(s).trim().is_empty())
+            .unwrap_or(false);
+        let has_head = row
+            .get("head")
+            .map(|s| !strip_term(s).trim().is_empty())
+            .unwrap_or(false);
+        if has_body && has_head {
+            continue;
+        }
+        let missing = match (has_body, has_head) {
+            (false, false) => "body 与 head",
+            (false, true) => "body",
+            _ => "head",
+        };
         issues.push(ValidationIssue::error(
             "L3-6",
             "L3",
             "check_l3_swrl_atomic_completeness",
-            format!("SWRL 规则 '{imp}' 需人工复核 body/head 原子完备性（悬空变量检查）"),
+            format!("SWRL 规则 '{imp}' 缺少 {missing}，规则不完整"),
         ));
     }
 }
@@ -732,6 +753,49 @@ mod tests {
         let mut issues = Vec::new();
         check_l2_functional(&store, &mut issues);
         assert!(issues.iter().any(|i| i.id == "L2-4"));
+    }
+
+    #[test]
+    fn l3_swrl_rules_with_body_and_head_pass() {
+        let ttl = r#"
+            @prefix owl: <http://www.w3.org/2002/07/owl#> .
+            @prefix swrl: <http://www.w3.org/2003/11/swrl#> .
+            @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+            @prefix ex: <http://example.org/> .
+            ex:Lead a owl:Class .
+            ex:rule a swrl:Imp ;
+                swrl:body ( [ a swrl:ClassAtom ; swrl:classPredicate ex:Lead ; swrl:argument1 "l"^^xsd:string ] ) ;
+                swrl:head ( [ a swrl:ClassAtom ; swrl:classPredicate ex:Lead ; swrl:argument1 "l"^^xsd:string ] ) .
+        "#;
+        let store = parse(ttl);
+        let mut issues = Vec::new();
+        check_l3_swrl_atomic_completeness(&store, &mut issues);
+        assert!(
+            !issues.iter().any(|i| i.id == "L3-6"),
+            "合法规则不应报错: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn l3_swrl_rule_missing_head_is_error() {
+        let ttl = r#"
+            @prefix owl: <http://www.w3.org/2002/07/owl#> .
+            @prefix swrl: <http://www.w3.org/2003/11/swrl#> .
+            @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+            @prefix ex: <http://example.org/> .
+            ex:Lead a owl:Class .
+            ex:broken a swrl:Imp ;
+                swrl:body ( [ a swrl:ClassAtom ; swrl:classPredicate ex:Lead ; swrl:argument1 "l"^^xsd:string ] ) .
+        "#;
+        let store = parse(ttl);
+        let mut issues = Vec::new();
+        check_l3_swrl_atomic_completeness(&store, &mut issues);
+        assert!(
+            issues.iter().any(|i| i.id == "L3-6" && i.message.contains("head")),
+            "缺 head 应报错: {:?}",
+            issues
+        );
     }
 
     #[test]

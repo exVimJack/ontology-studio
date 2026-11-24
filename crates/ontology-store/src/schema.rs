@@ -206,20 +206,20 @@ pub fn init_schema(conn: &Connection) -> StoreResult<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_changelog_ont ON ontology_changelog(ontology_api_name, revision DESC);
 
-        -- ═══ 本体设计宪章（不变点：业务场景 / 本质 / 设计意图 / 补充说明）═══
+        -- ═══ 本体设计宪章（不变点：业务场景 / 业务目标）═══
         -- 与 changelog（变化点）物理分离、语义分离、写入路径分离：
         --   - changelog 记「每次变更」——随历史增长，revision 递增
-        --   - charter 记「业务本质说明」——不随历史变化，1:1 关联本体
+        --   - charter 记业务场景与业务目标——不随历史变化，1:1 关联本体
         -- charter 由独立命令 set_ontology_charter 写入，不进 import 流程
         -- （import 的 upsert_ontology 不覆盖 charter，也不从 payload 读 charter）。
         -- 用 api_name（而非 ontology_id）作主键：ontology 行被 delete+recreate
         -- 时 id 会变（new_id()），但 api_name 稳定，charter 跟着 api_name 走不丢。
         -- 设计动机（决策：本体不变点）：
         --   1. 业务意图目标决定，遵循「够用且可扩展」——charter 记录建模的取舍边界
-        --   2. 本体始终扮演「向 AI 说明业务本质」的角色——charter 是 AI 的结构化业务认知
-        -- 四字段语义：
-        --   business_scenario：业务场景（服务于什么业务目标、谁用、解决什么问题）
-        --   business_essence：业务本质（核心业务对象/状态/关系/动态行为的一句话本质概括）
+        --   2. 本体始终扮演「向 AI 说明业务目标」的角色——charter 是 AI 的结构化业务认知
+        -- 字段语义（design_intent/invariants 结构保留兼容存量，不下发）：
+        --   business_scenario：业务场景（定义本体建模的使用范围以及对象）
+        --   business_essence：业务目标（定义本体建模的使用目标；字段名历史兼容）
         CREATE TABLE IF NOT EXISTS ontology_charter (
             ontology_api_name  TEXT PRIMARY KEY,        -- 1:1 关联 ontologies.api_name
             business_scenario  TEXT NOT NULL DEFAULT '',
@@ -281,7 +281,7 @@ pub fn init_schema(conn: &Connection) -> StoreResult<()> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS validation_issues (
-            id                     TEXT PRIMARY KEY,            -- 稳定 id：vi-{uuid simple}；review 来源为 "{review_id}:{B条目id}"
+            id                     TEXT PRIMARY KEY,            -- 全局唯一；rules 来源入库加本体作用域前缀 "{iri}#{rule-id}"，review 来源 "{review_id}:{B条目id}"
             ontology_iri           TEXT NOT NULL,               -- 归属本体 IRI
             validation_id          TEXT NOT NULL,               -- 同一次 validate 调用分组（review 来源 = review_id）
             layer                  TEXT NOT NULL,               -- 'L0'|'L1'|'L2'|'L2.5'|'L2.6'|'L3'|'L4'
@@ -322,11 +322,28 @@ pub fn init_schema(conn: &Connection) -> StoreResult<()> {
             step_ms_b     INTEGER NOT NULL DEFAULT 0,  -- B 评审耗时 ms（0=未完成）
             step_ms_a     INTEGER NOT NULL DEFAULT 0,  -- A 修订耗时 ms（0=未完成）
             step_ms_re    INTEGER NOT NULL DEFAULT 0,  -- B 复核耗时 ms（0=未完成）
+            outcome_reason TEXT NOT NULL DEFAULT 'unknown', -- 结束归因：verdict_capped|step_failed|interrupted|manual_escalation|write_back_conflict|unknown
+            outcome_detail TEXT NOT NULL DEFAULT '',        -- 失败实际错误文本（仅日志与 tooltip，不直接面向用户）
+            base_ttl       TEXT NOT NULL DEFAULT '',        -- 评审启动时的草稿全文基线（写回前判冲突）
             status        TEXT NOT NULL DEFAULT 'in_progress', -- in_progress|resolved|escalated
             created_at    INTEGER NOT NULL,
             updated_at    INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_vr_ont ON validation_reviews(ontology_iri);
+
+        CREATE TABLE IF NOT EXISTS review_rounds (
+            id             TEXT PRIMARY KEY,            -- 稳定 id：rr-{uuid simple}
+            review_id      TEXT NOT NULL,               -- 归属评审（FK→validation_reviews.id）
+            round          INTEGER NOT NULL,            -- 轮次：1=首轮 B 评审，2/3=修订复核轮
+            snapshot_json  TEXT NOT NULL,               -- 该轮结束时 issue 清单快照 [{id,severity,rule,status,a_action}]
+            found_count    INTEGER NOT NULL DEFAULT 0,  -- 该轮累计发现数（review 域 + 规则域 warning）
+            accepted_count INTEGER NOT NULL DEFAULT 0,  -- A 接受（已修改）
+            disputed_count INTEGER NOT NULL DEFAULT 0,  -- A 异议（待裁决）
+            verdict        TEXT,                        -- 该轮后 review 状态：in_progress|resolved|escalated
+            created_at     INTEGER NOT NULL,
+            updated_at     INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rr_review ON review_rounds(review_id);
         "#,
     )?;
 
@@ -347,6 +364,9 @@ pub fn init_schema(conn: &Connection) -> StoreResult<()> {
     // 主 execute_batch 里不再建 idx_datasets_ontology / idx_data_sources_ontology
     // （这两个索引引用 ontology_api_name 列，旧库迁移前没有该列，会 panic）。
     migrate_datasets_data_sources_ontology_scoping(conn)?;
+    // 映射绑定层（决策 25）：与 element_evidence 同构的独立表，与 TtlStore 共用同一
+    // 建表函数（双处幂等，勿复制建表语句）。
+    crate::mapping::init_element_mapping_schema(conn)?;
     Ok(())
 }
 
@@ -399,6 +419,17 @@ fn migrate_validation_unified_pool(conn: &Connection) -> StoreResult<()> {
             ("step_ms_b", "INTEGER NOT NULL DEFAULT 0"),
             ("step_ms_a", "INTEGER NOT NULL DEFAULT 0"),
             ("step_ms_re", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+    )?;
+
+    // 评审生命周期（v0.12）：结束归因 + 写回基线。历史行归因不可追溯，统一 'unknown'。
+    ensure_columns(
+        conn,
+        "validation_reviews",
+        &[
+            ("outcome_reason", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("outcome_detail", "TEXT NOT NULL DEFAULT ''"),
+            ("base_ttl", "TEXT NOT NULL DEFAULT ''"),
         ],
     )?;
     Ok(())

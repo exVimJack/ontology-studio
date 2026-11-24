@@ -4,7 +4,7 @@
 //! 后注入 AppState（路径解析在 src-tauri/src/skill.rs，复用 pdfium 三层兜底）。
 //!
 //! 性能（SKILL-SYSTEM.md §3.6 已落地）：`discover_all()` 做磁盘 read_dir +
-//! Govcraft SkillDirectory::load 解析。`build_preamble_section` 和
+//! Govcraft 解析（现统一走 super::read_skill_md / load_skill_at，内含 CRLF→LF 归一化）。
 //! `active_skill_doc_paths` 都会调，每次发消息扫描两遍磁盘。现已加 60s TTL
 //! 缓存（`discover_cache`），导入/卸载时 `invalidate_cache()` 失效。
 //! 全局禁用/会话级激活是 DB 查询（非磁盘扫描），不影响缓存。
@@ -13,11 +13,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use agent_skills::Skill;
 
 use super::builtin::parse_disable_model_invocation;
 use super::{
-    resource_doc_path, scan_subdir_files, SkillError, SkillRecord, SkillSource, SkillSubdir,
+    load_skill_at, read_skill_md, resource_doc_path, scan_subdir_files, SkillError,
+    SkillRecord, SkillSource, SkillSubdir,
 };
 
 /// 缓存有效期（秒）。SKILL-SYSTEM §3.6 建议 60s。
@@ -208,73 +208,22 @@ impl SkillManager {
                 continue;
             }
             let load_t = std::time::Instant::now();
-            // 不用 SkillDirectory::load（其内部 fs 调用不可观测，Windows 卡死时
-            // 日志只能停在“before load”，无法定位具体哪一步阻塞）。改为等效实现，
-            // 每个 fs 调用都打计时日志：metadata → read → parse，哪步卡一眼可见。
-            // 语义与 SkillDirectory::load 完全一致（含 name == 目录名校验）。
-            let skill_md = path.join("SKILL.md");
             tracing::info!(subdir = %path.display(), "scan_dir: before load");
-            let meta_t = Instant::now();
-            let md = std::fs::symlink_metadata(&skill_md);
-            let md_is_file = md.as_ref().map(|m| m.is_file()).unwrap_or(false);
-            tracing::info!(
-                subdir = %path.display(),
-                skil_md_exists = md.is_ok(),
-                is_file = md_is_file,
-                elapsed_ms = meta_t.elapsed().as_millis() as u64,
-                "scan_dir: SKILL.md metadata"
-            );
-            if !md_is_file {
-                tracing::info!(subdir = %path.display(), "scan_dir: no SKILL.md, skipping");
-                continue;
-            }
-            let read_t = Instant::now();
-            let raw = match std::fs::read_to_string(&skill_md) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::info!(
-                        subdir = %path.display(),
-                        error = %e,
-                        elapsed_ms = read_t.elapsed().as_millis() as u64,
-                        "scan_dir: SKILL.md read failed, skipping"
-                    );
-                    continue;
-                }
-            };
-            // CRLF → LF 归一化：绕开 agent-skills 0.2 `find_closing_delimiter` 的
-            // CRLF bug（其用 `lines()` 迭代 + `line.len()+1` 累计字节偏移，
-            // `lines()` 会剩掉 `\r`，导致偏移落入多字节字符中间，
-            // `&content[..pos]` 在 char boundary 内切片 → panic。
-            // Windows 安装包里的 SKILL.md 若是 CRLF 行尾必中招；mac LF 不触发）。
-            let content = raw.replace("\r\n", "\n");
-            tracing::info!(
-                subdir = %path.display(),
-                bytes = content.len(),
-                elapsed_ms = read_t.elapsed().as_millis() as u64,
-                "scan_dir: SKILL.md read ok"
-            );
-            let skill = match Skill::parse(&content) {
+            // 读取 + 校验统一走 super::load_skill_at（内含 CRLF→LF 归一化与上游同款 5 条
+            // 校验；分步计时日志 metadata → read+parse 也在那一侧，用于定位 Windows 上 fs
+            // 调用阻塞）。扫描场景里任何失败都只是「跳过这个子目录」——external_dirs
+            // 常含非 skill 目录，不能当成错误上报。
+            let skill = match load_skill_at(&path) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::info!(
                         subdir = %path.display(),
-                        error = ?e,
-                        "scan_dir: SKILL.md parse failed, skipping"
+                        error = %e,
+                        "scan_dir: not a loadable skill dir, skipping"
                     );
                     continue;
                 }
             };
-            // name 与目录名一致性（原 SkillDirectory::load 同款校验）
-            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            if skill.name().as_str() != dir_name {
-                tracing::info!(
-                    subdir = %path.display(),
-                    dir_name,
-                    skill_name = skill.name().as_str(),
-                    "scan_dir: name mismatch dir vs frontmatter, skipping"
-                );
-                continue;
-            }
             {
                 tracing::info!(
                     subdir = %path.display(),
@@ -338,11 +287,8 @@ impl SkillManager {
         if let Some(id) = &record.doc_id {
             return Ok(id.clone());
         }
-        let raw = std::fs::read_to_string(record.dir_path.join("SKILL.md"))
-            .map_err(|e| SkillError::Load(e.to_string()))?;
-        // CRLF→LF 归一化，绕开 agent-skills 0.2 find_closing_delimiter 的 CRLF panic
-        let content = raw.replace("\r\n", "\n");
-        let skill = Skill::parse(&content).map_err(|e| SkillError::Load(e.to_string()))?;
+        // 统一走共享加载器（内含 CRLF→LF 归一化），不再在本处重复一份行尾处理
+        let skill = read_skill_md(&record.dir_path)?;
         let body = skill.body();
 
         // skill body 放在 /Skills/<name>/ 下，避免平铺到知识库根目录干扰用户浏览

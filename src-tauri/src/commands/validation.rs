@@ -20,6 +20,53 @@ use ontology_store::TtlStore;
 use crate::commands::error::{AppError, AppResult};
 use crate::state::AppState;
 
+/// 运行中评审任务注册表：`ontology_iri → review_id`。
+///
+/// 评审是 `spawn` 出去的 tokio 任务。进程一退任务就没了，但库里的 review 行还停在
+/// `in_progress`——前端按 `deriveStep` 倒推会永远显示"B 评审 进行中"，用时还从第一次
+/// 运行起算，看着就是卡死（2026-10-26 现场：一行在 in_progress 上挂了 44.8 小时，
+/// 三个 step_ms 全为 0，日志里连一条失败都没有——它不是失败，是消失）。
+///
+/// 桌面应用是单进程：注册表里没有的 `in_progress` **定义上**就是僵尸，不需要心跳
+/// 超时阈值来猜（B 评审在 1416 三元组本体上可能跑很久，任何阈值都会误判）。
+static REVIEW_TASKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+fn review_tasks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    REVIEW_TASKS.get_or_init(Default::default)
+}
+
+/// 注销守卫：Drop 时移除登记。**用 Drop 而非手写 remove**——任务即便 panic 展开，
+/// 注册表也会清干净，下一次 reap 就能把那一行标成中断；手写清理在 panic 路径上会跳过，
+/// 那正是我们要修的故障本身。
+struct ReviewTaskGuard {
+    ontology_iri: String,
+}
+
+impl Drop for ReviewTaskGuard {
+    fn drop(&mut self) {
+        if let Ok(mut m) = review_tasks().lock() {
+            m.remove(&self.ontology_iri);
+        }
+    }
+}
+
+/// 把无主的 `in_progress` 评审标为 `interrupted`。
+///
+/// 调用时机：① 应用启动（setup hook，ttl_store 就绪后）；② 每次前端读评审状态。
+/// 后者是为了兜住"任务被 tokio 取消但进程还活着"这类没有重启的情形。
+pub(crate) fn reap_orphan_reviews(store: &TtlStore) {
+    let live: Vec<String> = review_tasks()
+        .lock()
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default();
+    if let Err(e) = store.reap_interrupted(&live) {
+        tracing::warn!(error = %e, "reap_orphan_reviews 失败");
+    }
+}
+
 fn get_ttl_store(state: &AppState) -> AppResult<std::sync::Arc<TtlStore>> {
     Ok(state.ttl_store.clone())
 }
@@ -27,25 +74,11 @@ fn get_ttl_store(state: &AppState) -> AppResult<std::sync::Arc<TtlStore>> {
 // ════════════════════════════════════════════════════════════════
 // L3 规则答辩（第二层对抗）
 // ════════════════════════════════════════════════════════════════
+// 合并方案 v0.8：独立答辩通道已并入语义评审的 A 修订环节——A 对规则告警的
+// 异议在 A 修订时提交（带证据引用，机械匹配把关），B 复核裁决；不再有
+// dispute_issue / resolve_dispute_llm 命令。resolve_dispute 保留供人工仲裁。
 
-/// A 对 warning 级 issue 发起答辩。两步裁决第 ① 步（counterEvidence 机械匹配）
-/// 在此完成——匹配失败直接返回错误，不进入 argument 判定。
-#[tauri::command]
-#[specta::specta]
-pub async fn dispute_issue(
-    state: State<'_, AppState>,
-    issue_id: String,
-    argument: String,
-    counter_source_id: String,
-    counter_quote: String,
-) -> AppResult<String> {
-    let store = get_ttl_store(&state)?;
-    store
-        .dispute_issue(&issue_id, &argument, &counter_source_id, &counter_quote)
-        .map_err(AppError::from)
-}
-
-/// 裁决答辩（第 ② 步）。由 B 复核或人工调用——**不作为 A 的工具暴露**。
+/// 裁决答辩（第 ② 步）。由人工仲裁调用——**不作为 A 的工具暴露**。
 /// verdict: "overruled"（撤销）| "accepted"（升级 error）；resolved_by: "verifier"|"human"。
 #[tauri::command]
 #[specta::specta]
@@ -59,83 +92,6 @@ pub async fn resolve_dispute(
     store
         .resolve_dispute(&issue_id, &verdict, &resolved_by)
         .map_err(AppError::from)
-}
-
-/// B 自动裁决答辩（②b 机器裁决）：LLM 判定 overruled/accepted；uncertain 保持
-/// disputed（进入人工仲裁队列）。**resolved_by 记 verifier**——裁决权在 B。
-#[tauri::command]
-#[specta::specta]
-pub async fn resolve_dispute_llm(
-    state: State<'_, AppState>,
-    issue_id: String,
-    model_b: String,
-) -> AppResult<String> {
-    let store = get_ttl_store(&state)?;
-    judge_disputed_issue(&store, &state, &issue_id, &model_b).await
-}
-
-/// 裁决核心：取答辩上下文 → B LLM 裁决 → overruled/accepted 落库，
-/// uncertain 保持 disputed（升级人工仲裁）。resolve_dispute_llm 与
-/// dispute_and_judge 共用。
-async fn judge_disputed_issue(
-    store: &std::sync::Arc<TtlStore>,
-    state: &State<'_, AppState>,
-    issue_id: &str,
-    model_b: &str,
-) -> AppResult<String> {
-    let Some((message, argument, quote)) = store
-        .get_dispute_context(issue_id)
-        .map_err(AppError::from)?
-    else {
-        return Err(AppError::Ontology(
-            "issue 不存在、不处于 disputed 状态，或答辩材料不完整".into(),
-        ));
-    };
-    let chat = crate::commands::provider::verifier_chat(state)
-        .await
-        .ok_or_else(|| AppError::Ontology("未配置校验者 provider，无法自动裁决".into()))?;
-    let out = agent_core::validation_llm::run_dispute_verdict(
-        &chat, model_b, &message, &argument, &quote,
-    )
-    .await
-    .map_err(AppError::Ontology)?;
-    if out.contains("\"overruled\"") {
-        store
-            .resolve_dispute(issue_id, "overruled", "verifier")
-            .map_err(AppError::from)?;
-        Ok("overruled".into())
-    } else if out.contains("\"uncertain\"") {
-        // B 判不定 → 保持 disputed，进入人工仲裁队列
-        Ok("uncertain".into())
-    } else {
-        store
-            .resolve_dispute(issue_id, "accepted", "verifier")
-            .map_err(AppError::from)?;
-        Ok("accepted".into())
-    }
-}
-
-/// 答辩提交 + B 自动机器裁决（一步到位）。
-///
-/// 前端提交后即可离开页面：裁决在 Rust 侧完成并落库，切窗/切页不影响结果，
-/// 回来后按 issue 状态回显（overruled/accepted 已闭环，uncertain 在仲裁队列）。
-#[tauri::command]
-#[specta::specta]
-pub async fn dispute_and_judge(
-    state: State<'_, AppState>,
-    issue_id: String,
-    argument: String,
-    counter_source_id: String,
-    counter_quote: String,
-    model_b: String,
-) -> AppResult<String> {
-    let store = get_ttl_store(&state)?;
-    // 第一步：提交答辩（含反证机械匹配，不匹配直接报错）
-    store
-        .dispute_issue(&issue_id, &argument, &counter_source_id, &counter_quote)
-        .map_err(AppError::from)?;
-    // 第二步：B 机器裁决（overruled/accepted 落库；uncertain 保持 disputed）
-    judge_disputed_issue(&store, &state, &issue_id, &model_b).await
 }
 
 /// 查询本体的全部 issue（对抗状态展示 + 报告）。
@@ -230,7 +186,7 @@ pub async fn escalate_review(
     review_id: String,
 ) -> AppResult<ValidationReview> {
     let store = get_ttl_store(&state)?;
-    store.escalate(&review_id).map_err(AppError::from)
+    store.escalate(&review_id, "manual_escalation", "").map_err(AppError::from)
 }
 
 /// 查询本体的最新 review（可为 None）。
@@ -241,6 +197,7 @@ pub async fn latest_validation_review(
     ontology_iri: String,
 ) -> AppResult<Option<ValidationReview>> {
     let store = get_ttl_store(&state)?;
+    reap_orphan_reviews(&store);
     store.latest_review(&ontology_iri).map_err(AppError::from)
 }
 
@@ -335,6 +292,9 @@ pub async fn run_review_loop(
         v.as_ref().map(|c| c.model.clone()).unwrap_or_else(|| model_a.clone())
     };
     let store = get_ttl_store(&state)?;
+    // 先回收无主评审：否则「复用已有 in_progress」分支会捡起一个任务早就不在的僵尸行，
+    // 在它上面重跑，界面继续显示"进行中"且用时从第一次运行起算。
+    reap_orphan_reviews(&store);
 
     // 复用已有 in_progress review，否则新建
     let review_id = {
@@ -344,6 +304,10 @@ pub async fn run_review_loop(
             _ => store.review_ontology(&ontology_iri)?.id,
         }
     };
+    // 登记任务归属（进程内注册表）；任务结束时由 Drop 守卫注销。
+    if let Ok(mut m) = review_tasks().lock() {
+        m.insert(ontology_iri.clone(), review_id.clone());
+    }
 
     // 后台任务：完整循环（每步落库；失败标记 escalated 保留审计轨迹）。
     // 多轮对抗（§2.2.1，2026-09-24）：B 复核追问且未达轮次封顶 → 拿残留问题
@@ -352,16 +316,40 @@ pub async fn run_review_loop(
     let chat_a2 = chat_a.clone();
     let chat_b2 = chat_b.clone();
     let review_id2 = review_id.clone();
+    let ontology_iri2 = ontology_iri.clone();
     tauri::async_runtime::spawn(async move {
+        // 注销守卫：任务返回（含 panic 展开）即从注册表移除，下一次 reap 就能把
+        // 这一行标成 interrupted——不靠手写清理，否则 panic 路径会跳过清理。
+        let _task_guard = ReviewTaskGuard {
+            ontology_iri: ontology_iri2.clone(),
+        };
         let run = async {
+            // 合并方案 v0.8：规则告警（R 编号）并入 A 修订输入——A 对统一发现池
+            // （B 评审建议 + 规则 warning/suggestion）逐条表态，不再走独立答辩通道。
+            // 必须在 issues_json move 进 issue_lines 之前构建。
+            let rules_warnings = build_rules_warnings(&issues_json);
             // ── 环节 1：B 评审（八维度）──
+            // 输入必须五段齐全（VALIDATION-DESIGN §2.2.1）：宪章 + 29 句话与覆盖矩阵
+            // + Turtle + L0-L3 报告 + 证据上下文。此前这里自拼了三段，缺后两类输入，
+            // 导致 ①事实忠实度 与 ②完整性 两个维度无从执行（build_b_review_inputs
+            // 早已实现并带单测，只是从没被接上）。
             let issue_lines = if issues_json.trim().is_empty() {
                 "（无规则检查报告）".to_string()
             } else {
                 issues_json
             };
-            let inputs = format!(
-                "【设计宪章】\n{charter_summary}\n\n【待评审 Turtle】\n{ttl_content}\n\n【规则检查报告】\n{issue_lines}"
+            let coverage = render_coverage_context(&ttl_content);
+            let evidence = render_evidence_context(
+                &store2
+                    .list_evidence_sources_for_dispute(&ontology_iri2)
+                    .unwrap_or_default(),
+            );
+            let inputs = agent_core::validation_llm::build_b_review_inputs(
+                &charter_summary,
+                &coverage,
+                &ttl_content,
+                &issue_lines,
+                &evidence,
             );
             let b_out = agent_core::validation_llm::run_b_review(&chat_b2, &model_b, &inputs)
                 .await
@@ -383,15 +371,24 @@ pub async fn run_review_loop(
                     &model_a,
                     &current_ttl,
                     &pending_suggestions,
+                    &rules_warnings,
                 )
                 .await
                 .map_err(|e| e.to_string())?;
                 store2.a_revise(&review_id2, &revised_ttl, &reasoning).map_err(|e| e.to_string())?;
 
-                let verdict = agent_core::validation_llm::run_b_recheck(&chat_b2, &model_b, &revised_ttl)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let confirm = !verdict.contains("\"verdict\": \"question\"");
+                let verdict = agent_core::validation_llm::run_b_recheck(
+                    &chat_b2,
+                    &model_b,
+                    &revised_ttl,
+                    &pending_suggestions,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                // 判定走解析而非子串匹配：仅显式 verdict=confirm 算收敛，
+                // 解析失败/缺字段/未知值一律按未收敛（宁可多走一轮或进仲裁，
+                // 也不在判定不可靠时把修订稿整本写回工作区）。
+                let confirm = agent_core::validation_llm::verdict_is_confirm(&verdict);
                 // b_recheck 三态：确认 → resolved；追问未封顶 → 保持 in_progress
                 //（返回行 status 仍为 in_progress）；封顶 → escalated
                 let after = store2
@@ -407,7 +404,7 @@ pub async fn run_review_loop(
         };
         if let Err(e) = run.await {
             // 失败 → 标记 escalated（转人工仲裁，保留已落库产物与审计轨迹）
-            let _ = store2.escalate(&review_id2);
+            let _ = store2.escalate(&review_id2, "step_failed", &e);
             tracing::error!("run_review_loop {review_id2} 失败: {e}");
         }
     });
@@ -456,267 +453,33 @@ pub async fn run_a_revise_llm(
     let Some(chat) = chat.as_ref() else {
         return Err(AppError::Ontology("未配置 provider，无法运行修订".into()));
     };
+    // 合并方案 v0.8：此命令供 error 纠错/仲裁后修订使用，不处理规则告警（rules_warnings 传空）
     let (revised_ttl, reasoning) =
-        agent_core::validation_llm::run_a_revise(chat, &model_a, &ttl_v1, &b_suggestions)
+        agent_core::validation_llm::run_a_revise(chat, &model_a, &ttl_v1, &b_suggestions, "")
             .await
             .map_err(|e| AppError::Ontology(e))?;
     Ok(AReviseResult { revised_ttl, reasoning })
 }
 
-/// 运行 B 复核（LLM）。只传修订后 Turtle（a_revision），不传修订说明。
+/// 运行 B 复核（LLM）。传修订后 Turtle（a_revision）+ 核查基准（上一轮建议清单），
+/// **不传修订说明**（a_reasoning 对 B 不可见）。
+///
+/// 遗留的单步命令：阶段② 已改为后端 `run_review_loop` 编排，UI 不再逐步驱动。
+/// 保留它时也必须带上核查基准——否则这个入口会重演"B 失忆"缺陷。
 #[tauri::command]
 #[specta::specta]
 pub async fn run_b_recheck_llm(
     state: State<'_, AppState>,
     model_b: String,
     a_revision: String,
+    baseline_suggestions: String,
 ) -> AppResult<String> {
     let chat = crate::commands::provider::verifier_chat(&state)
         .await
         .ok_or_else(|| AppError::Ontology("未配置 provider，无法运行复核".into()))?;
-    agent_core::validation_llm::run_b_recheck(&chat, &model_b, &a_revision)
+    agent_core::validation_llm::run_b_recheck(&chat, &model_b, &a_revision, &baseline_suggestions)
         .await
         .map_err(|e| AppError::Ontology(e))
-}
-
-/// 最近一次 run_auto_dispute 的状态缓存（按本体 IRI）——切页/切窗回来回显，
-/// 不依赖前端组件存活。running=true 表示后端任务进行中（切窗不丢状态）。
-/// 应用重启即清（issue 状态本身已落库）。
-#[derive(Debug, Clone, Default, serde::Serialize, specta::Type)]
-pub struct AutoDisputeState {
-    /// 后端任务是否进行中（切窗回来据此恢复"进行中"展示，不依赖前端 mutation 状态）
-    pub running: bool,
-    /// 逐条结果（进行中已完成的条目 / 全部完成后的完整结果）
-    #[serde(default)]
-    pub items: Vec<AutoDisputeItem>,
-}
-
-static AUTO_DISPUTE_RESULTS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<String, AutoDisputeState>>,
-> = std::sync::OnceLock::new();
-
-fn auto_dispute_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, AutoDisputeState>> {
-    AUTO_DISPUTE_RESULTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// 读取缓存的自动答辩状态（切页/切窗回来回显用，含 running 标志）。
-#[tauri::command]
-#[specta::specta]
-pub async fn get_auto_dispute_result(
-    ontology_iri: String,
-) -> AppResult<AutoDisputeState> {
-    Ok(auto_dispute_cache()
-        .lock()
-        .map(|m| m.get(&ontology_iri).cloned().unwrap_or_default())
-        .unwrap_or_default())
-}
-
-/// A 自动答辩的批量结果（run_auto_dispute 逐条汇总，前端进度展示）。
-#[derive(Debug, Clone, serde::Serialize, specta::Type)]
-pub struct AutoDisputeItem {
-    /// 目标 warning 的 issue id
-    pub issue_id: String,
-    /// "overruled"（B 撤销）| "accepted"（B 驳回升级 error）| "uncertain"
-    /// （B 判不定进仲裁）| "accept"（A 接受不辩）| "rejected_match"（A 摘录
-    /// 未过机械匹配，维持 open）| "error"（该条处理失败）
-    pub outcome: String,
-    /// 一句话说明（B 的 reason / 失败原因）
-    #[serde(default)]
-    pub detail: String,
-}
-
-/// A 自动答辩（§2.1.5 完整对抗语义——答辩的发起方是 A 建模者，不是人）：
-///
-/// 对本体全部 rules 来源 open warning，后端一次跑完
-/// 「A 构造论据+反证 → dispute_issue（机械匹配把关）→ resolve_dispute_llm
-/// （B 裁决三态）」。人只在阶段③ 仲裁 B 判不定的残留项。
-///
-/// - A 无证据反驳的 warning → accept（留给纠错/人工修订，不走裁决）
-/// - A 摘录的 quote 没过机械匹配 → 该条维持 open（outcome=rejected_match）
-///   ——不降级 A 的答辩资格，也不放水匹配，如实呈现
-#[tauri::command]
-#[specta::specta]
-pub async fn run_auto_dispute(
-    state: State<'_, AppState>,
-    ontology_iri: String,
-) -> AppResult<Vec<AutoDisputeItem>> {
-    let store = get_ttl_store(&state)?;
-    // A（建模者）通道——答辩是 A 的权利与义务
-    let chat_a = {
-        let c = state.chat.read().await;
-        c.clone()
-            .ok_or_else(|| AppError::Ontology("未配置建模者 provider，无法自动答辩".into()))?
-    };
-    // B（校验者）通道——裁决权在 B
-    let chat_b = crate::commands::provider::verifier_chat(&state)
-        .await
-        .ok_or_else(|| AppError::Ontology("未配置校验者 provider，无法裁决".into()))?;
-    let model_a = {
-        let c = state.provider_config.read().await;
-        c.as_ref().map(|c| c.model.clone())
-            .ok_or_else(|| AppError::Ontology("未配置建模者 provider".into()))?
-    };
-    let model_b = {
-        let v = state.verifier_config.read().await;
-        v.as_ref().map(|c| c.model.clone()).unwrap_or_else(|| model_a.clone())
-    };
-
-    let warnings = store.list_disputable_warnings(&ontology_iri)?;
-    if warnings.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // 后台驱动（对齐 run_review_loop）：spawn 后立即返回，前端轮询
-    // get_auto_dispute_result（含 running 标志）恢复进行中状态——切窗/切页不丢。
-    // 每条处理完即写缓存（items 追加、running=true），全部完成置 running=false。
-    {
-        if let Ok(mut m) = auto_dispute_cache().lock() {
-            m.insert(ontology_iri.clone(), AutoDisputeState { running: true, items: Vec::new() });
-        }
-    }
-    let store2 = store.clone();
-    let ont = ontology_iri.clone();
-    tauri::async_runtime::spawn(async move {
-        let run = async {
-            // A 的决策输入：warning 清单（带建议）+ 证据源全文
-            let warnings_json = serde_json::to_string_pretty(
-                &warnings
-                    .iter()
-                    .map(|w| {
-                        serde_json::json!({
-                            "issue_id": w.id,
-                            "rule": w.rule,
-                            "message": w.message,
-                            "target": w.target,
-                            "suggestion": w.suggestion,
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(|e| format!("serialize warnings: {e}"))?;
-            let sources = store2.list_evidence_sources_for_dispute(&ont).map_err(|e| e.to_string())?;
-            let evidence_context = if sources.is_empty() {
-                "（无已登记证据源——没有证据的 warning 只能接受）".to_string()
-            } else {
-                sources
-                    .iter()
-                    .map(|(id, title, content)| format!("[{id}] {title}\n{content}"))
-                    .collect::<Vec<_>>()
-                    .join("\n\n---\n\n")
-            };
-
-            // 环节 1：A 逐条决策（dispute / accept）
-            let a_out = agent_core::validation_llm::run_a_dispute(&chat_a, &model_a, &warnings_json, &evidence_context)
-                .await
-                .map_err(|e| e.to_string())?;
-            let decisions: Vec<agent_core::validation_llm::ADisputeDecision> =
-                agent_core::validation_llm::parse_a_dispute(&a_out)
-                    .into_iter()
-                    .filter(|d| warnings.iter().any(|w| w.id == d.issue_id))
-                    .collect();
-
-            let mut results = Vec::new();
-            for w in &warnings {
-                let Some(d) = decisions.iter().find(|d| d.issue_id == w.id) else {
-                    // A 未回应（漏答/JSON 丢条）→ 按接受处理，落库 accepted
-                    let _ = store2.accept_issue(&w.id);
-                    results.push(AutoDisputeItem {
-                        issue_id: w.id.clone(),
-                        outcome: "accept".into(),
-                        detail: "A 未回应，按接受处理".into(),
-                    });
-                    push_dispute_item(&ont, &results);
-                    continue;
-                };
-                if d.action != "dispute" {
-                    // A 接受告警 → 落库 accepted（此前只记结果不改状态，issue 维持 open 是 bug）
-                    let _ = store2.accept_issue(&w.id);
-                    results.push(AutoDisputeItem {
-                        issue_id: w.id.clone(),
-                        outcome: "accept".into(),
-                        detail: "A 接受，按建议修订（不走裁决）".into(),
-                    });
-                    push_dispute_item(&ont, &results);
-                    continue;
-                }
-                // 环节 2：提交答辩（机械匹配在此把关，失败即驳回不进裁决）
-                let submit = store2.dispute_issue(&d.issue_id, &d.argument, &d.source_id, &d.quote);
-                match submit {
-                    Ok(s) if s == "disputed" => {}
-                    Ok(reject) => {
-                        // 机械匹配驳回 / 状态不符等——issue 维持 open，如实记录
-                        results.push(AutoDisputeItem {
-                            issue_id: d.issue_id.clone(),
-                            outcome: "rejected_match".into(),
-                            detail: reject,
-                        });
-                        push_dispute_item(&ont, &results);
-                        continue;
-                    }
-                    Err(e) => {
-                        results.push(AutoDisputeItem {
-                            issue_id: d.issue_id.clone(),
-                            outcome: "error".into(),
-                            detail: e.to_string(),
-                        });
-                        push_dispute_item(&ont, &results);
-                        continue;
-                    }
-                }
-                // 环节 3：B 机器裁决（uncertain 保持 disputed 进仲裁）
-                let (message, argument, quote) = store2
-                    .get_dispute_context(&d.issue_id)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "答辩材料不完整".to_string())?;
-                let verdict = agent_core::validation_llm::run_dispute_verdict(
-                    &chat_b, &model_b, &message, &argument, &quote,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-                if verdict.contains("\"overruled\"") {
-                    store2.resolve_dispute(&d.issue_id, "overruled", "verifier")
-                        .map_err(|e| e.to_string())?;
-                    results.push(AutoDisputeItem { issue_id: d.issue_id.clone(), outcome: "overruled".into(), detail: "B 认可——warning 撤销".into() });
-                } else if verdict.contains("\"uncertain\"") {
-                    results.push(AutoDisputeItem { issue_id: d.issue_id.clone(), outcome: "uncertain".into(), detail: "B 判不定——已进人工仲裁队列".into() });
-                } else {
-                    store2.resolve_dispute(&d.issue_id, "accepted", "verifier")
-                        .map_err(|e| e.to_string())?;
-                    results.push(AutoDisputeItem { issue_id: d.issue_id.clone(), outcome: "accepted".into(), detail: "B 驳回——升级 error".into() });
-                }
-                push_dispute_item(&ont, &results);
-            }
-            Ok::<(), String>(())
-        };
-        if let Err(e) = run.await {
-            tracing::error!("run_auto_dispute {ont} 失败: {e}");
-        }
-        // 收尾：剩余 open 的 warning（rejected_match 摘录未匹配 / error 处理失败）
-        // 视为告警成立——没有有效证据反驳的 warning 按 accepted 收敛，避免悬在 open
-        // 死胡同（仲裁只收 disputed、纠错只收 error，open 的 warning 无出口）。
-        // 语义与 accept 分支一致：A 拿不出过关证据 = 告警成立。跳过 disputed（答辩中）。
-        if let Err(e) = store2.accept_open_warnings(&ont) {
-            tracing::warn!("收尾 open warning 转 accepted 失败: {e}");
-        }
-        // 完成（或失败）：置 running=false，items 已逐条写入
-        if let Ok(mut m) = auto_dispute_cache().lock() {
-            if let Some(state) = m.get_mut(&ont) {
-                state.running = false;
-            }
-        }
-    });
-
-    Ok(Vec::new())
-}
-
-/// 把当前 results 快照写回缓存（running 仍 true），供前端轮询实时回显逐条进度。
-fn push_dispute_item(ontology_iri: &str, items: &[AutoDisputeItem]) {
-    if let Ok(mut m) = auto_dispute_cache().lock() {
-        if let Some(state) = m.get_mut(ontology_iri) {
-            state.items = items.to_vec();
-        }
-    }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -744,6 +507,9 @@ pub struct PostArbitrationState {
     /// ok=成功 / err=失败 / ""=进行中
     #[serde(default)]
     pub kind: String,
+    /// A 修订说明（run_a_revise 返回的 notes：改了哪些内容；成功后填充）
+    #[serde(default)]
+    pub revise_notes: String,
 }
 
 static POST_ARB_RESULTS: std::sync::OnceLock<
@@ -826,7 +592,7 @@ pub async fn run_post_arbitration_revise(
         if let Ok(mut m) = post_arb_cache().lock() {
             m.insert(ontology_iri.clone(), PostArbitrationState {
                 running: true, started_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0), elapsed_ms: 0,
-                msg: String::new(), kind: String::new(),
+                msg: String::new(), kind: String::new(), revise_notes: String::new(),
             });
         }
     }
@@ -837,16 +603,29 @@ pub async fn run_post_arbitration_revise(
         // provider 偶发返回 "error decoding response body"（连接被网关掐断/响应体
         // 不完整），加重试最多 3 次——整本重写耗时长，首次失败重试通常能成功。
         let mut last_err = String::new();
+        let mut revise_notes = String::new();
         let mut ok = false;
         for attempt in 1..=3 {
             match agent_core::validation_llm::run_a_revise(
-                &chat_a, &model_a, &ttl, &b_suggestions,
+                &chat_a, &model_a, &ttl, &b_suggestions, "",
             )
             .await
             {
-                Ok(revised) => match store2.import_ttl(&revised.0, true) {
+                Ok((revised_ttl, notes)) => match store2.import_ttl(&revised_ttl, true) {
                     Ok(_) => {
                         ok = true;
+                        revise_notes = notes;
+                        // 落一条 changelog（本体工作台「历史」Tab 可查修订记录）；
+                        // title+body ≤500 chars 的约束做截断保护
+                        let body = truncate_chars(&revise_notes, 480);
+                        let _ = store2.commit_change(
+                            &ont,
+                            "仲裁后 A 修订落盘",
+                            &body,
+                            r#"{"arbitration_revise": true}"#,
+                            None,
+                            "agent",
+                        );
                         break;
                     }
                     Err(e) => {
@@ -875,9 +654,147 @@ pub async fn run_post_arbitration_revise(
                 s.elapsed_ms = elapsed;
                 s.msg = msg;
                 s.kind = kind;
+                s.revise_notes = revise_notes;
             }
         }
     });
     Ok(())
 }
 
+/// 按字符数截断（CJK 安全，不按字节切）。
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars).collect();
+        out.push('…');
+        out
+    }
+}
+
+
+/// B 评审证据上下文的注入预算。上限依据 1416 三元组本体的实测（2026-11-04）：
+/// Turtle 正文 65,758 字符 + 矩阵约 2,600 + 宪章与规则报告约 3,000；证据源 5 个合计
+/// 43,978 字符（单个最大 33,004）。按下面的预算注入后总输入约 77k 字符（≈26k–45k
+/// token），比改动前增加约 12%，在 128k 窗口内有余量。
+const EVIDENCE_PER_SOURCE_CHARS: usize = 1200;
+const EVIDENCE_TOTAL_CHARS: usize = 6000;
+
+// 已知遗留：摘录取的是**头部** N 字符。33k 字符的文档只取头部 1,200 字符，相关片段
+// 大概率不在其中——"B 比 A 信息更多"目前只做到"有信息"，还没做到"给对信息"。
+// 按相关性检索片段需要另一套取段策略，留待后续 change。
+
+/// 渲染 29 句话 + 覆盖矩阵为 B 评审的完整性基准段。
+///
+/// 未落地条目逐条列（B 据此判断缺失是否属语义级问题）；已落地条目折叠为编号列表
+/// ——设计 §2.2.1 的去重约定：完整性以矩阵为底，B 只报矩阵抓不住的语义级增量，
+/// 不重复罗列矩阵已高亮的缺失项。一次调用同时满足"注入 29 句话"与"注入矩阵结果"。
+fn render_coverage_context(ttl: &str) -> String {
+    let parsed = match ontology_store::ttl::parse_ttl_to_memory(ttl) {
+        Ok(s) => s,
+        Err(e) => {
+            return format!(
+                "（覆盖矩阵不可用：本体解析失败 {e}。完整性维度请按 29 句话规范逐条核对产物）"
+            );
+        }
+    };
+    let m = ontology_store::ttl_coverage::coverage_matrix(&parsed, &[]);
+    let mut missing: Vec<String> = Vec::new();
+    let mut covered_ids: Vec<String> = Vec::new();
+    for item in &m.items {
+        if item.covered {
+            covered_ids.push(item.sentence_id.clone());
+        } else {
+            missing.push(format!(
+                "- {}（类别 {}）{}｜期望产物形态：{}",
+                item.sentence_id, item.category, item.description, item.product_shape
+            ));
+        }
+    }
+    let mut out = format!(
+        "覆盖率 {}/{}（{:.0}%）。未落地判定来自名词级机械比对，语义级的类型/粒度错配需要你补充。\n",
+        m.covered_count,
+        m.total_count,
+        m.coverage * 100.0
+    );
+    if missing.is_empty() {
+        out.push_str("未落地条目：无（机械比对全部命中）。\n");
+    } else {
+        out.push_str("未落地条目：\n");
+        out.push_str(&missing.join("\n"));
+        out.push('\n');
+    }
+    if !covered_ids.is_empty() {
+        out.push_str(&format!(
+            "已落地条目（仅编号，不要重复罗列）：{}\n",
+            covered_ids.join("、")
+        ));
+    }
+    out
+}
+
+/// 渲染已登记证据源为 B 评审的证据上下文（B 不做自主检索，由编排预注入）。
+///
+/// 无证据源时 MUST 显式声明缺失、MUST NOT 留空：留空会让模型用先验补位，产出
+/// 看着合理实则无据的批评；而 B 的"每条建议必须带证据"约束在没有证据源时
+/// 会直接憋死输出——所以缺失声明里同时给出替代的引用方式。
+fn render_evidence_context(sources: &[(String, String, String)]) -> String {
+    if sources.is_empty() {
+        return "（未登记证据源——①事实忠实度维度无法核查，仅按宪章与 Turtle 评审；evidence_ref 请引用宪章条目或 29 句话句号）".to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for (idx, (id, title, content)) in sources.iter().enumerate() {
+        let body = truncate_chars(content, EVIDENCE_PER_SOURCE_CHARS);
+        let cost = body.chars().count();
+        if used + cost > EVIDENCE_TOTAL_CHARS {
+            out.push_str(&format!(
+                "…（其余 {} 个证据源因注入预算未展开）\n",
+                sources.len() - idx
+            ));
+            break;
+        }
+        used += cost;
+        out.push_str(&format!("E{} 编号={id}｜{title}\n{body}\n\n", idx + 1));
+    }
+    out
+}
+
+/// 合并方案 v0.8：从规则检查报告提取 warning/suggestion 清单并编号 R1..Rn，
+/// 供 A 修订统一表态（R 编号回传后按序映射到 rules 域 issue）。
+/// 非 JSON（LLM/前端文本）→ 原文透传（A 按内容表态，后端按 rule 名匹配）。
+fn build_rules_warnings(issues_json: &str) -> String {
+    let trimmed = issues_json.trim();
+    if trimmed.is_empty() {
+        return "（无规则告警）".to_string();
+    }
+    if let Ok(items) = serde_json::from_str::<Vec<serde_json::Value>>(trimmed) {
+        let mut out = Vec::new();
+        for (i, item) in items.iter().enumerate() {
+            let severity = item.get("severity").and_then(|v| v.as_str()).unwrap_or("");
+            if severity == "error" {
+                continue;
+            }
+            let rule = item.get("rule").and_then(|v| v.as_str()).unwrap_or("");
+            let message = item.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            out.push(format!("R{} [{}] {}: {}", i + 1, severity, rule, message));
+        }
+        if out.is_empty() {
+            return "（无待处理规则告警）".to_string();
+        }
+        return out.join("\n");
+    }
+    trimmed.to_string()
+}
+
+/// 轮次清单（合并方案 v0.8）：按轮次返回该评审的 issue 快照 + 统计，
+/// 前端「轮次清单」可查看每轮 发现/已修改/异议/裁决。
+#[tauri::command]
+#[specta::specta]
+pub async fn list_review_rounds(
+    state: State<'_, AppState>,
+    review_id: String,
+) -> AppResult<Vec<ontology_store::validation::ReviewRound>> {
+    let store = get_ttl_store(&state)?;
+    store.list_review_rounds(&review_id).map_err(AppError::from)
+}

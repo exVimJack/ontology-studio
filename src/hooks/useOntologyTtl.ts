@@ -10,12 +10,17 @@ import type { ElementEvidenceRow } from "./useOntology";
 
 export type { ElementEvidenceRow };
 import type {
-  TtlOntologySummary,
-  TtlValidation,
-  TtlImportResult,
-  TtlCharter,
   TtlChangelog,
+  TtlCharter,
+  TtlImportResult,
+  TtlOntologySummary,
+  TtlClassEdit,
+  TtlClassMeta,
   TtlPropertyEdit,
+  TtlValidation,
+  TtlVersionDiff,
+  TtlVersionSummary,
+  WorkspaceDiffRevokeItem,
 } from "@/lib/domain";
 import {
   extractTtlCharterFromContent,
@@ -28,8 +33,13 @@ const QK_CHANGELOG = (iri: string) => ["ontology-ttl-changelog", iri] as const;
 const QK_CHARTER = (iri: string) => ["ontology-ttl-charter", iri] as const;
 const QK_PROPERTIES = (iri: string) =>
   ["ontology-ttl-properties", iri] as const;
+const QK_CLASS_METAS = (iri: string) =>
+  ["ontology-ttl-class-metas", iri] as const;
 const QK_CLASS_IRIS = (iri: string) =>
   ["ontology-ttl-class-iris", iri] as const;
+const QK_ACTIVE_REV = (iri: string) => ["ontology-ttl-active-rev", iri] as const;
+const QK_WORKSPACE_DIRTY = (iri: string) =>
+  ["ontology-ttl-workspace-dirty", iri] as const;
 
 /** 已存 W3C 本体列表（左栏）。 */
 export function useOntologyTtls() {
@@ -39,11 +49,18 @@ export function useOntologyTtls() {
   });
 }
 
-/** 导出本体 Turtle 文本（中栏源码展示 / 增量更新起点）。 */
+/** 生效快照 Turtle（发布版本，导出用；不含未发布修改）。 */
+export function useExportOntologyTtl() {
+  return useMutation({
+    mutationFn: (iri: string): Promise<string> => ipc.exportOntologyTtl(iri),
+  });
+}
+
+/** 工作区草稿 Turtle（中栏源码 / 概念图谱等编辑态）。 */
 export function useOntologyTtlContent(iri: string | null) {
   return useQuery<string>({
     queryKey: QK_CONTENT(iri ?? ""),
-    queryFn: () => ipc.exportOntologyTtl(iri!),
+    queryFn: () => ipc.exportOntologyTtlWorkspace(iri!),
     enabled: !!iri,
   });
 }
@@ -68,9 +85,11 @@ export function useImportOntologyTtl() {
       overwrite: boolean;
     }): Promise<TtlImportResult> => ipc.importOntologyTtl(ttl, overwrite),
     onSuccess: (_data) => {
-      // import 成功后列表必变；缓存失效让详情刷新
+      // import 成功后列表必变；缓存失效让详情刷新；写路径置脏
       qc.invalidateQueries({ queryKey: QK_LIST });
       qc.invalidateQueries({ queryKey: ["ontology-ttl-content"] });
+      qc.invalidateQueries({ queryKey: ["ontology-ttl-workspace-dirty"] });
+      qc.invalidateQueries({ queryKey: ["ontology-ttl-active-rev"] });
     },
   });
 }
@@ -280,6 +299,9 @@ export function useOntologyTtlChangedListener() {
       qc.invalidateQueries({ queryKey: ["ontology-ttl-content"] });
       qc.invalidateQueries({ queryKey: ["ontology-ttl-changelog"] });
       qc.invalidateQueries({ queryKey: ["ontology-ttl-charter"] });
+      qc.invalidateQueries({ queryKey: ["ontology-ttl-workspace-dirty"] });
+      qc.invalidateQueries({ queryKey: ["ontology-ttl-sparql"] });
+      qc.invalidateQueries({ queryKey: ["ontology-ttl-version-diff"] });
     });
     return () => {
       unlisten.then((f) => f());
@@ -323,17 +345,23 @@ export function useOntologyTtlDefaultPropertyNs(iri: string | null) {
   });
 }
 
-/** 属性编辑成功后的缓存失效（三个手术命令共用）。 */
+/** 类/属性手术成功后的缓存失效（编辑/新增/删除共用）。 */
 function invalidateAfterSurgery(
   qc: ReturnType<typeof useQueryClient>,
   iri: string,
 ) {
   qc.invalidateQueries({ queryKey: QK_CONTENT(iri) });
+  qc.invalidateQueries({ queryKey: QK_WORKSPACE_DIRTY(iri) });
+  qc.invalidateQueries({ queryKey: QK_ACTIVE_REV(iri) });
   qc.invalidateQueries({ queryKey: QK_PROPERTIES(iri) });
   qc.invalidateQueries({ queryKey: QK_CLASS_IRIS(iri) });
+  qc.invalidateQueries({ queryKey: QK_CLASS_METAS(iri) });
   // 展示缓存（图/树/详情/label 映射/SPARQL 只读）staleTime=Infinity，需强制失效
   qc.invalidateQueries({ queryKey: ["ontology-ttl-sparql", iri] });
   qc.invalidateQueries({ queryKey: ["ontology-ttl-labels", iri] });
+  // 相对生效 diff：图上着色依赖此查询；漏失效会导致改完类/属性后 overlay 仍是旧状态
+  // （prefix 匹配该本体下所有 rev 对，与 publish/activate 一致）
+  qc.invalidateQueries({ queryKey: ["ontology-ttl-version-diff", iri] });
 }
 
 /** 编辑既有属性（iri 为身份不可改，其余字段原位替换其主语块）。 */
@@ -378,5 +406,212 @@ export function useDeleteOntologyTtlProperty() {
       propertyIri: string;
     }): Promise<string> => ipc.deleteOntologyTtlProperty(iri, propertyIri),
     onSuccess: (_ttl, v) => invalidateAfterSurgery(qc, v.iri),
+  });
+}
+
+/** 变更清单逐条撤销（相对生效快照逆向补丁）。 */
+export function useRevokeOntologyWorkspaceDiffItem() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      iri,
+      item,
+    }: {
+      iri: string;
+      item: WorkspaceDiffRevokeItem;
+    }): Promise<string> => ipc.revokeOntologyWorkspaceDiffItem(iri, item),
+    onSuccess: (_ttl, v) => invalidateAfterSurgery(qc, v.iri),
+  });
+}
+
+/** 类行级联撤销（服务端重算强依赖，原子写回）。 */
+export function useRevokeOntologyWorkspaceClassCascade() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      iri,
+      classIri,
+      op,
+    }: {
+      iri: string;
+      classIri: string;
+      op: "add" | "remove";
+    }): Promise<string> =>
+      ipc.revokeOntologyWorkspaceClassCascade(iri, classIri, op),
+    onSuccess: (_ttl, v) => invalidateAfterSurgery(qc, v.iri),
+  });
+}
+
+/** 类元数据列表（label/comment，概念图谱编辑表单回显用）。 */
+export function useOntologyTtlClassMetas(iri: string | null) {
+  return useQuery<TtlClassMeta[]>({
+    queryKey: QK_CLASS_METAS(iri ?? ""),
+    queryFn: () => ipc.listOntologyTtlClassMetas(iri!),
+    enabled: !!iri,
+  });
+}
+
+/** 编辑类声明块（label/comment/subClassOf 受管重写）。 */
+export function useEditOntologyTtlClass() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      iri,
+      edit,
+    }: {
+      iri: string;
+      edit: TtlClassEdit;
+    }): Promise<string> => ipc.editOntologyTtlClass(iri, edit),
+    onSuccess: (_ttl, v) => invalidateAfterSurgery(qc, v.iri),
+  });
+}
+
+/** 删除类（卡片硬删：独占属性删、多定义域摘除、触及关系整删、继承清理后删类）。 */
+export function useDeleteOntologyTtlClass() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      iri,
+      classIri,
+    }: {
+      iri: string;
+      classIri: string;
+    }): Promise<string> => ipc.deleteOntologyTtlClass(iri, classIri),
+    onSuccess: (_ttl, v) => invalidateAfterSurgery(qc, v.iri),
+  });
+}
+
+// ── 版本管理（显式发布才留快照；回退切指针不新建版本）──
+
+const QK_VERSIONS = (iri: string) => ["ontology-ttl-versions", iri] as const;
+const QK_VERSION_DIFF = (iri: string, a: number, b: number) =>
+  ["ontology-ttl-version-diff", iri, a, b] as const;
+
+/** 版本历史（revision 降序；active 对应条目前端标"已启用"）。 */
+export function useOntologyVersions(iri: string | null) {
+  return useQuery<TtlVersionSummary[]>({
+    queryKey: QK_VERSIONS(iri ?? ""),
+    queryFn: () => ipc.listOntologyVersions(iri!),
+    enabled: !!iri,
+  });
+}
+
+/** 当前生效发布版本（null = 从未发布）。 */
+export function useOntologyActiveRevision(iri: string | null) {
+  return useQuery<number | null>({
+    queryKey: QK_ACTIVE_REV(iri ?? ""),
+    queryFn: () => ipc.getOntologyActiveRevision(iri!),
+    enabled: !!iri,
+  });
+}
+
+/** 工作区相对生效快照是否有未发布修改。 */
+export function useOntologyWorkspaceDirty(iri: string | null) {
+  return useQuery<boolean>({
+    queryKey: QK_WORKSPACE_DIRTY(iri ?? ""),
+    queryFn: () => ipc.getOntologyWorkspaceDirty(iri!),
+    enabled: !!iri,
+  });
+}
+
+/** 两版本结构化 diff（rev=0 = 当前工作区内容）。 */
+export function useOntologyVersionDiff(
+  iri: string | null,
+  revA: number | null,
+  revB: number | null,
+) {
+  return useQuery<TtlVersionDiff>({
+    queryKey: QK_VERSION_DIFF(iri ?? "", revA ?? 0, revB ?? 0),
+    queryFn: () => ipc.diffOntologyVersions(iri!, revA!, revB!),
+    enabled: !!iri && revA != null && revB != null,
+    staleTime: 30_000,
+  });
+}
+
+/** 发布当前内容为新版本（版本=里程碑）。 */
+export function usePublishOntologyVersion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      iri,
+      label,
+      description,
+    }: {
+      iri: string;
+      label: string;
+      description: string;
+    }): Promise<number> => ipc.publishOntologyVersion(iri, label, description, "user"),
+    onSuccess: (_rev, v) => {
+      qc.invalidateQueries({ queryKey: QK_VERSIONS(v.iri) });
+      qc.invalidateQueries({ queryKey: QK_ACTIVE_REV(v.iri) });
+      qc.invalidateQueries({ queryKey: QK_WORKSPACE_DIRTY(v.iri) });
+      qc.invalidateQueries({ queryKey: QK_CHANGELOG(v.iri) });
+      qc.invalidateQueries({ queryKey: QK_CONTENT(v.iri) });
+      qc.invalidateQueries({ queryKey: ["ontology-ttl-version-diff", v.iri] });
+      qc.invalidateQueries({ queryKey: QK_LIST });
+    },
+  });
+}
+
+/** 回退到指定版本（切指针覆盖当前内容，不新建版本）。 */
+export function useRevertOntologyVersion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      iri,
+      revision,
+    }: {
+      iri: string;
+      revision: number;
+    }): Promise<null> => ipc.revertOntologyVersion(iri, revision, "user"),
+    onSuccess: (_r, v) => {
+      qc.invalidateQueries({ queryKey: QK_VERSIONS(v.iri) });
+      qc.invalidateQueries({ queryKey: QK_ACTIVE_REV(v.iri) });
+      qc.invalidateQueries({ queryKey: QK_WORKSPACE_DIRTY(v.iri) });
+      qc.invalidateQueries({ queryKey: QK_CHANGELOG(v.iri) });
+      qc.invalidateQueries({ queryKey: QK_CONTENT(v.iri) });
+      qc.invalidateQueries({ queryKey: QK_PROPERTIES(v.iri) });
+      qc.invalidateQueries({ queryKey: QK_CLASS_IRIS(v.iri) });
+      qc.invalidateQueries({ queryKey: ["ontology-ttl-version-diff", v.iri] });
+      qc.invalidateQueries({ queryKey: QK_LIST });
+    },
+  });
+}
+
+/** 删除单个版本快照（当前启用版本后端拒绝）。 */
+export function useDeleteOntologyVersion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      iri,
+      revision,
+    }: {
+      iri: string;
+      revision: number;
+    }): Promise<null> => ipc.deleteOntologyVersion(iri, revision),
+    onSuccess: (_r, v) => {
+      qc.invalidateQueries({ queryKey: QK_VERSIONS(v.iri) });
+      qc.invalidateQueries({ queryKey: QK_ACTIVE_REV(v.iri) });
+      qc.invalidateQueries({ queryKey: QK_CHANGELOG(v.iri) });
+    },
+  });
+}
+
+/** 版本上限（默认 20）。 */
+export function useVersionLimit() {
+  return useQuery<number>({
+    queryKey: ["ontology-ttl-version-limit"],
+    queryFn: () => ipc.getVersionLimit(),
+  });
+}
+
+/** 设置版本上限（0 回退默认）。 */
+export function useSetVersionLimit() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (limit: number): Promise<number> => ipc.setVersionLimit(limit),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["ontology-ttl-version-limit"] });
+    },
   });
 }

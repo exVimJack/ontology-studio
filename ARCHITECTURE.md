@@ -91,7 +91,7 @@
 
 - DOCX 读/写、PPTX、老格式 DOC/XLS/PPT → `office_oxide = "0.1.8"`
 - XLSX 读 → `calamine`(保留,类型/公式保真更优)
-- XLSX 写 → `rust_xlsxwriter`(保留,领域标准;当前代码未实现 XLSX 写功能,暂未引入依赖,实现时加回)
+- XLSX 写 → `rust_xlsxwriter`(已引入 `crates/ontology-store`,用于元素映射多工作表导出;纯 Rust,MIT/Apache-2.0,无 C/系统依赖)
 
 **理由**(基于解析质量对比,非性能):
 
@@ -541,7 +541,7 @@ pdfium-render = { version = "0.9.3", default-features = false, features = ["thre
 # Office
 office_oxide = "0.1.8"      # DOCX 读/写 + PPTX + 老格式 DOC/XLS/PPT(统一 IR)
 calamine = "0.36"           # XLSX 读(类型/公式保真)
-rust_xlsxwriter = "0.96"    # XLSX 写
+rust_xlsxwriter = "0.102"  # XLSX 写(元素映射多工作表导出)
 
 # eBook
 rbook = "0.7"               # ePub 2/3
@@ -2026,3 +2026,46 @@ TTL 骨架含 owl:Ontology 头部 + 宪章四谓词（`TtlStore::create_with_cha
 
 - 复用决策 10（本体存储）、决策 22（charter 不进 payload——本决策的两条复用路径均不触碰 charter）- 渲染层复用决策 12 前端约束（组件不直接 invoke，数据变换全部在 lib 纯函数层，可单测）
 - 不引入新依赖（G6/preview/import 均为既有能力，符合原则 1/2/3）
+
+### 决策 25：元素映射绑定层——本体元素与物理表字段解耦（2026-11）
+
+**背景**：本体建模只是第一步。本体要真正用起来，每个对象类型的属性都必须能落回原始表的字段，否则 schema 与数据实例之间没有桥。历史上这件事只有两条半成品路径：
+
+| 现状 | 位置 | 问题 |
+|---|---|---|
+| Palantir `properties.backing_*` 五列 | `schema.rs` | 只覆盖属性；W3C 侧完全没有；一次只能表达一组（多候选列无处安放） |
+| W3C TTL 内的绑定三元组 | `.ttl` 正文 | 改一次绑定 = 一次 `import_ttl`，产生 changelog revision + 版本快照，把"映射"当设计资产污染 diff |
+| 映射校验雏形 | `store.rs::preview_import` 的 P3 | 只对 VIRTUAL 生效，且靠 `content.contains("table.column")` 裸匹配 |
+
+**决策**：新增**独立的映射绑定层**（`element_mapping` 表），把"元素 ↔ 物理位置"从概念定义里彻底剥离。两套标准共用同一张表、同一套 IPC、同一套前端组件。
+
+**落地要点**：
+
+- **一张表两套标准**：`standard ∈ {palantir, w3c}` + `ontology_key`（Palantir 用本体 `api_name`，W3C 用本体 IRI）+ `element_type`（`object_type/property/link` 对 `class/datatype_property/object_property`）+ `element_id`。物理位置拆成 8 段（`source_/target_ × catalog/schema/table/column`）作为复合唯一键，同元素可挂多列（`ORDER BY created_at, id` 稳定）。
+- **核状态由系统判定，不由调用方声明**：`verified` 只来自 `mapping_verify::verify_mapping(来源, 目标, 快照)`。有快照 → 命中即 `verified=1`；未命中 → 未核对 + 聚合 warning；无快照 → 保留旧状态（新行默认未核对）。用户/模型不能自封"已核对"。
+- **warn_only，不阻断**：映射缺失、未核对、单端（关系只绑一端）、孤儿都只是提示。`preview_import` 的 P3 升级为全类型聚合告警（单条聚合，不逐条刷屏），并且**任何情况下不当作 error 拒绝导入/保存**。
+- **单一真相源 + 一处双写**：新表是映射的真相源；`properties.backing_*` 降级为 payload 契约载体（Gaia 兼容字段，删列会破坏 export/import round-trip）。双写**仅限 Palantir**（`save_element_mappings` 后 `sync_property_backing`），W3C 只写新表、不碰 `.ttl`。
+- **回填双向可逆**：存量库 `backfill_mappings_from_properties`（本体映射集合为空才执行，幂等）；导入路径 `backfill_palantir_payload_mappings`（payload 带 `backing_mapping` 时补齐**该元素尚无任何映射**的情形，绝不覆盖用户已做的多列绑定）。
+- **快照在编排层汇合，`ontology-store` 不依赖 `federation`**：`PhysicalSchemaSnapshot` 由 `FederationService::cached_snapshots()`（内存缓存，不额外连库）+ `evidence_sources` 的 `parse_evidence_physical` 文本解析拼成，经 `Arc<dyn Fn() -> Snapshot>` 注入。W3C 与 Palantir 的 store 都只接收快照值。
+- **建议纯确定性、不落库**：名称归一 + 类型兼容 + 同表先验打分，产出候选值必来自快照里真实存在的列。不走 LLM——LLM 编造的 `t_order.order_no` 看起来完全可信但库里没有，正是 P3 当初想挡的事；LLM 的角色限缩为"指认哪张表/哪批字段值得登记证据源"。
+- **Agent 读视图按需注入**：`describe_object_type` 对已映射属性附 `backing`，未映射属性该字段不出现（不是空对象）；工具组 `suggest/save/list/export_element_mappings` 每次调用现取快照。
+- **导出扁平 CSV，两个范围共用渲染器**：`All` / `Gap`（未映射 + 未核对）同表输出，首字节 UTF-8 BOM（Excel 中文）、CRLF、RFC 4180 转义；关系行备注写连接条件，单端映射标为不完整。
+- **孤儿不自动清理**：元素改名/删除后映射残留由完整性报告呈现，可选择清理（需用户确认）。不做删除路径的横切钩子——`surgery_import` / `delete_ttl_class_cascade` / `delete_object_type` 三条路径各插一次清理，漏一处就是静默数据丢失。
+
+**禁止的做法**：
+
+- ❌ 把映射写进概念三元素组（TTL 三元组 / payload 新增契约字段）——换绑不该产生本体版本
+- ❌ 让调用方传 `verified=true`——核对状态只能由快照比对得出
+- ❌ 映射缺失/未核对当 error 阻断导入（用户已确认「明确的就写，抽象的就不写」）
+- ❌ `ontology-store` 反向依赖 `federation`（架构隔离：快照在编排层汇合后以值传入）
+- ❌ 用 LLM 生成候选列名（候选必须来自快照里真实存在的列）
+- ❌ 在删除/改名路径上零散插映射清理（漏一处即静默丢失）
+- ❌ 把映射状态塞进 system prompt / 每次对话重发（撑 context、破 prefix cache；由工具按需查）
+
+**与现有决策的关系**：
+
+- 决策 10（本体存储）——映射表复用同一 SQLite，不引入第二存储
+- 决策 17（`@` 挂载统一 agentic search）——同一条「不自动注入、按需读」的原则
+- 决策 24（跨标准能力复用）——映射层是两条标准共用一套实现，前端组件单实现、数据层做适配
+- 不引入新依赖（`rusqlite` + 既有 store，符合原则 1/2/3）
+

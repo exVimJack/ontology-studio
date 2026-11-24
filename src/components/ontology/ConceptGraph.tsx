@@ -14,30 +14,48 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useMemo,
   useState,
   useSyncExternalStore,
+  type ReactNode,
 } from "react";
 import {
   Search,
   X,
-  Info,
-  ExternalLink,
   Copy,
-  Share2,
   Maximize,
   Minimize,
   FileCode2,
   Plus,
   Minus,
+  Pencil,
+  Trash2,
+  ArrowLeft,
+  Check,
 } from "lucide-react";
+import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { Graph } from "@antv/g6";
+import {
+  useOntologyTtlClassMetas,
+  useOntologyTtlClassIris,
+  useOntologyTtlProperties,
+  useEditOntologyTtlClass,
+  useDeleteOntologyTtlClass,
+  useEditOntologyTtlProperty,
+  useDeleteOntologyTtlProperty,
+} from "@/hooks/useOntologyTtl";
+import type { TtlPropertyEdit } from "@/lib/domain";
 import type { LayoutOptions } from "@antv/g6";
 import {
   buildGraphData,
   canvasBackground,
   computeDepth,
+  rdfTermForKind,
+  buildClassDeleteConfirmMessage,
+  filterDatatypeVisibility,
+  iriLooseEq as iriLooseEqLib,
 } from "@/lib/ontology-graph";
 import type { ConceptNode, ConceptEdge } from "@/lib/ontology-graph";
 
@@ -58,6 +76,12 @@ function getTheme() {
 // (OntologyTtlView 的 GraphPanel 通过 ConceptGraph 导入 ConceptNode/ConceptEdge)
 export type { ConceptNode, ConceptEdge } from "@/lib/ontology-graph";
 
+/** 图选中焦点（供变更清单相关过滤）；与 GraphDiffFocus 对齐。 */
+export type ConceptGraphSelection =
+  | { kind: "class"; iri: string }
+  | { kind: "property"; iri: string }
+  | { kind: "hierarchy"; childIri: string; parentIri: string };
+
 interface ConceptGraphProps {
   nodes: ConceptNode[];
   edges: ConceptEdge[];
@@ -66,6 +90,12 @@ interface ConceptGraphProps {
   className?: string;
   /** 图谱→Turtle 联动：点击节点跳转到 Turtle 源码定义行 */
   onJumpToSource?: (iri: string) => void;
+  /** 本体 IRI——提供后启用图上编辑（类/属性/关系 的修改与删除） */
+  ontologyIri?: string;
+  /** 选中变化（点空白/Esc/关详情为 null）；用于变更清单相关过滤 */
+  onSelectionChange?: (sel: ConceptGraphSelection | null) => void;
+  /** 右栏下段（如变更清单）；详情/编辑在上，清单在下，避免浮层重叠 */
+  sidebarBottom?: ReactNode;
 }
 
 export function ConceptGraph({
@@ -74,6 +104,9 @@ export function ConceptGraph({
   storageKey,
   className,
   onJumpToSource,
+  ontologyIri,
+  onSelectionChange,
+  sidebarBottom,
 }: ConceptGraphProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -103,9 +136,29 @@ export function ConceptGraph({
     x: number;
     y: number;
   } | null>(null);
+  // 边详情（关系/属性定义）
+  const [edgeDetail, setEdgeDetail] = useState<ConceptEdge | null>(null);
+  /** 属性/关系查看卡（从类卡行进入或点属性节点/关系边） */
+  const [propView, setPropView] = useState<{
+    iri: string;
+    kind: "object" | "datatype";
+  } | null>(null);
+  /** 类锚：编属性/关系门禁 + 清单宽过滤 */
+  const [anchorClassIri, setAnchorClassIri] = useState<string | null>(null);
+  const [anchorGateMsg, setAnchorGateMsg] = useState("");
+  // 编辑面板：类 / 属性 / 关系（分型，不可互转）
+  const [editing, setEditing] = useState<
+    | { type: "class"; iri: string }
+    | { type: "property"; iri: string; kind: "object" | "datatype" }
+    | null
+  >(null);
 
-  // 属性开关（默认显示）
-  const [showDatatypes, setShowDatatypes] = useState(true);
+  // 属性开关（默认不勾选，避免大数据属性量时图过密）
+  const [showDatatypes, setShowDatatypes] = useState(false);
+  /** 双击类展开的数据属性 domain 集合（与 showDatatypes 并集） */
+  const [expandedAttrClassIris, setExpandedAttrClassIris] = useState<
+    Set<string>
+  >(() => new Set());
   // 搜索定位
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -114,16 +167,25 @@ export function ConceptGraph({
   const searchResults = useMemo(() => {
     if (!searchQuery.trim()) return [];
     const q = searchQuery.toLowerCase();
-    const visible = showDatatypes
-      ? nodes
-      : nodes.filter((n) => n.kind !== "datatype");
+    const { nodes: visible } = filterDatatypeVisibility(
+      nodes,
+      edges,
+      showDatatypes,
+      expandedAttrClassIris,
+    );
     return visible
       .filter(
         (n) =>
           n.label.toLowerCase().includes(q) || n.id.toLowerCase().includes(q),
       )
       .slice(0, 20);
-  }, [nodes, searchQuery, showDatatypes]);
+  }, [nodes, edges, searchQuery, showDatatypes, expandedAttrClassIris]);
+
+  const onSelectionChangeRef = useRef(onSelectionChange);
+  onSelectionChangeRef.current = onSelectionChange;
+  const emitSelection = (sel: ConceptGraphSelection | null) => {
+    onSelectionChangeRef.current?.(sel);
+  };
 
   // 搜索定位（“选中高亮”）：清除旧高亮 → focusElement → 高亮目标
   const handleSearchSelect = (id: string) => {
@@ -139,6 +201,15 @@ export function ConceptGraph({
     setSearchQuery("");
     setSearchOpen(false);
     setDetail(null);
+    setEdgeDetail(null);
+    const node = nodes.find((n) => n.id === id);
+    if (node?.kind === "class") applyClassSelect(node);
+    else if (node?.kind === "datatype")
+      applyPropertySelect(node.iri, "datatype");
+    else {
+      setAnchorClassIri(null);
+      emitSelection(null);
+    }
   };
 
   const handleSearchOpen = () => {
@@ -155,6 +226,32 @@ export function ConceptGraph({
   // 样式值与原 node/edge state 定义保持一致：
   //   节点 focused: { opacity 1, lineWidth 3, stroke #f59e0b }  dimmed: { opacity 0.12 }
   //   边   focused: { opacity 1 }                                dimmed: { opacity 0.08 }
+  // buildData 经 ref 读取：graph.on 装在 [] 闭包里，直接闭包 buildData 会过期。
+  // 先占位，buildData 定义后每帧回写（见下方）。
+  const buildDataRef = useRef<() => ReturnType<typeof buildGraphData>>(
+    () => ({ nodes: [], edges: [] }),
+  );
+
+  const redrawElements = (graph: Graph) => {
+    try {
+      // Graph.context 是 private，但运行时可访问（v5 官方 setElementState 内部
+      // 同样走 context.element.draw）；用断言访问避免 G6 暴露公开 draw API 前
+      // 无法显式重绘的问题。
+      const el = (
+        graph as unknown as {
+          context: {
+            element: {
+              draw: (cfg: { animation: boolean; stage: string }) => unknown;
+            };
+          };
+        }
+      ).context.element;
+      void el.draw({ animation: false, stage: "state" });
+    } catch {
+      /* element controller 不可用时忽略 */
+    }
+  };
+
   const applyHighlight = (graph: Graph, nodeId: string) => {
     const { edges: curEdges } = dataRef.current;
     const neighborIds = new Set<string>([nodeId]);
@@ -183,81 +280,469 @@ export function ConceptGraph({
       }));
     graph.updateNodeData(nodeUpdates);
     graph.updateEdgeData(edgeUpdates);
-    try {
-      // Graph.context 是 private，但运行时可访问（v5 官方 setElementState 内部
-      // 同样走 context.element.draw）；用断言访问避免 G6 暴露公开 draw API 前
-      // 无法显式重绘的问题。
-      const el = (
-        graph as unknown as {
-          context: {
-            element: {
-              draw: (cfg: { animation: boolean; stage: string }) => unknown;
-            };
-          };
-        }
-      ).context.element;
-      void el.draw({ animation: false, stage: "state" });
-    } catch {
-      /* element controller 不可用时忽略 */
-    }
+    redrawElements(graph);
   };
 
-  // 清除全部高亮（详情关闭 / Esc / 画布·边·minimap 点击时调用）
+  // 清除全部高亮（详情关闭 / Esc / 画布·边·minimap 点击时调用）。
+  // 必须把 stroke/lineWidth 一并还原：updateNodeData 是合并写入，
+  // 只设 opacity:1 时橙色描边会残留在数据上。
   const clearHighlight = (graph: Graph | null) => {
     if (!graph) return;
+    const baseline = buildDataRef.current();
+    const nodeBase = new Map(
+      (baseline.nodes ?? []).map((n) => [
+        n.id as string,
+        n.style as Record<string, unknown> | undefined,
+      ]),
+    );
+    const edgeBase = new Map(
+      (baseline.edges ?? []).map((e) => [
+        e.id as string,
+        e.style as Record<string, unknown> | undefined,
+      ]),
+    );
     const nodeUpdates = graph
       .getNodeData()
       .filter((n) => n.id)
-      .map((n) => ({ id: n.id as string, style: { opacity: 1 } }));
+      .map((n) => {
+        const id = n.id as string;
+        const base = nodeBase.get(id) ?? {};
+        return {
+          id,
+          style: {
+            opacity: 1,
+            stroke: base.stroke as string | undefined,
+            lineWidth: base.lineWidth as number | undefined,
+          },
+        };
+      });
     const edgeUpdates = graph
       .getEdgeData()
       .filter((e) => e.id)
-      .map((e) => ({ id: e.id as string, style: { opacity: 1 } }));
+      .map((e) => {
+        const id = e.id as string;
+        const base = edgeBase.get(id) ?? {};
+        return {
+          id,
+          style: {
+            opacity: 1,
+            stroke: base.stroke as string | undefined,
+            lineWidth: base.lineWidth as number | undefined,
+            endArrowFill: base.endArrowFill as string | undefined,
+          },
+        };
+      });
     graph.updateNodeData(nodeUpdates);
     graph.updateEdgeData(edgeUpdates);
-    try {
-      const el = (
-        graph as unknown as {
-          context: {
-            element: {
-              draw: (cfg: { animation: boolean; stage: string }) => unknown;
-            };
-          };
-        }
-      ).context.element;
-      void el.draw({ animation: false, stage: "state" });
-    } catch {
-      /* element controller 不可用时忽略 */
+    redrawElements(graph);
+  };
+
+  // ── 图上编辑（ontologyIri 提供时启用）：hooks 无条件调用，query 用 enabled 门控 ──
+  const classMetasQ = useOntologyTtlClassMetas(ontologyIri ?? null);
+  const classIrisQ = useOntologyTtlClassIris(ontologyIri ?? null);
+  const propsQ = useOntologyTtlProperties(ontologyIri ?? null);
+  const editClass = useEditOntologyTtlClass();
+  const deleteClass = useDeleteOntologyTtlClass();
+  const editProp = useEditOntologyTtlProperty();
+  const deleteProp = useDeleteOntologyTtlProperty();
+  const [form, setForm] = useState<{
+    label: string;
+    comment: string;
+    domain: string;
+    range: string;
+    parents: string[];
+  }>({ label: "", comment: "", domain: "", range: "", parents: [] });
+  const [formErr, setFormErr] = useState("");
+  const [formOk, setFormOk] = useState("");
+
+  const openClassEdit = (iri: string) => {
+    const meta = (classMetasQ.data ?? []).find((m) => m.iri === iri);
+    const parents = edges
+      .filter((e) => e.kind === "hierarchy" && e.source === iri)
+      .map((e) => nodes.find((n) => n.id === e.target)?.iri ?? "");
+    setEditing({ type: "class", iri });
+    setForm({
+      label: meta?.label ?? "",
+      comment: meta?.comment ?? "",
+      domain: "",
+      range: "",
+      parents: parents.filter(Boolean),
+    });
+    setFormErr("");
+    setFormOk("");
+  };
+
+  const iriLooseEq = iriLooseEqLib;
+
+  const propTouchesClass = (prop: TtlPropertyEdit | undefined, classIri: string) => {
+    if (!prop) return false;
+    return (
+      iriLooseEq(prop.domain ?? "", classIri) ||
+      iriLooseEq(prop.range ?? "", classIri)
+    );
+  };
+
+  const openPropertyEdit = (predIri: string, kind: "object" | "datatype") => {
+    if (!anchorClassIri) {
+      setAnchorGateMsg("请先选择一个类，再编辑属性或关系");
+      return;
     }
+    const prop = (propsQ.data ?? []).find((x) => x.iri === predIri);
+    if (prop && !propTouchesClass(prop, anchorClassIri)) {
+      setAnchorGateMsg("请先选择一个类，再编辑属性或关系");
+      return;
+    }
+    setAnchorGateMsg("");
+    setEditing({ type: "property", iri: predIri, kind });
+    setForm({
+      label: prop?.label ?? "",
+      comment: prop?.comment ?? "",
+      domain: prop?.domain ?? "",
+      range: prop?.range ?? "",
+      parents: [],
+    });
+    setFormErr("");
+    setFormOk("");
+  };
+
+  const saveEdit = () => {
+    if (!ontologyIri || !editing) return;
+    setFormErr("");
+    setFormOk("");
+    if (editing.type === "class") {
+      editClass.mutate(
+        {
+          iri: ontologyIri,
+          edit: {
+            iri: editing.iri,
+            label: form.label,
+            comment: form.comment,
+            parents: form.parents,
+          },
+        },
+        {
+          onSuccess: () => setFormOk("已保存"),
+          onError: (e) => setFormErr((e as Error).message),
+        },
+      );
+    } else {
+      const prop = (propsQ.data ?? []).find((x) => x.iri === editing.iri);
+      const next: TtlPropertyEdit = {
+        iri: editing.iri,
+        kind: editing.kind,
+        label: form.label,
+        comment: form.comment,
+        domain: form.domain,
+        range: form.range,
+      };
+      editProp.mutate(
+        { iri: ontologyIri, edit: next },
+        {
+          onSuccess: () => {
+            void prop;
+            setFormOk("已保存");
+          },
+          onError: (e) => setFormErr((e as Error).message),
+        },
+      );
+    }
+  };
+
+  /** 取消编辑：回查看卡，保留类锚。 */
+  const cancelEdit = () => {
+    const was = editing;
+    setEditing(null);
+    setFormErr("");
+    setFormOk("");
+    if (!was) return;
+    if (was.type === "class") {
+      const node =
+        nodes.find((n) => n.kind === "class" && iriLooseEq(n.iri, was.iri)) ??
+        ({
+          id: was.iri,
+          label: was.iri.split(/[#/]/).pop() || was.iri,
+          iri: was.iri,
+          kind: "class" as const,
+        } satisfies ConceptNode);
+      applyClassSelect(node);
+      return;
+    }
+    setPropView({ iri: was.iri, kind: was.kind });
+    setDetail(null);
+    setEdgeDetail(null);
+  };
+
+  /** 一期摘要：基于 propsQ 单 domain（多定义域共享可能显示为独占，以后端执行为准）。 */
+  const confirmDeleteClassMessage = (classIri: string) => {
+    const props = propsQ.data ?? [];
+    const datatypeProps: { iri: string; label?: string }[] = [];
+    const objectProps: { iri: string; label?: string }[] = [];
+    for (const p of props) {
+      const label = p.label || undefined;
+      if (p.kind === "object") {
+        if (
+          iriLooseEq(p.domain ?? "", classIri) ||
+          iriLooseEq(p.range ?? "", classIri)
+        ) {
+          objectProps.push({ iri: p.iri, label });
+        }
+      } else if (iriLooseEq(p.domain ?? "", classIri)) {
+        datatypeProps.push({ iri: p.iri, label });
+      }
+    }
+    // 继承边：该类作为父/子端点的边会一并解除
+    const classNode = nodes.find(
+      (n) => n.kind === "class" && iriLooseEq(n.iri, classIri),
+    );
+    const labelOf = (id: string) => nodes.find((n) => n.id === id)?.label ?? id;
+    const parentLabels = edges
+      .filter((e) => e.kind === "hierarchy" && e.source === classNode?.id)
+      .map((e) => labelOf(e.target));
+    const childLabels = edges
+      .filter((e) => e.kind === "hierarchy" && e.target === classNode?.id)
+      .map((e) => labelOf(e.source));
+    return buildClassDeleteConfirmMessage({
+      classIri,
+      datatypeProps,
+      objectProps,
+      parentLabels,
+      childLabels,
+    });
+  };
+
+  /**
+   * 卡片删类：确认通过后才发起写入。
+   *
+   * MUST NOT 用 window.confirm —— tauri-plugin-dialog 在 webview 初始化时把它覆盖成
+   * 返回 Promise 的异步函数，`!window.confirm(x)` 恒为 false，用户点取消也会执行。
+   */
+  const deleteClassFromCard = async (classIri: string) => {
+    if (!ontologyIri) return;
+    const ok = await confirm(confirmDeleteClassMessage(classIri), {
+      kind: "warning",
+    });
+    if (!ok || deleteClass.isPending) return;
+    deleteClass.mutate(
+      { iri: ontologyIri, classIri },
+      {
+        onSuccess: () => {
+          setEditing(null);
+          setDetail(null);
+          setPropView(null);
+          setEdgeDetail(null);
+          setAnchorClassIri(null);
+          setAnchorGateMsg("");
+          clearHighlight(graphRef.current);
+          emitSelection(null);
+        },
+        onError: (e) => {
+          const msg = (e as Error).message || "删除失败，请重试";
+          // 禁止向用户堆 IRI 墙
+          const friendly = msg.includes("http")
+            ? "删除失败：仍有无法自动清理的引用，请先处理相关内容后再试"
+            : msg;
+          void message(friendly, { kind: "error" });
+        },
+      },
+    );
+  };
+
+  /** 卡片删属性/关系：同样先 await 确认，再发起写入。 */
+  const deletePropertyFromCard = async (propertyIri: string) => {
+    if (!ontologyIri) return;
+    const ok = await confirm("确定删除该属性或关系吗？", { kind: "warning" });
+    if (!ok || deleteProp.isPending) return;
+    deleteProp.mutate(
+      { iri: ontologyIri, propertyIri },
+      {
+        onSuccess: () => {
+          setEditing(null);
+          setPropView(null);
+          setEdgeDetail(null);
+          if (anchorClassIri) {
+            const node = nodes.find(
+              (n) => n.kind === "class" && iriLooseEq(n.iri, anchorClassIri),
+            );
+            if (node) applyClassSelect(node);
+            else {
+              setDetail(null);
+              setAnchorClassIri(null);
+              emitSelection(null);
+            }
+          } else {
+            setDetail(null);
+            emitSelection(null);
+          }
+        },
+        onError: (e) => {
+          void message((e as Error).message || "删除失败，请重试", {
+            kind: "error",
+          });
+        },
+      },
+    );
   };
 
   const closeDetail = () => {
     setDetail(null);
+    setPropView(null);
+    setEdgeDetail(null);
+    setAnchorClassIri(null);
+    setAnchorGateMsg("");
+    setEditing(null);
     clearHighlight(graphRef.current);
+    emitSelection(null);
+  };
+
+  /** 清单焦点：有类锚时始终钉类（宽过滤）；否则跟选中元素。 */
+  const emitListFocus = (
+    sel: ConceptGraphSelection | null,
+    nextAnchor: string | null,
+  ) => {
+    if (nextAnchor) {
+      emitSelection({ kind: "class", iri: nextAnchor });
+      return;
+    }
+    emitSelection(sel);
+  };
+
+  const applyClassSelect = (node: ConceptNode) => {
+    setDetail({ node, x: 0, y: 0 });
+    setPropView(null);
+    setEdgeDetail(null);
+    setEditing(null);
+    setAnchorClassIri(node.iri);
+    setAnchorGateMsg("");
+    emitListFocus({ kind: "class", iri: node.iri }, node.iri);
+  };
+
+  /** 属性卡「返回」：回到下钻前类卡（锚优先，否则用 domain）。 */
+  const backFromPropView = (domainHint?: string | null) => {
+    const classIri = anchorClassIri || domainHint || null;
+    if (!classIri) {
+      closeDetail();
+      return;
+    }
+    const classNode =
+      nodes.find((n) => n.kind === "class" && iriLooseEq(n.iri, classIri)) ??
+      ({
+        id: classIri,
+        label: classIri.split(/[#/]/).pop() || classIri,
+        iri: classIri,
+        kind: "class" as const,
+      } satisfies ConceptNode);
+    applyClassSelect(classNode);
+  };
+
+  const toggleExpandedAttrClass = (classIri: string) => {
+    setExpandedAttrClassIris((prev) => {
+      const next = new Set(prev);
+      let found: string | null = null;
+      for (const x of next) {
+        if (iriLooseEq(x, classIri)) {
+          found = x;
+          break;
+        }
+      }
+      if (found) next.delete(found);
+      else next.add(classIri);
+      return next;
+    });
+  };
+
+  const applyPropertySelect = (
+    predIri: string,
+    kind: "object" | "datatype",
+  ) => {
+    const prop = (propsQ.data ?? []).find((x) => x.iri === predIri);
+    const touches =
+      !!anchorClassIri && propTouchesClass(prop, anchorClassIri);
+    if (touches && anchorClassIri) {
+      setDetail(null);
+      setEdgeDetail(null);
+      setPropView({ iri: predIri, kind });
+      setAnchorGateMsg("");
+      emitListFocus({ kind: "property", iri: predIri }, anchorClassIri);
+      return;
+    }
+    // 无关或无锚：切换焦点，清锚
+    setDetail(null);
+    setEdgeDetail(null);
+    setPropView({ iri: predIri, kind });
+    setAnchorClassIri(null);
+    setAnchorGateMsg("");
+    emitListFocus({ kind: "property", iri: predIri }, null);
   };
 
   // 构建 G6 数据（主题感知），稳定引用避免重复渲染
   const buildData = useCallback(
-    () => buildGraphData(nodes, edges, theme, showDatatypes),
-    [nodes, edges, theme, showDatatypes],
+    () =>
+      buildGraphData(
+        nodes,
+        edges,
+        theme,
+        showDatatypes,
+        expandedAttrClassIris,
+      ),
+    [nodes, edges, theme, showDatatypes, expandedAttrClassIris],
   );
+  buildDataRef.current = buildData;
 
   // 内容签名：相同节点/边数据跳过 setData+render
   const dataSignature = useMemo(() => {
     let h = 0;
-    for (const n of nodes) h = ((h << 5) - h + n.id.length) | 0;
-    for (const e of edges) h = ((h << 5) - h + e.id.length) | 0;
-    // 显示开关/主题也参与签名：它们改变 buildData 输出（过滤/配色），
+    for (const n of nodes) {
+      h = ((h << 5) - h + n.id.length) | 0;
+      // diffStatus 必须进签名：异步 diff overlay 到达时 id 不变，
+      // 漏掉会跳过 setData，图上永远看不到相对生效着色。
+      if (n.diffStatus === "added") h = ((h << 3) - h + 11) | 0;
+      else if (n.diffStatus === "modified") h = ((h << 3) - h + 13) | 0;
+      else if (n.diffStatus === "removed") h = ((h << 3) - h + 17) | 0;
+    }
+    for (const e of edges) {
+      h = ((h << 5) - h + e.id.length) | 0;
+      if (e.diffStatus === "added") h = ((h << 3) - h + 19) | 0;
+      else if (e.diffStatus === "modified") h = ((h << 3) - h + 23) | 0;
+      else if (e.diffStatus === "removed") h = ((h << 3) - h + 29) | 0;
+    }
+    // 显示开关/主题/按类展开也参与签名：它们改变 buildData 输出（过滤/配色），
     // 但不改变 nodes/edges——不进签名会被增量更新去重跳过，
     // 画布不同步（例：取消勾选「属性」后属性节点残留）。
     h = ((h << 3) - h + (showDatatypes ? 1 : 0)) | 0;
     h = ((h << 3) - h + (theme === "dark" ? 2 : 0)) | 0;
+    for (const iri of [...expandedAttrClassIris].sort()) {
+      h = ((h << 5) - h + iri.length) | 0;
+      for (let i = 0; i < iri.length; i++) h = ((h << 5) - h + iri.charCodeAt(i)) | 0;
+    }
     return h;
-  }, [nodes, edges, showDatatypes, theme]);
+  }, [nodes, edges, showDatatypes, theme, expandedAttrClassIris]);
 
   // dataRef：graph.on 回调（[] 闭包）中读取最新节点/边数据
   const dataRef = useRef({ nodes, edges });
   dataRef.current = { nodes, edges };
+
+  const applyClassSelectRef = useRef(applyClassSelect);
+  applyClassSelectRef.current = applyClassSelect;
+  const applyPropertySelectRef = useRef(applyPropertySelect);
+  applyPropertySelectRef.current = applyPropertySelect;
+  const toggleExpandedAttrClassRef = useRef(toggleExpandedAttrClass);
+  toggleExpandedAttrClassRef.current = toggleExpandedAttrClass;
+
+  const selectionFromEdge = (e: ConceptEdge): ConceptGraphSelection | null => {
+    if (e.kind === "hierarchy") {
+      const { nodes: ns } = dataRef.current;
+      const child = ns.find((n) => n.id === e.source);
+      const parent = ns.find((n) => n.id === e.target);
+      if (!child?.iri || !parent?.iri) return null;
+      return {
+        kind: "hierarchy",
+        childIri: child.iri,
+        parentIri: parent.iri,
+      };
+    }
+    if (e.predIri) return { kind: "property", iri: e.predIri };
+    return null;
+  };
 
   // 主题切换时重建样式并重绘
   useEffect(() => {
@@ -349,12 +834,11 @@ export function ConceptGraph({
               }
             )?.data;
             if (!d) return "";
-            const kindText =
-              d.kindText ??
-              (d.kind === "class" ? "owl:Class" : "owl:DatatypeProperty");
+            // 节点与边共用该 tooltip：按真实元素类型映射术语
+            const kindText = d.kindText ?? rdfTermForKind(d.kind);
             return `<div style="font-size:11px;line-height:1.5">
               <div style="font-weight:600">${d.label ?? ""}</div>
-              <div style="color:#64748b">${kindText}</div>
+              ${kindText ? `<div style="color:#64748b">${kindText}</div>` : ""}
               <div style="color:#94a3b8;word-break:break-all;max-width:240px">${d.iri ?? ""}</div>
             </div>`;
           },
@@ -365,19 +849,24 @@ export function ConceptGraph({
       background: canvasBackground(theme),
     });
 
-    // ResizeObserver：容器尺寸变化时通知 G6；
-    // 从 display:none（尺寸 0）切回可见时额外 fitView，保证图谱重新适配视口
+    // ResizeObserver：容器尺寸变化时按实像素通知 G6（避免 sizeOf 在 0 高时落到 480 默认值后卡住）
     let lastSize = 0;
     const resizeObserver = new ResizeObserver((entries) => {
       const entry = entries[0];
       if (!entry) return;
-      const area = entry.contentRect.width * entry.contentRect.height;
-      if (area > 0) {
-        graph.resize();
+      const w = Math.floor(entry.contentRect.width);
+      const h = Math.floor(entry.contentRect.height);
+      const area = w * h;
+      if (w > 0 && h > 0) {
+        graph.resize(w, h);
         // 容器 resize 后也重新定位 minimap（全屏/切回窗口）；
         // setupMinimap 幂等，重复调用安全
         setupMinimap();
-        if (lastSize === 0) {
+        // 从 0 恢复，或宽高变化较大时重新适配（右栏开合）
+        if (
+          lastSize === 0 ||
+          Math.abs(area - lastSize) / Math.max(lastSize, 1) > 0.08
+        ) {
           graph.fitView();
         }
       }
@@ -385,32 +874,84 @@ export function ConceptGraph({
     });
     resizeObserver.observe(container);
 
+    // 单击延迟；双击用 click.detail===2（勿再听 node:dblclick）。
+    // G6 会对同一次双击各发一次「合成 dblclick」(detail=2) 与「原生 dblclick」，
+    // 若两边都 toggle 会展开又立刻收起。
+    let nodeClickTimer: ReturnType<typeof setTimeout> | null = null;
     graph.on("node:click", (evt: unknown) => {
-      const target = (evt as { target?: { id?: string } }).target;
-      const nodeId = target?.id;
-      const { nodes: curNodes } = dataRef.current;
-      if (nodeId) {
-        const node = curNodes.find((n) => n.id === nodeId);
-        if (node) {
-          setDetail({ node, x: 0, y: 0 });
-          applyHighlight(graph, node.id);
-        }
-      } else {
-        setDetail(null);
-        clearHighlight(graph);
+      const e = evt as { target?: { id?: string }; detail?: number };
+      const nodeId = e.target?.id;
+      const detail = e.detail ?? 1;
+      if (nodeClickTimer) {
+        clearTimeout(nodeClickTimer);
+        nodeClickTimer = null;
       }
+      if (detail === 2) {
+        const node = dataRef.current.nodes.find((n) => n.id === nodeId);
+        if (node?.kind === "class") {
+          toggleExpandedAttrClassRef.current(node.iri);
+        }
+        return;
+      }
+      nodeClickTimer = setTimeout(() => {
+        nodeClickTimer = null;
+        const { nodes: curNodes } = dataRef.current;
+        if (nodeId) {
+          const node = curNodes.find((n) => n.id === nodeId);
+          if (node) {
+            applyHighlight(graph, node.id);
+            if (node.kind === "class") applyClassSelectRef.current(node);
+            else applyPropertySelectRef.current(node.iri, "datatype");
+          }
+        } else {
+          setDetail(null);
+          setPropView(null);
+          setEdgeDetail(null);
+          setAnchorClassIri(null);
+          clearHighlight(graph);
+          emitSelection(null);
+        }
+      }, 280);
     });
 
     graph.on("canvas:click", () => {
       setDetail(null);
+      setPropView(null);
+      setEdgeDetail(null);
+      setEditing(null);
+      setAnchorClassIri(null);
+      setAnchorGateMsg("");
       clearHighlight(graph);
+      emitSelection(null);
     });
 
-    // 边也视为空白：默认无 edge:click handler 时点边不会派发 canvas:click，
-    // 用户点在边线上（尤其放大视图后边很密）同样表现为"点空白无响应"。
-    graph.on("edge:click", () => {
-      setDetail(null);
-      clearHighlight(graph);
+    // 边点击 → 关系/属性查看；继承边仍走边详情
+    graph.on("edge:click", (evt: unknown) => {
+      const target = (evt as { target?: { id?: string } }).target;
+      const edgeId = target?.id;
+      const { edges: curEdges } = dataRef.current;
+      const e = curEdges.find((x) => x.id === edgeId);
+      if (e) {
+        clearHighlight(graph);
+        if (e.kind === "object" && e.predIri) {
+          applyPropertySelectRef.current(e.predIri, "object");
+        } else if (e.kind === "datatype" && e.predIri) {
+          applyPropertySelectRef.current(e.predIri, "datatype");
+        } else {
+          setDetail(null);
+          setPropView(null);
+          setEdgeDetail(e);
+          setAnchorClassIri(null);
+          emitSelection(selectionFromEdge(e));
+        }
+      } else {
+        setEdgeDetail(null);
+        setDetail(null);
+        setPropView(null);
+        setAnchorClassIri(null);
+        clearHighlight(graph);
+        emitSelection(null);
+      }
     });
 
     // ── 拖拽位置持久化：拖完落盘，下次打开恢复 ──
@@ -493,7 +1034,9 @@ export function ConceptGraph({
         // （拖动导航不受影响，click 仅在非拖动时触发）。
         el.addEventListener("click", () => {
           setDetail(null);
+          setEdgeDetail(null);
           clearHighlight(graphRef.current);
+          emitSelection(null);
         });
       } catch {
         /* 兼容无 minimap 或 API 变更 */
@@ -589,36 +1132,52 @@ export function ConceptGraph({
   const handleZoomOut = () => graphRef.current?.zoomBy(0.77, false);
   const handleFitView = () => graphRef.current?.fitView();
 
-  // 全屏切换：对整个图谱容器请求/退出全屏
-  const handleFullscreen = async () => {
+  const showAside =
+    !!sidebarBottom || !!detail || !!edgeDetail || !!editing || !!propView;
+
+  // 全屏：写窗口像素盒 + 强制 G6 resize。
+  // Tauri WebView 下 requestFullscreen / 父级内 % 高度都不可靠。
+  const handleFullscreen = () => setIsFullscreen((v) => !v);
+
+  const syncGraphSize = useCallback(() => {
+    const graph = graphRef.current;
+    const el = containerRef.current;
     const root = rootRef.current;
-    if (!root) return;
-    try {
-      if (document.fullscreenElement) {
-        await document.exitFullscreen();
-      } else {
-        await root.requestFullscreen();
-      }
-    } catch {
-      /* 浏览器拒绝时静默 */
+    if (!graph || !el) return;
+
+    // 强制一次 reflow，确保刚写的 fixed 像素盒已参与布局
+    if (root) void root.offsetHeight;
+
+    const rect = el.getBoundingClientRect();
+    let width = Math.floor(rect.width);
+    let height = Math.floor(rect.height);
+
+    // 全屏：若 flex 子项尚未拉满，按窗口像素直接算画布区（扣侧栏 + 画布顶边）
+    if (isFullscreen) {
+      const asideW = showAside ? 288 : 0; // w-72
+      const top = Math.max(0, rect.top);
+      const fsW = Math.floor(window.innerWidth - asideW);
+      const fsH = Math.floor(window.innerHeight - top);
+      if (fsW > 0 && (width < fsW * 0.9 || width <= 0)) width = fsW;
+      if (fsH > 0 && (height < fsH * 0.9 || height <= 0)) height = fsH;
+      // 同步撑开容器，避免 G6 canvas 小于外层白底
+      el.style.width = `${width}px`;
+      el.style.height = `${height}px`;
+    } else {
+      el.style.width = "";
+      el.style.height = "";
     }
-  };
 
-  // 监听全屏状态变化：同步按钮图标，并在切换后重新自适应
-  useEffect(() => {
-    const onFsChange = () => {
-      const fs = Boolean(document.fullscreenElement);
-      setIsFullscreen(fs);
-      if (fs) {
-        // 等全屏布局稳定后重新 fitView
-        setTimeout(() => graphRef.current?.fitView(), 100);
-      }
-    };
-    document.addEventListener("fullscreenchange", onFsChange);
-    return () => document.removeEventListener("fullscreenchange", onFsChange);
-  }, []);
+    if (width <= 0 || height <= 0) return;
+    try {
+      graph.resize(width, height);
+      void graph.fitView();
+    } catch {
+      /* destroy 竞态忽略 */
+    }
+  }, [isFullscreen, showAside]);
 
-  // Ctrl+F / Cmd+F 打开图谱搜索；Esc 关闭弹层
+  // Ctrl+F 搜索；Esc：先退出全屏，再关弹层
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
@@ -627,16 +1186,19 @@ export function ConceptGraph({
         setTimeout(() => searchInputRef.current?.focus(), 50);
       }
       if (e.key === "Escape") {
-        // 搜索定位后 detail 可能为 null，但仍需清除高亮
-        if (detail) {
-          setDetail(null);
+        if (isFullscreen) {
+          setIsFullscreen(false);
+          return;
         }
+        if (detail) setDetail(null);
+        setEdgeDetail(null);
         clearHighlight(graphRef.current);
+        emitSelection(null);
       }
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [detail]);
+  }, [detail, isFullscreen]);
   const handleExportPng = async () => {
     const graph = graphRef.current;
     if (!graph) return;
@@ -663,34 +1225,6 @@ export function ConceptGraph({
     URL.revokeObjectURL(a.href);
   };
 
-  // 计算节点邻居/边信息（用于详情面板）
-  const neighborCache = useMemo(() => {
-    const nei = new Map<
-      string,
-      { neighbors: ConceptNode[]; relatedEdges: ConceptEdge[] }
-    >();
-    for (const n of nodes) {
-      const neighbors: ConceptNode[] = [];
-      const relatedEdges: ConceptEdge[] = [];
-      for (const e of edges) {
-        if (e.source === n.id) {
-          const t = nodes.find((nn) => nn.id === e.target);
-          if (t) neighbors.push(t);
-          relatedEdges.push(e);
-        } else if (e.target === n.id) {
-          const s = nodes.find((nn) => nn.id === e.source);
-          if (s) neighbors.push(s);
-          relatedEdges.push(e);
-        }
-      }
-      nei.set(n.id, {
-        neighbors: neighbors.slice(0, 20), // 最多20个邻居
-        relatedEdges,
-      });
-    }
-    return nei;
-  }, [nodes, edges]);
-
   const nodeCount = nodes.length;
   const edgeCount = edges.length;
 
@@ -713,12 +1247,75 @@ export function ConceptGraph({
   const hierarchyCount = edges.filter((e) => e.kind === "hierarchy").length;
   const objectCount = edges.filter((e) => e.kind === "object").length;
 
+  // 全屏：直接写窗口像素尺寸（避开 % / vh / 父级 overflow 链），再 resize G6
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+
+    if (!isFullscreen) {
+      root.style.position = "";
+      root.style.top = "";
+      root.style.left = "";
+      root.style.right = "";
+      root.style.bottom = "";
+      root.style.width = "";
+      root.style.height = "";
+      root.style.zIndex = "";
+      root.style.background = "";
+      root.style.margin = "";
+      syncGraphSize();
+      const t1 = window.setTimeout(syncGraphSize, 50);
+      const t2 = window.setTimeout(syncGraphSize, 150);
+      return () => {
+        window.clearTimeout(t1);
+        window.clearTimeout(t2);
+      };
+    }
+
+    const applyFsBox = () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      root.style.position = "fixed";
+      root.style.top = "0";
+      root.style.left = "0";
+      root.style.right = "auto";
+      root.style.bottom = "auto";
+      root.style.width = `${w}px`;
+      root.style.height = `${h}px`;
+      root.style.zIndex = "9999";
+      root.style.background = canvasBackground(theme);
+      root.style.margin = "0";
+      syncGraphSize();
+    };
+    applyFsBox();
+    const t1 = window.setTimeout(applyFsBox, 50);
+    const t2 = window.setTimeout(applyFsBox, 200);
+    window.addEventListener("resize", applyFsBox);
+    return () => {
+      window.clearTimeout(t1);
+      window.clearTimeout(t2);
+      window.removeEventListener("resize", applyFsBox);
+    };
+  }, [isFullscreen, theme, syncGraphSize]);
+
+  // 右栏开合只触发 resize，不碰全屏定位样式
+  useLayoutEffect(() => {
+    syncGraphSize();
+  }, [showAside, syncGraphSize]);
+
   return (
     <div
       ref={rootRef}
-      style={isFullscreen ? { background: canvasBackground(theme) } : undefined}
-      className={`relative flex h-full w-full flex-col ${className ?? ""}`}
+      className={`flex min-h-0 flex-row ${
+        isFullscreen ? "" : `relative h-full w-full ${className ?? ""}`
+      }`}
     >
+      {/* 全屏根节点已是窗口像素高，子项用 h-full 可拉满；非全屏仍靠 flex stretch */}
+      <div
+        className={`flex min-h-0 min-w-0 flex-1 flex-col self-stretch ${
+          isFullscreen ? "h-full" : ""
+        }`}
+      >
       {/* 顶栏：图例 + 布局切换 + 操作 */}
       <div className="flex shrink-0 items-center gap-2 border-b border-border bg-bg-hover/30 px-3 py-1.5 text-[10px] text-fg-subtle">
         <span className="inline-flex items-center gap-1">
@@ -732,8 +1329,8 @@ export function ConceptGraph({
               cx="6"
               cy="6"
               r="4.5"
-              fill="#4f46e5"
-              stroke="#4338ca"
+              fill="#f1f5f9"
+              stroke="#64748b"
               strokeWidth="1"
             />
           </svg>
@@ -750,8 +1347,8 @@ export function ConceptGraph({
               cx="6"
               cy="6"
               r="4.5"
-              fill="#2563eb"
-              stroke="#1d4ed8"
+              fill="#f8fafc"
+              stroke="#94a3b8"
               strokeWidth="1"
             />
           </svg>
@@ -768,8 +1365,8 @@ export function ConceptGraph({
               cx="6"
               cy="6"
               r="4.5"
-              fill="#60a5fa"
-              stroke="#3b82f6"
+              fill="#ffffff"
+              stroke="#cbd5e1"
               strokeWidth="1"
             />
           </svg>
@@ -787,17 +1384,17 @@ export function ConceptGraph({
               y1="6"
               x2="18"
               y2="6"
-              stroke="#f59e0b"
+              stroke="#d97706"
               strokeWidth="1"
               strokeDasharray="4 3"
             />
-            <polygon points="18,3 24,6 18,9" fill="#f59e0b" />
+            <polygon points="18,3 24,6 18,9" fill="#d97706" />
             <circle
               cx="32"
               cy="6"
               r="4.5"
-              fill="#fef3c7"
-              stroke="#f59e0b"
+              fill="#fffbeb"
+              stroke="#d97706"
               strokeWidth="1"
             />
           </svg>
@@ -815,11 +1412,11 @@ export function ConceptGraph({
               y1="6"
               x2="13"
               y2="6"
-              stroke="#94a3b8"
+              stroke="#cbd5e1"
               strokeWidth="1"
-              strokeDasharray="5 3"
+              strokeDasharray="5 4"
             />
-            <polygon points="13,3.5 18,6 13,8.5" fill="#94a3b8" />
+            <polygon points="13,3.5 18,6 13,8.5" fill="#cbd5e1" />
           </svg>
           subClassOf {hierarchyCount}
         </span>
@@ -835,10 +1432,10 @@ export function ConceptGraph({
               y1="6"
               x2="13"
               y2="6"
-              stroke="#10b981"
+              stroke="#64748b"
               strokeWidth="1"
             />
-            <polygon points="13,3 19,6 13,9" fill="#10b981" />
+            <polygon points="13,3 19,6 13,9" fill="#64748b" />
           </svg>
           ObjectProperty {objectCount}
         </span>
@@ -1015,27 +1612,78 @@ export function ConceptGraph({
         </button>
       </div>
 
-      {/* 画布 */}
-      <div className="relative min-h-0 flex-1">
-        <div ref={containerRef} className="h-full w-full" />
+      {/* 画布：全屏时由 syncGraphSize 按窗口像素撑开 container，避免 flex 链塌缩 */}
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        <div
+          ref={containerRef}
+          className={isFullscreen ? "" : "absolute inset-0"}
+          style={
+            isFullscreen
+              ? { position: "absolute", top: 0, left: 0 }
+              : undefined
+          }
+        />
         {nodeCount === 0 && (
           <div className="absolute inset-0 flex items-center justify-center text-xs text-fg-subtle/50">
             该本体无类/属性
           </div>
         )}
       </div>
+      </div>
 
-      {/* 详情弹层 */}
-      {detail &&
+      {showAside && (
+      <aside
+        className={`flex min-h-0 w-72 shrink-0 flex-col self-stretch border-l border-border bg-bg ${
+          isFullscreen ? "h-full" : ""
+        }`}
+      >
+      {/* 上段：实体/边详情或编辑（有内容才渲染，避免空块抢走清单高度） */}
+      {(detail || edgeDetail || editing || propView) && (
+      <div
+        className={`min-h-0 ${
+          sidebarBottom
+            ? editing
+              ? // 编辑表单字段多（label/comment/父类列表），比查看卡需要更多高度；
+                // 外层交给面板内部的表单区滚动，这里只做高度约束，避免双层滚动。
+                // 必须是 flex 容器，内部 `flex-1` 的表单区才能撑开并独立滚动。
+                "flex max-h-[78%] shrink-0 flex-col overflow-hidden border-b border-border"
+              : "max-h-[58%] shrink-0 overflow-y-auto border-b border-border"
+            : // 无变更清单时右侧只有这一块：不能拉满窗口（否则 flex 撑高后
+              // 表单区用 flex-1 吸收剩余空间，页脚被推离内容掉到窗口底部）。
+              // max-h-full 兜住 aside 高度：内容短则自然高度（页脚紧跟表单，
+              // 不再掉到窗口底部）；内容长才滚动。
+              "max-h-full shrink-0 overflow-y-auto"
+        }`}
+      >
+      {detail && !editing && detail.node.kind === "class" &&
         (() => {
-          const info = neighborCache.get(detail.node.id);
-          const neighbors = info?.neighbors ?? [];
-          const relatedEdges = info?.relatedEdges ?? [];
-          const edgeCount = relatedEdges.length;
-          const neighborCount = neighbors.length;
+          const classIri = detail.node.iri;
+          const relatedProps = (propsQ.data ?? []).filter(
+            (p) =>
+              iriLooseEq(p.domain ?? "", classIri) ||
+              iriLooseEq(p.range ?? "", classIri),
+          );
+          const attrs = relatedProps.filter((p) => p.kind === "datatype");
+          const rels = relatedProps.filter((p) => p.kind === "object");
+          const parents = edges
+            .filter((e) => e.kind === "hierarchy" && e.source === detail.node.id)
+            .map((e) => nodes.find((n) => n.id === e.target))
+            .filter(Boolean) as ConceptNode[];
+          const children = edges
+            .filter((e) => e.kind === "hierarchy" && e.target === detail.node.id)
+            .map((e) => nodes.find((n) => n.id === e.source))
+            .filter(Boolean) as ConceptNode[];
+          const labelOfIri = (iri: string) => {
+            const n = nodes.find((x) => iriLooseEq(x.iri, iri));
+            if (n?.label) return n.label;
+            const meta = (classMetasQ.data ?? []).find((m) =>
+              iriLooseEq(m.iri, iri),
+            );
+            return meta?.label || iri.split(/[#/]/).pop() || iri;
+          };
           return (
             <div
-              className="pointer-events-auto absolute right-3 top-16 z-20 w-64 rounded-lg border border-border bg-surface/98 p-3 shadow-lg backdrop-blur-sm"
+              className="p-3"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="flex items-center justify-between">
@@ -1048,57 +1696,119 @@ export function ConceptGraph({
                   <X size={12} />
                 </button>
               </div>
-              <div className="mt-1 text-[10px] text-fg-subtle">
-                {detail.node.kindText ??
-                  (detail.node.kind === "class"
-                    ? "owl:Class"
-                    : "owl:DatatypeProperty")}
-              </div>
+              <div className="mt-1 text-[11px] text-fg-subtle">owl:Class</div>
               <div className="mt-1 break-all text-[10px] text-fg-subtle/60">
                 {detail.node.iri}
               </div>
-
-              {/* 统计信息 */}
-              <div className="mt-2 flex gap-3 border-t border-border pt-2 text-[10px] text-fg-subtle">
-                <span className="inline-flex items-center gap-1">
-                  <Info size={10} />
-                  {neighborCount} 邻居
-                </span>
-                <span className="inline-flex items-center gap-1">
-                  <Share2 size={10} />
-                  {edgeCount} 边
-                </span>
-              </div>
-
-              {/* 邻居列表 */}
-              {neighbors.length > 0 && (
-                <div className="mt-2 max-h-28 overflow-y-auto border-t border-border pt-1.5">
-                  <div className="mb-1 text-[10px] font-medium text-fg-subtle">
-                    关联节点
-                  </div>
-                  {neighbors.map((nb) => (
-                    <div
-                      key={nb.id}
-                      className="flex items-center gap-1.5 rounded px-1 py-0.5 text-[10px] transition hover:bg-bg-hover"
-                    >
-                      <span
-                        className={`inline-block h-1.5 w-1.5 shrink-0 rounded-${
-                          nb.kind === "class" ? "full" : "sm"
-                        } ${
-                          nb.kind === "class" ? "bg-blue-500" : "bg-amber-500"
-                        }`}
-                      />
-                      <span className="truncate">{nb.label}</span>
-                      <span className="ml-auto shrink-0 text-fg-subtle/50">
-                        {nb.kind === "class" ? "类" : "属性"}
-                      </span>
-                    </div>
-                  ))}
-                </div>
+              {anchorGateMsg && (
+                <p className="mt-2 text-[10px] text-amber-700">{anchorGateMsg}</p>
               )}
 
-              {/* 操作按钮 */}
-              <div className="mt-2 flex gap-1 border-t border-border pt-1.5">
+              <div className="mt-2 max-h-40 space-y-2 overflow-y-auto border-t border-border pt-1.5">
+                <div>
+                  <div className="mb-0.5 text-[11px] font-medium text-fg-subtle">
+                    属性
+                    <span className="ml-1 text-fg-subtle/60">({attrs.length})</span>
+                  </div>
+                  {attrs.length === 0 ? (
+                    <p className="text-[11px] text-fg-subtle/60">无</p>
+                  ) : (
+                    attrs.map((p) => (
+                      <button
+                        key={p.iri}
+                        type="button"
+                        className="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-[11.5px] text-fg hover:bg-bg-hover"
+                        onClick={() => applyPropertySelect(p.iri, "datatype")}
+                      >
+                        <span className="truncate">
+                          {p.label || p.iri.split(/[#/]/).pop()}
+                        </span>
+                        {p.range && (
+                          <span className="ml-auto shrink-0 truncate text-fg-subtle">
+                            → {p.range.split(/[#/]/).pop()}
+                          </span>
+                        )}
+                      </button>
+                    ))
+                  )}
+                </div>
+                <div>
+                  <div className="mb-0.5 text-[11px] font-medium text-fg-subtle">
+                    关系
+                    <span className="ml-1 text-fg-subtle/60">({rels.length})</span>
+                  </div>
+                  {rels.length === 0 ? (
+                    <p className="text-[11px] text-fg-subtle/60">无</p>
+                  ) : (
+                    rels.map((p) => (
+                      <button
+                        key={p.iri}
+                        type="button"
+                        className="flex w-full items-center gap-1 rounded px-1 py-0.5 text-left text-[11.5px] text-fg hover:bg-bg-hover"
+                        onClick={() => applyPropertySelect(p.iri, "object")}
+                      >
+                        <span className="truncate">
+                          {p.label || p.iri.split(/[#/]/).pop()}
+                        </span>
+                        <span className="ml-auto shrink-0 truncate text-fg-subtle">
+                          → {labelOfIri(p.range || "")}
+                        </span>
+                      </button>
+                    ))
+                  )}
+                </div>
+                <div>
+                  <div className="mb-0.5 text-[11px] font-medium text-fg-subtle">
+                    继承
+                    <span className="ml-1 text-fg-subtle/60">
+                      ({parents.length + children.length})
+                    </span>
+                  </div>
+                  {parents.length === 0 && children.length === 0 ? (
+                    <p className="text-[11px] text-fg-subtle/60">无</p>
+                  ) : (
+                    <>
+                      {parents.map((n) => (
+                        <div
+                          key={`p-${n.id}`}
+                          className="truncate px-1 py-0.5 text-[11.5px] text-fg-subtle"
+                        >
+                          ⊑ {n.label}
+                        </div>
+                      ))}
+                      {children.map((n) => (
+                        <div
+                          key={`c-${n.id}`}
+                          className="truncate px-1 py-0.5 text-[11.5px] text-fg-subtle"
+                        >
+                          {n.label} ⊑ …
+                        </div>
+                      ))}
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="mt-2 flex flex-wrap gap-1 border-t border-border pt-1.5 [&>button]:whitespace-nowrap">
+                {ontologyIri && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => openClassEdit(detail.node.iri)}
+                      className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] transition hover:bg-bg-hover"
+                    >
+                      <Pencil size={11} /> 编辑
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => deleteClassFromCard(detail.node.iri)}
+                      disabled={deleteClass.isPending}
+                      className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] text-red-600 transition hover:bg-bg-hover disabled:opacity-40"
+                    >
+                      <Trash2 size={11} /> 删除
+                    </button>
+                  </>
+                )}
                 <button
                   type="button"
                   onClick={() => {
@@ -1106,34 +1816,356 @@ export function ConceptGraph({
                       ?.writeText(detail.node.iri)
                       .catch(() => {});
                   }}
-                  className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] transition hover:bg-bg-hover"
+                  className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] transition hover:bg-bg-hover"
                 >
-                  <Copy size={10} /> 复制 IRI
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    window.open(detail.node.iri, "_blank", "noopener");
-                  }}
-                  className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] transition hover:bg-bg-hover"
-                >
-                  <ExternalLink size={10} /> 打开
+                  <Copy size={11} /> 复制 IRI
                 </button>
                 {onJumpToSource && (
                   <button
                     type="button"
-                    onClick={() => {
-                      onJumpToSource(detail.node.iri);
-                    }}
-                    className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] transition hover:bg-bg-hover"
+                    onClick={() => onJumpToSource(detail.node.iri)}
+                    className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] transition hover:bg-bg-hover"
                   >
-                    <FileCode2 size={10} /> 源码
+                    <FileCode2 size={11} /> 源码
                   </button>
                 )}
               </div>
             </div>
           );
         })()}
+
+      {/* 属性 / 关系查看卡 */}
+      {propView && !editing && !detail && (
+        <div className="p-3" onClick={(e) => e.stopPropagation()}>
+          {(() => {
+            const prop = (propsQ.data ?? []).find((x) => x.iri === propView.iri);
+            const isRel = propView.kind === "object";
+            const title =
+              prop?.label || propView.iri.split(/[#/]/).pop() || propView.iri;
+            const canBack = !!(anchorClassIri || prop?.domain);
+            return (
+              <>
+                <div className="flex items-center justify-between gap-1">
+                  <div className="flex min-w-0 items-center gap-1">
+                    {canBack && (
+                      <button
+                        type="button"
+                        onClick={() => backFromPropView(prop?.domain)}
+                        className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[10px] text-fg-subtle hover:bg-bg-hover hover:text-fg"
+                        title="返回所属类"
+                      >
+                        <ArrowLeft size={12} />
+                        返回
+                      </button>
+                    )}
+                    <h3 className="truncate text-sm font-semibold">{title}</h3>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={closeDetail}
+                    className="shrink-0 rounded p-0.5 text-fg-subtle hover:bg-bg-hover"
+                    title="关闭"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+                <div className="mt-1 text-[11px] text-fg-subtle">
+                  {isRel ? "关系（ObjectProperty）" : "属性（DatatypeProperty）"}
+                </div>
+                <div className="mt-1 break-all text-[10px] text-fg-subtle/60">
+                  {propView.iri}
+                </div>
+                {anchorGateMsg && (
+                  <p className="mt-2 text-[11px] text-amber-700">{anchorGateMsg}</p>
+                )}
+                <div className="mt-2 space-y-0.5 text-[11.5px] text-fg-subtle">
+                  {prop?.domain && (
+                    <div className="truncate">
+                      所属类：{prop.domain.split(/[#/]/).pop()}
+                    </div>
+                  )}
+                  {prop?.range && (
+                    <div className="truncate">
+                      {isRel ? "目标类" : "数据类型"}：
+                      {prop.range.split(/[#/]/).pop()}
+                    </div>
+                  )}
+                  {prop?.comment && (
+                    <div className="mt-1 text-[11.5px] text-fg">{prop.comment}</div>
+                  )}
+                </div>
+                {ontologyIri && (
+                  <div className="mt-2 flex gap-1 border-t border-border pt-1.5">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        openPropertyEdit(propView.iri, propView.kind)
+                      }
+                      className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] transition hover:bg-bg-hover"
+                    >
+                      <Pencil size={11} /> 编辑
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => deletePropertyFromCard(propView.iri)}
+                      disabled={deleteProp.isPending}
+                      className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] text-red-600 transition hover:bg-bg-hover disabled:opacity-40"
+                    >
+                      <Trash2 size={11} /> 删除
+                    </button>
+                    {onJumpToSource && (
+                      <button
+                        type="button"
+                        onClick={() => onJumpToSource(propView.iri)}
+                        className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] transition hover:bg-bg-hover"
+                      >
+                        <FileCode2 size={11} /> 源码
+                      </button>
+                    )}
+                  </div>
+                )}
+              </>
+            );
+          })()}
+        </div>
+      )}
+
+      {/* 边详情：关系/属性定义 查看 + 编辑/删除入口 */}
+      {edgeDetail && !editing && !detail && (
+        <div
+          className="p-3"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-semibold">
+              {edgeDetail.label || edgeDetail.kindText || edgeDetail.kind}
+            </h3>
+            <button
+              type="button"
+              onClick={() => {
+                setEdgeDetail(null);
+                emitSelection(null);
+              }}
+              className="rounded p-0.5 text-fg-subtle hover:bg-bg-hover"
+            >
+              <X size={12} />
+            </button>
+          </div>
+          <div className="mt-1 text-[11px] text-fg-subtle">
+            {edgeDetail.kind === "hierarchy"
+              ? "父子关系（rdfs:subClassOf）"
+              : edgeDetail.kind === "object"
+                ? "对象属性定义（domain → range）"
+                : "数据属性定义（domain → 数据类型）"}
+          </div>
+          <div className="mt-2 space-y-0.5 text-[11px] text-fg-subtle/70">
+            <div className="truncate">源：{nodes.find((n) => n.id === edgeDetail.source)?.iri ?? edgeDetail.source}</div>
+            <div className="truncate">目标：{nodes.find((n) => n.id === edgeDetail.target)?.iri ?? edgeDetail.target}</div>
+            {edgeDetail.predIri && <div className="truncate">谓词：{edgeDetail.predIri}</div>}
+          </div>
+          {ontologyIri && (
+            <div className="mt-2 flex gap-1 border-t border-border pt-1.5">
+              {edgeDetail.kind === "hierarchy" ? (
+                <button
+                  type="button"
+                  onClick={() => openClassEdit(edgeDetail.source)}
+                  className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] transition hover:bg-bg-hover"
+                >
+                  <Pencil size={11} /> 编辑父类
+                </button>
+              ) : (
+                edgeDetail.predIri && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        openPropertyEdit(edgeDetail.predIri!, edgeDetail.kind === "object" ? "object" : "datatype")
+                      }
+                      className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] transition hover:bg-bg-hover"
+                    >
+                      <Pencil size={11} /> 编辑
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => deletePropertyFromCard(edgeDetail.predIri!)}
+                      disabled={deleteProp.isPending}
+                      className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] text-red-600 transition hover:bg-bg-hover disabled:opacity-40"
+                    >
+                      <Trash2 size={11} /> 删除
+                    </button>
+                  </>
+                )
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 编辑面板：类（label/comment/父类）或属性（label/comment/domain/range）
+          纵向 flex 布局。有变更清单时撑满父容器（页脚贴底、表单区内滚）；
+          无变更清单时父容器按内容自适应，此时不能再 h-full（会塌缩/撑高），
+          改为随内容自然高度。 */}
+      {editing && (
+        <div
+          className={`flex min-h-0 flex-col p-3 ${
+            sidebarBottom ? "h-full" : ""
+          }`}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="flex shrink-0 items-center justify-between">
+            <h3 className="text-sm font-semibold">
+              {editing.type === "class"
+                ? "编辑类"
+                : editing.kind === "object"
+                  ? "编辑关系"
+                  : "编辑属性"}
+            </h3>
+            <button
+              type="button"
+              onClick={cancelEdit}
+              className="rounded p-0.5 text-fg-subtle hover:bg-bg-hover"
+              title="关闭"
+            >
+              <X size={12} />
+            </button>
+          </div>
+          <div className="mt-1 shrink-0 break-all text-[10px] text-fg-subtle/60">{editing.iri}</div>
+
+          <div className={`mt-2 min-h-0 space-y-2 overflow-y-auto text-[13px] ${
+            sidebarBottom ? "flex-1" : ""
+          }`}>
+            <label className="block">
+              <span className="text-[11px] text-fg-subtle">rdfs:label</span>
+              <input
+                className="mt-0.5 w-full rounded border border-border bg-transparent px-1.5 py-1 text-[13px] outline-none focus:border-accent"
+                value={form.label}
+                onChange={(e) => setForm({ ...form, label: e.target.value })}
+                placeholder="中文名称"
+              />
+            </label>
+            <label className="block">
+              <span className="text-[11px] text-fg-subtle">rdfs:comment</span>
+              <textarea
+                className="mt-0.5 w-full rounded border border-border bg-transparent px-1.5 py-1 text-[13px] outline-none focus:border-accent"
+                rows={2}
+                value={form.comment}
+                onChange={(e) => setForm({ ...form, comment: e.target.value })}
+                placeholder="定义说明"
+              />
+            </label>
+
+            {editing.type === "class" ? (
+              <div>
+                <span className="text-[11px] text-fg-subtle">父类（rdfs:subClassOf，可多选）</span>
+                <div className="mt-1 max-h-28 space-y-0.5 overflow-y-auto rounded border border-border p-1">
+                  {(classIrisQ.data ?? [])
+                    .filter((c) => c !== editing.iri)
+                    .map((c) => {
+                      const short = c.split(/[#/]/).pop() ?? c;
+                      return (
+                        <label key={c} className="flex items-center gap-1.5 text-[12px]">
+                          <input
+                            type="checkbox"
+                            checked={form.parents.includes(c)}
+                            onChange={(e) =>
+                              setForm({
+                                ...form,
+                                parents: e.target.checked
+                                  ? [...form.parents, c]
+                                  : form.parents.filter((x) => x !== c),
+                              })
+                            }
+                          />
+                          <span className="truncate">{short}</span>
+                        </label>
+                      );
+                    })}
+                </div>
+              </div>
+            ) : (
+              <>
+                <label className="block">
+                  <span className="text-[11px] text-fg-subtle">
+                    {editing.kind === "object" ? "源端类" : "所属类"}
+                  </span>
+                  <select
+                    className="mt-0.5 w-full rounded border border-border bg-transparent px-1 py-1 text-[13px] outline-none"
+                    value={form.domain}
+                    onChange={(e) => setForm({ ...form, domain: e.target.value })}
+                  >
+                    <option value="">（未设置）</option>
+                    {(classIrisQ.data ?? []).map((c) => (
+                      <option key={c} value={c}>
+                        {c.split(/[#/]/).pop()}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="block">
+                  <span className="text-[11px] text-fg-subtle">
+                    {editing.kind === "object" ? "目标类" : "数据类型"}
+                  </span>
+                  {editing.kind === "object" ? (
+                    <select
+                      className="mt-0.5 w-full rounded border border-border bg-transparent px-1 py-1 text-[13px] outline-none"
+                      value={form.range}
+                      onChange={(e) => setForm({ ...form, range: e.target.value })}
+                    >
+                      <option value="">（未设置）</option>
+                      {(classIrisQ.data ?? []).map((c) => (
+                        <option key={c} value={c}>
+                          {c.split(/[#/]/).pop()}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      className="mt-0.5 w-full rounded border border-border bg-transparent px-1.5 py-1 text-[13px] outline-none focus:border-accent"
+                      value={form.range}
+                      onChange={(e) => setForm({ ...form, range: e.target.value })}
+                      placeholder="xsd:string"
+                    />
+                  )}
+                </label>
+                <p className="text-[11px] text-fg-subtle/70">
+                  类型已固定为{editing.kind === "object" ? "关系" : "属性"}；若需改类型请删除后新建。
+                </p>
+              </>
+            )}
+          </div>
+
+          {formErr && <p className="mt-2 text-[11px] text-red-600">{formErr}</p>}
+          {formOk && <p className="mt-2 text-[11px] text-green-600">{formOk}</p>}
+
+          {/* 页脚固定：不参与表单区滚动 */}
+          <div className="mt-2 flex shrink-0 gap-1 border-t border-border pt-2">
+            <button
+              type="button"
+              onClick={cancelEdit}
+              disabled={editClass.isPending || editProp.isPending}
+              className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] transition hover:bg-bg-hover disabled:opacity-40"
+            >
+              <X size={11} /> 取消
+            </button>
+            <button
+              type="button"
+              onClick={saveEdit}
+              disabled={editClass.isPending || editProp.isPending}
+              className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] font-medium text-accent transition hover:bg-accent/10 disabled:opacity-40"
+            >
+              <Check size={11} /> 保存
+            </button>
+          </div>
+        </div>
+      )}
+      </div>
+      )}
+      {/* 下段：变更清单 */}
+      {sidebarBottom && (
+        <div className="flex min-h-0 flex-1 flex-col">{sidebarBottom}</div>
+      )}
+      </aside>
+      )}
     </div>
   );
 }

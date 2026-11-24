@@ -251,7 +251,7 @@ export function ValidationReport({ ontologyIri }: { ontologyIri: string | null }
                 {errorCount === 0 ? "通过" : `${errorCount} error`}
               </div>
               <div className={own.rsSub}>
-                检测零 LLM：语法解析 · 结构规范 · 逻辑一致性
+                语法解析 · 结构规范 · 逻辑一致性
                 <br />
                 error {errorCount} · warning {warningCount} · suggestion {sugCount}
               </div>
@@ -367,7 +367,13 @@ export function ValidationReport({ ontologyIri }: { ontologyIri: string | null }
                                 : styles.stOpen
                         }
                       >
-                        {String(issue.status)}
+                        {String(issue.status) === "accepted"
+                          ? "采纳 B"
+                          : String(issue.status) === "overruled"
+                            ? "采纳 A"
+                            : String(issue.status) === "disputed"
+                              ? "待裁决"
+                              : "待处理"}
                       </span>
                     </td>
                   </tr>

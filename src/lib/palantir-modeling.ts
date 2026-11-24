@@ -11,6 +11,7 @@
  * 语义映射（TtlPropertyEdit ↔ Palantir）：
  *   datatype 属性 → PropertyDef { api_name, display_name, data_type }（domain=所属 OT）
  *   object   关系 → LinkDef { api_name, display_name, target_object_type_api_name, cardinality }
+ *                         cardinality ∈ ONE|MANY（Gaia 契约，非四元组；M:N 拆中间 OT）
  *
  * 写入安全网（对齐后端 store.rs）：
  *   - preview_import 的 errors 非空必须阻断应用
@@ -56,15 +57,33 @@ export const DATA_TYPES = [
 
 export type DataType = (typeof DATA_TYPES)[number];
 
-/** LinkType 基数（对齐 Gaia cardinality 语义）。 */
-export const CARDINALITIES = [
-    "ONE_TO_ONE",
-    "ONE_TO_MANY",
-    "MANY_TO_ONE",
-    "MANY_TO_MANY",
-] as const;
+/**
+ * LinkType 基数（**对齐 Gaia `LinkTypeDefCreate.cardinality: Literal["ONE","MANY"]`**）。
+ *
+ * 只有两值，不是四元组——这是 Gaia 契约（后端 store.rs::validate_link +
+ * schema.rs CHECK 同源），语义见 CARDINALITY_HINTS：
+ *   - ONE  = 严格 1:1
+ *   - MANY = 关系里存在「多」的一端（1:N 与 N:1 都填 MANY，不做区分）
+ * 方向由 source→target 声明（LinkDef 无 direction 字段，source 侧即隐含 outgoing），
+ * 所以 M:N 不能直接建，必须拆中间 ObjectType（见 CARDINALITY_HELP）。
+ */
+export const CARDINALITIES = ["ONE", "MANY"] as const;
 
 export type Cardinality = (typeof CARDINALITIES)[number];
+
+/** 基数的用户可读说明（下拉选项文案 + 表单提示共用，避免两处漂移）。 */
+export const CARDINALITY_HINTS: Record<Cardinality, string> = {
+    ONE: "ONE（严格 1:1，两端各一个）",
+    MANY: "MANY（存在「多」端：1:N 或 N:1 都填 MANY）",
+};
+
+/**
+ * 基数选择处的常驻提示（对齐 Gaia 建模方法论，用户最容易误解的三点）。
+ */
+export const CARDINALITY_HELP =
+    "基数只有 ONE / MANY 两档：ONE 仅用于严格 1:1；只要关系里存在「多」的一端就填 MANY" +
+    "（1:N、N:1 不区分，方向由本关系声明的 源→目标 表达）。多对多不能直接建，" +
+    "需先建一个中间对象类型（如 SupplierMaterialRel），再拆成两组 1:N。";
 
 const PASCAL_CASE = /^[A-Z][a-zA-Z0-9]{0,99}$/;
 const CAMEL_CASE = /^[a-z][a-zA-Z0-9]{0,99}$/;
@@ -210,7 +229,11 @@ export function validateLinkDraft(
         return `目标对象类型「${d.targetObjectTypeName}」未在本体中定义`;
     }
     if (!isValidCardinality(d.cardinality)) {
-        return `基数「${d.cardinality}」不在合法枚举内`;
+        return (
+            `基数「${d.cardinality}」不在合法枚举内（只接受 ${CARDINALITIES.join(
+                " / ",
+            )}；1:N 与 N:1 统一填 MANY，多对多需拆中间对象类型）`
+        );
     }
     return null;
 }

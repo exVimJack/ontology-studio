@@ -21,6 +21,11 @@ uuid.workspace = true
 # ── api_name pattern 校验（对齐 Gaia naming.py） ──
 regex = "1"
 
+# ── XLSX 写（映射导出多工作表）──
+# rust_xlsxwriter：MIT OR Apache-2.0，纯 Rust，无 C/系统依赖（守原则 1/3）。
+# 见 ARCHITECTURE.md 决策 4：XLSX 写选用 rust_xlsxwriter，此前因未实现而暂缺依赖。
+rust_xlsxwriter = "0.102"
+
 # ── IPC 类型导出（OntologySummary 等 DTO 需 #[derive(specta::Type)] 暴给前端）──
 # 与 src-tauri 的 tauri-specta 2.0-rc 配套（specta 2.0.0-rc.25）。
 specta = { version = "2.0.0-rc.25", features = ["derive", "serde_json"] }
@@ -32,3 +37,8 @@ specta-typescript = "0.0.12"
 # 守 AGENTS.md 原则 2 轻量化）。持久化走 SQLite 存 .ttl 文本（见 ttl.rs），oxigraph 仅做内存校验/查询。
 # 推理暂不内置（对齐 oxigraph 官方设计决策 + AGENTS.md 原则 2 轻量化）。
 oxigraph = { version = "0.5", default-features = false }
+
+# ── XLSX 读（仅测试用：回读自己生成的字节，验证 sheet 名/表头/单元格真实可解析）──
+# dev-dependency 不进生产二进制；与 crates/ingest 用同一读库（类型保真）。
+[dev-dependencies]
+calamine = "0.36"

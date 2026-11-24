@@ -34,7 +34,7 @@ impl TtlStore {
 impl TtlStore {
     /// 写入/更新本体设计宪章（不变点）。
     ///
-    /// **charter 不随历史变化**——它记录本体的业务本质说明，不随实体增删改而变更。
+    /// **charter 不随历史变化**——它记录本体的业务场景与业务目标，不随实体增删改而变更。
     /// 只有用户明确要求调整 charter 时才调用；常规增量更新不应触碰 charter。
     /// 冷启动建模时，如历史对话已提及业务场景/本质/意图，应主动提取后调用本工具落库。
     /// import_ttl 不覆盖 charter（写入路径分离）。
@@ -90,7 +90,33 @@ impl TtlStore {
                 r.errors
             )));
         }
+        // 名称单独落列：骨架 TTL 头部也带 rdfs:label，但后续 agent 全量导入
+        // 提交的 TTL 未必保留它——列是名称的稳定来源（见 init_ttl_schema 注释）。
+        self.set_display_name(ontology_iri, display_name)?;
         self.set_charter(ontology_iri, charter)
+    }
+
+    /// 写入本体显示名（用户填的业务名）；空串表示未命名。
+    pub fn set_display_name(&self, ontology_iri: &str, display_name: &str) -> StoreResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE ontology_ttl SET display_name = ?2 WHERE ontology_iri = ?1",
+            rusqlite::params![ontology_iri, display_name.trim()],
+        )?;
+        Ok(())
+    }
+
+    /// 读取本体显示名（未命名时返回空串，由调用方决定回退口径）。
+    pub fn get_display_name(&self, ontology_iri: &str) -> StoreResult<String> {
+        let conn = self.conn.lock().unwrap();
+        let name: Option<String> = conn
+            .query_row(
+                "SELECT display_name FROM ontology_ttl WHERE ontology_iri=?1",
+                rusqlite::params![ontology_iri],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(name.unwrap_or_default())
     }
 }
 

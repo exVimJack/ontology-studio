@@ -215,7 +215,7 @@ export function ValidationPanel({
             avatarCls={own.tlAvatarSys}
             who="规则引擎"
             meta="· validate"
-            text={`规则检查完成：error ×${errorCount} · warning ×${warningCount} · suggestion ×${suggestionCount}。error 直接进入修订列表（B 不参与），warning 可发起答辩。`}
+            text={`规则检查完成：error ×${errorCount} · warning ×${warningCount} · suggestion ×${suggestionCount}。error 直接进入修订列表（B 不参与），warning/suggestion 在语义评审的 A 修订环节统一处理（接受即改 / 带证据异议）。`}
           />
           <TimelineItem
             avatar="M"
@@ -238,7 +238,7 @@ export function ValidationPanel({
       {/* Issue 列表 */}
       <div className={own.listHead}>
         <span className={own.listTitle}>Issue 列表</span>
-        <span className={own.listHint}>点击卡片展开证据与操作 · warning 可答辩</span>
+        <span className={own.listHint}>点击卡片展开证据与操作 · warning/suggestion 待语义评审统一处理</span>
       </div>
       {issues.isLoading && <div className={styles.hint}>加载中…</div>}
       {issues.isError && (
@@ -353,7 +353,9 @@ export function IssueCard({
               {issue.dispute.verdict && (
                 <div className={own.disputeVerdict}>
                   <b>裁决（{issue.dispute.resolved_by}）：</b>
-                  {issue.dispute.verdict === "overruled" ? "撤销" : "升级 error"}
+                  {issue.dispute.verdict === "overruled"
+                    ? "采纳 A（告警撤销，不用改）"
+                    : "采纳 B（升级 error，按建议修改）"}
                 </div>
               )}
             </div>

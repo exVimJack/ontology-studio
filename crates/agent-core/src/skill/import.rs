@@ -2,7 +2,7 @@
 //!
 //! 复用基础设施：
 //!   - `ingest::security::{check_size, ArchiveBudget}`：预校验压缩包大小 + 累计展开字节
-//!   - `agent_skills::SkillDirectory::load`：校验源目录是合法 skill（SKILL.md + name 匹配目录名）
+//!   - `super::load_skill_at`：校验源目录是合法 skill（SKILL.md + name 匹配目录名）
 //!   - `memory::Memory::remove_skill_records`：卸载时清 DB 记录
 //!
 //! ingest 没有现成的 `extract_zip_safe`，只有防护原语——解压循环在此自建。
@@ -11,20 +11,29 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use agent_skills::SkillDirectory;
-
-use super::{SkillError, SkillManager};
+use super::{load_skill_at, SkillError, SkillManager};
 
 impl SkillManager {
     /// 导入本地 skill 目录：复制到 `~/.onto-studio/skills/<name>/`。
     ///
-    /// 先用 Govcraft 校验合法性（SKILL.md 存在 + name 匹配目录名），再递归复制
+    /// 先用共享加载器校验合法性（SKILL.md 存在且可解析 + name 匹配目录名），再递归复制
     /// （含 scripts/references/assets 子目录）。已存在则报错（用户需先卸载）。
     pub fn import_from_dir(&self, src_dir: &Path) -> Result<String, SkillError> {
-        // 1. 用 Govcraft 校验源目录是合法 skill
-        let skill_dir = SkillDirectory::load(src_dir)
-            .map_err(|e| SkillError::InvalidSkill(e.to_string()))?;
-        let name = skill_dir.skill().name().as_str().to_string();
+        // 1. 校验源目录是合法 skill（与 super::load_skill_at 一整套，不再走上游 API）
+        if !src_dir.is_dir() {
+            return Err(SkillError::InvalidSkill(format!(
+                "目录不存在或不是目录：{}",
+                src_dir.display()
+            )));
+        }
+        let skill = load_skill_at(src_dir).map_err(|e| match e {
+            // 上游 API 时代这些串统一归入 InvalidSkill，保持前端提示口径不变
+            SkillError::Load(msg) | SkillError::InvalidSkill(msg) => {
+                SkillError::InvalidSkill(msg)
+            }
+            other => other,
+        })?;
+        let name = skill.name().as_str().to_string();
 
         // 2. 目标路径：user_dir/<name>/
         let dest = self.user_dir.join(&name);
@@ -59,6 +68,8 @@ impl SkillManager {
         // 2. 解压到临时目录，用 ArchiveBudget 累计展开字节防炸弹
         let temp = std::env::temp_dir().join(format!("onto-skill-import-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp).map_err(|e| SkillError::Io(e.to_string()))?;
+        // 临时目录守卫：校验/复制任何提前返回或失败都要清掉，不随失败次数累积
+        let _temp_guard = TempDirGuard(temp.clone());
         let file = File::open(zip_path).map_err(|e| SkillError::Io(e.to_string()))?;
         let mut archive = ZipArchive::new(file).map_err(|e| SkillError::Zip(e.to_string()))?;
         let mut budget = ArchiveBudget::new();
@@ -121,7 +132,6 @@ impl SkillManager {
         let name = self.import_from_dir(&skill_root)?;
 
         // 5. 清理临时目录
-        let _ = fs::remove_dir_all(&temp);
         tracing::info!(skill = %name, "skill imported from zip");
         Ok(name)
     }
@@ -221,6 +231,16 @@ fn find_skill_subdir(temp: &Path) -> Option<PathBuf> {
     None
 }
 
+/// 临时目录守卫：Drop 时尽力删除，保证 zip 导入在任何提前返回 / 失败路径上
+/// 都不在 `%TEMP%` 里留下 `onto-skill-import-*` 残骸。Drop 内不得 panic（删除失败静默）。
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +307,149 @@ mod tests {
 
         let err = mgr.import_from_dir(&src.join("empty")).unwrap_err();
         assert!(matches!(err, SkillError::InvalidSkill(_)));
+    }
+
+    /// 行尾变体夹具：CRLF（Windows 检出 / 记事本编辑的技能包就是这种形态）。
+    /// 既有 `write_skill` 用 `\n` 写文件——这正是导入路径的 CRLF 缺陷一直没被测到的原因。
+    fn write_skill_crlf(dir: &Path, name: &str, description: &str) {
+        let skill_dir = dir.join(name);
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\r\nname: {name}\r\nlicense: MIT\r\ndescription: {description}\r\n---\r\n# {name}\r\n\r\n正文内容\r\n",
+            )
+        )
+        .unwrap();
+    }
+
+    /// 修复前这里 panic：上游 `find_closing_delimiter` 在 CRLF 上每行少算 1 字节，
+    /// 累计漂移后切片落进「版」字中间 → `not a char boundary`。
+    #[test]
+    fn import_from_dir_accepts_crlf_skill_md_with_multibyte_frontmatter() {
+        let root = temp_root();
+        let src = root.join("src");
+        let user = root.join("user");
+        write_skill_crlf(&src, "crlf-imp-skill", "中文版测试技能");
+        let mgr = make_manager(&user);
+
+        let name = mgr
+            .import_from_dir(&src.join("crlf-imp-skill"))
+            .expect("CRLF + 中文 frontmatter 的技能目录应导入成功");
+        assert_eq!(name, "crlf-imp-skill");
+        assert!(user.join("crlf-imp-skill").join("SKILL.md").exists());
+    }
+
+    /// 归一化只作用于解析输入：MUST NOT 改写用户磁盘上的源文件。
+    #[test]
+    fn import_does_not_rewrite_source_line_endings() {
+        let root = temp_root();
+        let src = root.join("src");
+        let user = root.join("user");
+        write_skill_crlf(&src, "keep-eol-skill", "保留行尾");
+        let src_md = src.join("keep-eol-skill").join("SKILL.md");
+        let before = fs::read(&src_md).unwrap();
+        assert!(
+            before.windows(2).any(|w| w == b"\r\n"),
+            "夹具本身必须是 CRLF，否则本用例没有意义"
+        );
+        let mgr = make_manager(&user);
+
+        mgr.import_from_dir(&src.join("keep-eol-skill")).unwrap();
+
+        assert_eq!(fs::read(&src_md).unwrap(), before, "源文件不得被改写");
+        assert_eq!(
+            fs::read(user.join("keep-eol-skill").join("SKILL.md")).unwrap(),
+            before,
+            "导入语义是复制，副本也必须原样保留"
+        );
+    }
+
+    /// 静默错位型：漂移恰好落在字节边界时不 panic，但 body 起点会提前到 frontmatter
+    /// 尾部。归一化后正文开头不该出现任何 frontmatter 残片。
+    #[test]
+    fn import_from_crlf_skill_body_has_no_frontmatter_residue() {
+        let root = temp_root();
+        let src = root.join("src");
+        let user = root.join("user");
+        // 纯 ASCII frontmatter：正是「不报错但错位」的那一档
+        write_skill_crlf(&src, "ascii-eol-skill", "plain ascii description line");
+        let mgr = make_manager(&user);
+        mgr.import_from_dir(&src.join("ascii-eol-skill")).unwrap();
+
+        let mut rec = mgr
+            .discover_all()
+            .into_iter()
+            .find(|r| r.name == "ascii-eol-skill")
+            .expect("导入的技能应被发现");
+        let id = mgr.ensure_skill_documented(&mut rec).unwrap();
+        let read = mgr.memory.read_document(&id, None, None).unwrap();
+        let (_, _, _, text, _) = read.unwrap();
+        assert!(
+            !text.trim_start().starts_with('-'),
+            "正文开头不应带 frontmatter 残片: {text:?}"
+        );
+        assert!(
+            text.contains("# ascii-eol-skill"),
+            "正文应为 SKILL.md 的正文: {text:?}"
+        );
+        assert!(text.contains("正文内容"), "正文内容应完整: {text:?}");
+    }
+
+    /// 上游 `load` 的第 5 条校验（name == 目录名）必须原样保留。
+    #[test]
+    fn import_from_dir_rejects_name_mismatch() {
+        let root = temp_root();
+        let src = root.join("src");
+        let user = root.join("user");
+        fs::create_dir_all(src.join("wrong-dir-name")).unwrap();
+        fs::write(
+            src.join("wrong-dir-name").join("SKILL.md"),
+            "---\nname: other-name\ndescription: x\n---\n# body\n",
+        )
+        .unwrap();
+        let mgr = make_manager(&user);
+
+        let err = mgr
+            .import_from_dir(&src.join("wrong-dir-name"))
+            .expect_err("name 与目录名不一致应被拒绝");
+        assert!(matches!(err, SkillError::InvalidSkill(..)), "实际={err:?}");
+        assert!(
+            !user.join("other-name").exists() && !user.join("wrong-dir-name").exists(),
+            "校验失败不得留下任何复制产物"
+        );
+    }
+
+    #[test]
+    fn import_from_dir_rejects_nonexistent_dir() {
+        let root = temp_root();
+        let user = root.join("user");
+        let mgr = make_manager(&user);
+
+        let err = mgr
+            .import_from_dir(&root.join("nope"))
+            .expect_err("不存在的目录应被拒绝");
+        assert!(matches!(err, SkillError::InvalidSkill(..)), "实际={err:?}");
+    }
+
+    /// 临时目录守卫：Drop 必须删除目录，且删除失败时静默（Drop 内不得 panic）。
+    #[test]
+    fn temp_dir_guard_removes_dir_on_drop() {
+        let root = temp_root();
+        let target = root.join("guarded");
+        fs::create_dir_all(target.join("sub")).unwrap();
+        fs::write(target.join("sub").join("f.txt"), b"x").unwrap();
+
+        {
+            let _g = TempDirGuard(target.clone());
+            assert!(target.exists(), "持有期间不得删除");
+        }
+        assert!(!target.exists(), "Drop 后临时目录必须消失");
+
+        // 目录已不在：Drop 只能静默吞掉错误，不能 panic
+        {
+            let _g2 = TempDirGuard(target.clone());
+        }
     }
 
     #[test]

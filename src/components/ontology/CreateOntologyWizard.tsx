@@ -1,20 +1,28 @@
 // 新建本体宪章向导（宪章先行，ARCHITECTURE.md 决策 24）。
 //
-// 本体创建的唯一合法路径：用户在此确认设计宪章四字段 → 点「创建本体」
+// 本体创建的唯一合法路径：用户在此确认设计宪章两字段 → 点「创建本体」
 // → 空骨架本体 + 宪章原子落库（Rust 侧仅此 IPC 可创建本体；
 // agent 的 import 工具对不存在的 IRI 一律拒绝）。
 //
 // AI 只起草不落笔：AI 起草建议预填表单，用户逐字段采纳/修改后亲自保存，
 // 与「设计宪章」面板的用户主权红线一致（决策 22/23）。
+//
+// W3C：业务只填编码；完整 IRI = 设置中的前缀 + 编码 + #。
 
 import { useState } from "react";
 import { Loader2, Sparkles, X } from "lucide-react";
 
 import type { TtlCharter } from "@/lib/domain";
+import { CHARTER_FIELD_META } from "@/lib/charter-fields";
 import { suggestCharter } from "@/lib/charter-suggest";
+import {
+  buildOntologyIri,
+  isValidOntologyCode,
+} from "@/lib/ontology-iri";
 import { useProvider } from "@/hooks/useProvider";
 import { useCreateOntologyWithCharter } from "@/hooks/useOntology";
 import { useCreateOntologyTtlWithCharter } from "@/hooks/useOntologyTtl";
+import { useUiStore } from "@/stores/ui-store";
 
 type CharterDraft = {
   business_scenario: string;
@@ -25,26 +33,6 @@ const emptyCharter: CharterDraft = {
   business_scenario: "",
   business_essence: "",
 };
-
-const FIELD_META: {
-  key: keyof CharterDraft;
-  label: string;
-  hint: string;
-  placeholder: string;
-}[] = [
-  {
-    key: "business_scenario",
-    label: "业务场景",
-    hint: "服务于什么业务、谁用、解决什么问题",
-    placeholder: "例如：连接个人卖家、车商与买家的二手车交易平台……",
-  },
-  {
-    key: "business_essence",
-    label: "业务本质",
-    hint: "核心对象/状态/关系/行为的一句话概括",
-    placeholder: "例如：围绕非标实物的可信交易撮合……",
-  },
-];
 
 export function CreateOntologyWizard({
   variant,
@@ -70,14 +58,20 @@ export function CreateOntologyWizard({
   const [drafting, setDrafting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { data: provider } = useProvider();
+  const ontologyIriPrefix = useUiStore((s) => s.ontologyIriPrefix);
+  const setOntologySettingsOpen = useUiStore((s) => s.setOntologySettingsOpen);
 
   if (!open) return null;
 
-  const idLabel = variant === "ttl" ? "本体 IRI" : "api_name（PascalCase）";
+  const idLabel = variant === "ttl" ? "本体编码" : "api_name（PascalCase）";
   const idValid =
     variant === "ttl"
-      ? /^https?:\/\/\S+$/.test(id.trim())
+      ? isValidOntologyCode(id)
       : /^[A-Z][a-zA-Z0-9]{0,99}$/.test(id.trim());
+  const resolvedIri =
+    variant === "ttl" && idValid
+      ? buildOntologyIri(ontologyIriPrefix, id)
+      : "";
   const canCreate =
     idValid &&
     displayName.trim().length > 0 &&
@@ -126,16 +120,22 @@ export function CreateOntologyWizard({
       updated_by: "user",
       updated_at: 0,
     } as TtlCharter;
+    const createdId =
+      variant === "ttl" ? buildOntologyIri(ontologyIriPrefix, id) : id.trim();
     const opts = {
       onSuccess: () => {
-        onCreated(id.trim());
+        onCreated(createdId);
         onClose();
       },
       onError: (e: Error) => setError(e.message),
     };
     if (variant === "ttl") {
       createTtl.mutate(
-        { iri: id.trim(), displayName: displayName.trim(), charter },
+        {
+          iri: createdId,
+          displayName: displayName.trim(),
+          charter,
+        },
         opts,
       );
     } else {
@@ -172,36 +172,57 @@ export function CreateOntologyWizard({
 
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
           <p className="mb-3 text-[11px] text-fg-muted">
-            设计宪章是本体建模的前提（不变点）：定义业务场景、本质、意图与约束，
+            设计宪章是本体建模的前提（不变点）：定义业务场景与业务目标，
             AI 建模与后续演进都以它为基线。创建后仍可在「设计宪章」面板调整。
           </p>
 
-          <div className="grid grid-cols-2 gap-2">
+          <div className="grid grid-cols-2 items-start gap-2">
             <label className="block">
-              <span className="text-[10px] font-medium text-fg-subtle">
-                {idLabel}
+              {/* 两侧标签行统一高度，避免「修改前缀」把左侧输入框顶歪 */}
+              <span className="flex h-5 items-center justify-between gap-2">
+                <span className="text-[10px] font-medium text-fg-subtle">
+                  {idLabel}
+                </span>
+                {variant === "ttl" ? (
+                  <button
+                    type="button"
+                    onClick={() => setOntologySettingsOpen(true)}
+                    className="text-[10px] text-accent hover:underline"
+                  >
+                    修改前缀
+                  </button>
+                ) : (
+                  <span className="invisible text-[10px]" aria-hidden>
+                    —
+                  </span>
+                )}
               </span>
               <input
                 value={id}
                 onChange={(e) => setId(e.target.value)}
                 placeholder={
-                  variant === "ttl"
-                    ? "https://example.org/ontology/usedcar#UsedCarOntology"
-                    : "UsedCarOntology"
+                  variant === "ttl" ? "UsedCar" : "UsedCarOntology"
                 }
                 className="mt-0.5 w-full rounded-md border border-border bg-bg-base px-2 py-1 text-xs outline-none"
               />
+              {variant === "ttl" && resolvedIri && (
+                <span className="mt-0.5 block break-all text-[10px] text-fg-subtle">
+                  完整 IRI：{resolvedIri}
+                </span>
+              )}
               {id.length > 0 && !idValid && (
                 <span className="mt-0.5 block text-[10px] text-danger">
                   {variant === "ttl"
-                    ? "需为合法 IRI（http/https 开头，无空格）"
+                    ? "字母开头，仅字母数字、下划线或连字符"
                     : "需为 PascalCase（首字母大写，字母数字）"}
                 </span>
               )}
             </label>
             <label className="block">
-              <span className="text-[10px] font-medium text-fg-subtle">
-                名称
+              <span className="flex h-5 items-center">
+                <span className="text-[10px] font-medium text-fg-subtle">
+                  名称
+                </span>
               </span>
               <input
                 value={displayName}
@@ -245,7 +266,7 @@ export function CreateOntologyWizard({
           </div>
 
           <div className="mt-1.5 space-y-2">
-            {FIELD_META.map((f) => (
+            {CHARTER_FIELD_META.map((f) => (
               <label key={f.key} className="block">
                 <span className="flex items-baseline justify-between">
                   <span className="text-[10px] font-medium text-fg-subtle">

@@ -68,6 +68,23 @@ export type {
   TtlCharter,
   TtlChangelog,
   TtlPropertyEdit,
+  TtlClassEdit,
+  TtlClassMeta,
+  TtlVersionDiff,
+  TtlVersionSummary,
+  WorkspaceDiffRevokeItem,
+  // 元素映射绑定层（决策 25）
+  ElementMapping,
+  ElementMappingInput,
+  ElementMappingItem,
+  MappingEndpoint,
+  MappingElementRef,
+  MappingSuggestion,
+  MappingCoverage,
+  MappingCoverageBucket,
+  MappingIntegrityReport,
+  MappingIntegrityItem,
+  MappingWriteResult,
 } from "@/lib/ipc/bindings";
 
 /**
@@ -330,9 +347,18 @@ export interface Capabilities {
   action?: boolean;
 }
 
+/**
+ * 属性级物理来源字段（对齐 Rust `payload::BackingMapping`，五个字符串字段）。
+ *
+ * 历史版本曾用 `property_mapping: Record<string, string>`，但 Rust 侧从未有过该字段
+ * （它是早先设计稿的残留），实际契约是五个扁平字段，故必须与 Rust 一致。
+ */
 export interface BackingMapping {
   dataset_api_name?: string;
-  property_mapping?: Record<string, string>;
+  backing_catalog?: string;
+  backing_schema?: string;
+  backing_table?: string;
+  backing_column?: string;
 }
 
 export interface PropertyDef {

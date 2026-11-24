@@ -158,7 +158,7 @@ metadata:
 
 **宪章先行（决策 24，硬闸门）**：`import_ontology_ttl` 对库内不存在的 IRI 一律拒绝——
 本体创建必须由用户在「新建本体」向导完成设计宪章（AI 不得创建本体）。
-冷启动时：输出建模思路 + 宪章两字段（业务场景/业务本质）要点（业务场景/本质/意图/约束），指引用户
+冷启动时：输出建模思路 + 宪章两字段（业务场景/业务目标）要点，指引用户
 完成向导；本体建立后（list_ontology_ttl 可查到目标 IRI）再执行导入。
 
 **证据环（决策 24 后续，操作顺序——先登记后建模）**：
@@ -189,6 +189,22 @@ metadata:
 | `query_ontology_sparql(ontology_iri, sparql)` | 跑 SPARQL 查询 | 验证/抽查 |
 | `commit_ontology_ttl_change(ontology_iri, title, body, change_summary?, conversation_id?)` | 记变更日志 | 每次 import/delete 后 |
 | `list_ontology_ttl_changelog(ontology_iri)` | 列变更历史 | 回溯演进过程 |
+
+### 可用工具（映射绑定层，与 Palantir 路线共用同一套，4 个）
+
+| 工具 | 用途 | 何时调 |
+|---|---|---|
+| `list_element_mappings(standard, ontology_key)` | 列某本体全部映射（含核对状态） | 交付前自查映射是否落齐 |
+| `suggest_element_mappings(standard, ontology_key, elements?)` | 按名称/类型/同表线索给候选（候选值必来自已登记的数据源结构，不落库） | 用户给了表结构但没说哪个属性对应哪列 |
+| `save_element_mappings(standard, ontology_key, items)` | 按元素整组替换映射（传空集合 = 删除该元素全部映射） | 用户确认某个类/属性来自哪张表哪列 |
+| `export_element_mapping(standard, ontology_key, scope)` | 导出扁平 CSV（`all` 全量 / `gap` 仅未映射与未核对） | 用户要一份可交给数据团队核对的清单 |
+
+映射要点（决策 25）：
+
+- **映射不写进 Turtle**。类/属性/关系的概念定义与物理来源是两层，`.ttl` 只承载概念。
+- `standard` 在 W3C 路线固定为 `w3c`，`ontology_key` 用本体 IRI；元素类型为 `class` / `datatype_property` / `object_property`，`element_id` 用元素 IRI。
+- **只在材料明确给出表/字段时才写映射**；抽象概念（状态机、设计概念）不写，留空不是缺陷。
+- 核对状态由系统按已登记的数据源结构判定，不要向用户声称"已核对"——未核对只是提示，不阻断交付。
 
 ### Step 1：29 句话抽取
 
@@ -266,7 +282,7 @@ metadata:
 12. ❌ SWRL 规则不用 `swrl:Imp`/`swrlb:` 标准词汇
 13. ❌ 同名异物不拆 SKOS 概念（用 `skos:altLabel` 错误合并）
 14. ❌ IRI 局部名不符合命名规范
-15. ❌ 数据源绑定信息写入本体（概念层与数据解耦）
+15. ❌ 把数据源绑定写进概念三元素组（`.ttl` 里不出现任何"这张表对应哪个类"的三元组）——映射走独立绑定层，换绑不产生本体版本
 16. ❌ 滥用 `owl:cardinality` 基数约束（开放世界默认无约束，仅推理需要时用）
 
 ## 参考资料（按需加载）

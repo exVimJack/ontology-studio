@@ -660,7 +660,31 @@ impl ChatService {
             Some(s) => crate::ontology_ttl_tools::ontology_ttl_tools(s.clone()),
             None => Vec::new(),
         };
-        let all_tools: Vec<_> = doc_tools.into_iter().chain(fed_tools).chain(ont_tools).chain(ttl_tools).collect();
+        // 元素映射绑定层工具组（决策 25：suggest/save/list/export）。
+        // 复用既有的 Arc<OntologyStore> / Arc<TtlStore>，不新增 store 句柄；
+        // 物理结构快照按调用时实时装配（联邦内存快照 + 证据源），
+        // 这样数据源刚注册后无需重建 ChatService 即可被校验与建议使用。
+        let mapping_tools_ready: Vec<_> = if self.ontology_store.is_some() || self.ttl_store.is_some() {
+            let stores = crate::mapping_tools::MappingStores::new(
+                self.ontology_store.clone(),
+                self.ttl_store.clone(),
+            );
+            let fed = self.federation.clone();
+            let ont = self.ontology_store.clone();
+            let snapshot: crate::mapping_tools::MappingSnapshotProvider = Arc::new(move || {
+                crate::mapping_tools::live_snapshot(fed.as_deref(), ont.as_deref())
+            });
+            crate::mapping_tools::mapping_tools(stores, snapshot)
+        } else {
+            Vec::new()
+        };
+        let all_tools: Vec<_> = doc_tools
+            .into_iter()
+            .chain(fed_tools)
+            .chain(ont_tools)
+            .chain(ttl_tools)
+            .chain(mapping_tools_ready)
+            .collect();
         let handle = if !all_tools.is_empty() {
             // 复用已有 MCP handle，或新建空 ToolServer。两者都能 add_dynamic_tool。
             let h = handle.clone().unwrap_or_else(|| {

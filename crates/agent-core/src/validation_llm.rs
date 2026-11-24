@@ -104,7 +104,7 @@ pub const B_REVIEW_PREAMBLE: &str = r#"你是本体质量审计专家（校验�
 
 约束：
 1. 你不参与建模，不套用建模方法论；你只审查产物质量
-2. 每条建议必须带 evidence_ref（引用已提供的证据源编号）——不带证据的批评不输出
+2. 每条建议必须带 evidence_ref，且必须指向本次输入里真实存在的内容：优先引用【证据上下文】中的证据源编号；本轮未提供证据源时，改为引用设计宪章条目或【29 句话与覆盖矩阵】的句号（如 `charter`、`2.3`）。不得编造引用，不带证据的批评不输出
 3. 优先找反例（Prefer Counterexamples）："这个类在真实数据里没有实例""这个属性映射的列 90% 为空"
 4. 只评审不修改本体
 5. 同概念合并不重复
@@ -124,19 +124,32 @@ pub const B_REVIEW_PREAMBLE: &str = r#"你是本体质量审计专家（校验�
 - id：建议编号（B1、B2…），修订说明需按 id 逐条回应，必须填写"#;
 
 /// B 复核系统提示词（只看修订输出，不看修订说明——产物对产物博弈）。
-pub const B_RECHECK_PREAMBLE: &str = r#"你是本体质量审计专家（校验者 Verifier），正在进行多轮对抗的复核轮。上一轮你提出了 N 条建议，建模者已按建议修订。现在给你修订后的 Turtle 全文，请核查：
-1. 每条建议是否被落实（修订后产物中对应位置是否已改进）
-2. 修订是否引入新问题
+///
+/// 路线 B（2026-11-03 裁定）：B 只判"产物是否解决了问题"，**不裁决建模者的异议**。
+/// 异议一律保持 disputed 直通阶段③人工仲裁。此前 prompt 要求 B 产出 dispute_rulings，
+/// 却从未把异议清单（甚至 B 自己的上一轮建议清单）交给它——判不了落实也裁不了申诉。
+pub const B_RECHECK_PREAMBLE: &str = r#"你是本体质量审计专家（校验者 Verifier），正在进行多轮对抗的复核轮。你会收到两部分输入：你上一轮提出的建议清单（核查基准），以及建模者据此提交的修订后 Turtle 全文。请逐条核查：
+1. 每条建议是否被落实：必须在修订后的产物里找到对应的结构化声明才算 resolved；"看起来改过了"、只在措辞上呼应、或产物里找不到对应声明，判 unresolved
+2. 修订是否引入新问题：原来正确的内容被改坏，判 regressed
+3. 建模者对某些条目的拒绝理由**不在**你的输入范围内——这是刻意隔离，防止你被其论证同化。你只按产物判断：产物里没改就是没改，不要因为"对方给了理由"而松动
 
 输出严格 JSON（不要输出其他内容）：
-{ "verdict": "confirm" | "question", "remaining_issues": [ { "suggestion_id": "...", "status": "resolved|unresolved|regressed", "message": "..." } ] }
-- verdict=confirm：全部落实且无新问题 → 通过
-- verdict=question：仍有分歧 → 转人工仲裁"#;
+{ "verdict": "confirm" | "question", "remaining_issues": [ { "suggestion_id": "...", "status": "resolved|unresolved|regressed", "message": "...", "location": "修订后产物中的对应位置（iri 或声明片段）" } ] }
+- verdict=confirm：核查基准里每条建议都是 resolved 且无 regressed → 通过
+- verdict=question：仍有 unresolved 或 regressed → 继续对抗（两轮封顶后转人工仲裁）
+- 只要有一条 unresolved 或 regressed 就 MUST NOT 判 confirm；"大部分改了"不是 confirm 的理由
+- suggestion_id 必须来自核查基准里的编号，不可自造"#;
 
 /// A 修订系统提示词（建模者视角，与对话窗口同方法论但独立上下文）。
-pub const A_REVISE_PREAMBLE: &str = r#"你是本体建模者（Generator）。校验者对你产出的 Turtle 提出了问题清单。请逐条处理：
-1. 合理的问题 → 修订 Turtle 修正
-2. 你认为误判的问题 → 保持原样，在修订说明中注明拒绝理由（引用输入证据）
+/// 合并方案 v0.8：A 对统一发现池逐条表态——B 评审建议（B 编号）与规则检查
+/// 告警（R 编号）同清单处理；规则告警的异议必须带证据引用（机械匹配把关）。
+pub const A_REVISE_PREAMBLE: &str = r#"你是本体建模者（Generator）。校验者对本体产出了两类问题：语义评审建议（B 编号）与规则检查告警（R 编号）。请逐条处理：
+1. 合理的问题 → 修订 Turtle 修正（action=accepted）
+2. 你认为误判的问题 → 保持原样并拒绝（action=rejected，异议）。规则告警（R 编号）的异议必须引用输入证据：
+   ① 选一个已登记证据源编号（输入清单给出）
+   ② 从该源内容中逐字摘录支持你建模的原文片段（≤200 字符，不得改写/拼接/概括——系统会做字面机械匹配，匹配不上按接受处理）
+   ③ 写明辩护理由：为什么这段证据证明当前建模是对的（引用证据说明，不空谈）
+   没有证据支撑的异议不要发起——编造/改写引文会被机械匹配驳回
 
 **硬约束：修订后的 Turtle 只能是纯本体内容**——不要把问题描述、校验建议、
 "仲裁""B1""必须改"等任何校验过程的文字/标签/编号写进 Turtle。校验文字只
@@ -144,9 +157,9 @@ pub const A_REVISE_PREAMBLE: &str = r#"你是本体建模者（Generator）。�
 
 输出格式：
 第一段：修订后的完整 Turtle 全文
-第二段（用 --- 分隔）：修订说明 JSON [ { "issue_id": "...", "action": "accepted|rejected", "reason": "..." } ]
-- issue_id 必须原样回显校验者建议清单中每条建议的 id（如 "B1"），不可自造编号
-- rejected 的条目必须写明引用输入证据的拒绝理由"#;
+第二段（用 --- 分隔）：修订说明 JSON [ { "issue_id": "...", "action": "accepted|rejected", "reason": "...", "source_id": "...", "quote": "...", "argument": "..." } ]
+- issue_id 必须原样回显问题清单中每条条目的编号（B 编号如 "B1"，或 R 编号如 "R1"），不可自造编号
+- action=rejected 时必须写明引用输入证据的拒绝理由；R 编号条目 rejected 时 source_id/quote/argument 必填"#;
 
 /// 运行 B 语义评审（第三层对抗第 1 步）。
 ///
@@ -176,16 +189,18 @@ pub async fn run_b_review(
 
 /// 运行 A 修订（第三层对抗第 2 步）。
 ///
-/// `ttl_v1`: 当前 Turtle；`b_suggestions`: B 的建议清单（上一轮输出）。
+/// `ttl_v1`: 当前 Turtle；`b_suggestions`: B 的建议清单（上一轮输出）；
+/// `rules_warnings`: 规则检查的 warning/suggestion 清单（R 编号，供 A 统一表态）。
 /// 返回 (修订后 Turtle, 修订说明)。
 pub async fn run_a_revise(
     chat: &ChatService,
     model_a: &str,
     ttl_v1: &str,
     b_suggestions: &str,
+    rules_warnings: &str,
 ) -> Result<(String, String), String> {
     let prompt = format!(
-        "当前 Turtle：\n```turtle\n{ttl_v1}\n```\n\n校验者建议：\n{b_suggestions}\n\n请按约束输出修订结果。"
+        "当前 Turtle：\n```turtle\n{ttl_v1}\n```\n\n校验者建议（B 编号）：\n{b_suggestions}\n\n规则检查告警（R 编号）：\n{rules_warnings}\n\n请按约束输出修订结果。"
     );
     match chat.run_llm_prompt(model_a, A_REVISE_PREAMBLE, &prompt).await {
         Ok(out) => {
@@ -217,123 +232,94 @@ fn strip_code_fence(s: &str) -> &str {
 
 /// 运行 B 复核（第三层对抗第 3 步）。
 ///
-/// 只传修订后的 Turtle（a_revision），**不传修订说明**（a_reasoning 对 B 不可见）。
-/// 返回复核 JSON 文本。
+/// 输入两样：`baseline_suggestions`（B 自己上一轮的建议清单，核查基准）与
+/// `a_revision`（修订后产物）。**不传修订说明**（`a_reasoning` 对 B 不可见）——
+/// 独立性约束的是"不看答题者的解题思路"，不是"让裁判失忆"：没有核查基准，
+/// B 无从判断"每条建议是否被落实"，只能把产物重新审一遍并倾向判 question。
 pub async fn run_b_recheck(
     chat: &ChatService,
     model_b: &str,
     a_revision: &str,
+    baseline_suggestions: &str,
 ) -> Result<String, String> {
+    let n = count_baseline_items(baseline_suggestions);
     let prompt = format!(
-        "修订后的 Turtle 全文：\n```turtle\n{a_revision}\n```\n\n请核查建议落实情况并输出 JSON 判定。"
+        "【核查基准：你上一轮提出的建议清单】\n{baseline_suggestions}\n\n【修订后的 Turtle 全文】\n```turtle\n{a_revision}\n```\n\n上一轮你提出了 {n} 条建议，建模者已提交修订稿。请逐条核查落实情况并输出 JSON 判定；建模者的修订说明与辩护理由不在你的输入范围内，只按产物判断。"
     );
     chat.run_llm_prompt(model_b, B_RECHECK_PREAMBLE, &prompt).await.map_err(|e| e.to_string())
 }
 
-/// A 答辩构造系统提示词（§2.1.5 答辩的发起方是 A——建模者对规则 warning 逐条反驳）。
+/// 核查基准条目数：把"上一轮你提出了 N 条建议"的 N 真正填进去。
 ///
-/// 输入：warning issue + 证据源清单（id + 标题 + 内容摘录）。A 从中选源并
-/// **逐字摘录**反证原文（提交时过 match_quote 机械匹配，摘错即驳回）；
-/// 无可用证据时输出 skip，不硬编。
-pub const A_DISPUTE_PREAMBLE: &str = r#"你是本体建模者（Generator）。规则检查引擎对你建模的 Turtle 提出了 warning，请逐条决定：接受（按建议修订）还是答辩（引用输入证据反驳）。
-
-给你：
-1. 待处理的 warning 列表（规则引擎产出）
-2. 已登记的证据源清单（编号 + 标题 + 内容全文）
-
-决策规则：
-- warning 确有道理或你没有证据反驳 → 接受（后续按建议修订）
-- 有输入证据（原始材料/宪章/术语）能证明当前建模正确 → 答辩：
-  ① 选一个证据源编号
-  ② 从该源内容中**逐字摘录**支持你建模的原文片段（≤200 字符，不得改写/拼接/概括——系统会做字面机械匹配，匹配不上直接驳回）
-  ③ 写明辩护理由：为什么这段证据证明当前建模是对的（引用证据说明，不空谈）
-- 没有证据支撑的反驳不要发起——编造/改写引文会被机械匹配当场驳回
-
-输出严格 JSON 数组（不要输出其他内容）：
-[ { "issue_id": "...", "action": "dispute" | "accept", "source_id": "...", "quote": "...", "argument": "..." } ]
-- action=dispute 时 source_id/quote/argument 必填；action=accept 时只需 issue_id"#;
-
-/// A 答辩输出（单条 warning 的决策）。
-#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
-pub struct ADisputeDecision {
-    /// 目标 warning 的 issue id
-    pub issue_id: String,
-    /// "dispute"（发起答辩）| "accept"（接受，按建议修订）
-    pub action: String,
-    /// 反证证据源 id（action=dispute 必填）
-    #[serde(default)]
-    pub source_id: String,
-    /// 反证原文逐字摘录（action=dispute 必填；机械匹配对象）
-    #[serde(default)]
-    pub quote: String,
-    /// 辩护理由（action=dispute 必填）
-    #[serde(default)]
-    pub argument: String,
+/// 首轮基准是 B 评审输出的 JSON 数组；后续轮是上一轮复核输出（对象，含
+/// `remaining_issues`）。两者都数不出来时按非空行数兜底——数字只用于提示词
+/// 可读性，数错不影响判定，但**绝不能把占位符原样送进模型**。
+pub fn count_baseline_items(baseline: &str) -> usize {
+    let t = baseline.trim();
+    if t.is_empty() {
+        return 0;
+    }
+    if let Some(body) = json_object_body(t) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+            if let Some(arr) = v.get("remaining_issues").and_then(|x| x.as_array()) {
+                return arr.len();
+            }
+        }
+    }
+    if let Some(arr) = json_array_body(t) {
+        if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(arr) {
+            return v.len();
+        }
+    }
+    t.lines().filter(|line| !line.trim().is_empty()).count()
 }
 
-/// 运行 A 答辩构造：对 warning 清单逐条决策（dispute/accept），返回原始 JSON。
-pub async fn run_a_dispute(
-    chat: &ChatService,
-    model_a: &str,
-    warnings_json: &str,
-    evidence_context: &str,
-) -> Result<String, String> {
-    let prompt = format!(
-        "【待处理 warning 列表】\n{warnings_json}\n\n【已登记证据源清单】\n{evidence_context}\n\n请输出决策 JSON 数组。"
-    );
-    chat.run_llm_prompt(model_a, A_DISPUTE_PREAMBLE, &prompt)
-        .await
-        .map_err(|e| e.to_string())
+/// 解析 B 复核输出是否判"确认收敛"。
+///
+/// **仅** `verdict` 字段归一化后等于 `confirm` 才算收敛；`question`、字段缺失、
+/// 整体解析失败、未知取值、空串一律按未收敛。误判方向刻意不对称：宁可多走一轮
+/// 复核或多进一次人工仲裁，也不在判定不可靠时把 A 的修订稿整本写回工作区
+/// （confirm 分支会 `import_ttl(overwrite=true)`）。
+///
+/// 此前判定是 `!verdict.contains("\"verdict\": \"question\"")`——要求冒号后恰好
+/// 一个空格，模型输出紧凑 JSON `"verdict":"question"`（最常见形态）会被误判成
+/// confirm，方向恰好反了。
+pub fn verdict_is_confirm(b_verdict_json: &str) -> bool {
+    let Some(body) = json_object_body(b_verdict_json) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    v.get("verdict")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().eq_ignore_ascii_case("confirm"))
+        .unwrap_or(false)
 }
 
-/// 解析 A 答辩输出（容错：剥 `---` 分隔残留与 ```json 围栏，取首 `[` 末 `]`；
-/// 实测 LLM 会带双分隔符前缀，严格 from_str 全军覆没——同 adversarial.rs 的坑）。
-/// 解析失败返回空清单（调用方按「A 未回应」逐条 accept 保守处理）。
-pub fn parse_a_dispute(raw: &str) -> Vec<ADisputeDecision> {
-    let t = raw.trim().trim_start_matches('-').trim();
+/// 容错提取 JSON 对象文本：剥 ```json 围栏，取首个 `{` 到末个 `}`。
+fn json_object_body(s: &str) -> Option<&str> {
+    let t = strip_fence(s);
+    let start = t.find('{')?;
+    let end = t.rfind('}')?;
+    (start < end).then(|| &t[start..=end])
+}
+
+/// 容错提取 JSON 数组文本：剥围栏后取首个 `[` 到末个 `]`。
+fn json_array_body(s: &str) -> Option<&str> {
+    let t = strip_fence(s);
+    let start = t.find('[')?;
+    let end = t.rfind(']')?;
+    (start < end).then(|| &t[start..=end])
+}
+
+fn strip_fence(s: &str) -> &str {
+    let t = s.trim();
     let t = t
         .strip_prefix("```json")
         .or_else(|| t.strip_prefix("```"))
-        .unwrap_or(t)
-        .trim();
-    let Some(start) = t.find('[') else {
-        return Vec::new();
-    };
-    let Some(end) = t.rfind(']') else {
-        return Vec::new();
-    };
-    if start >= end {
-        return Vec::new();
-    }
-    serde_json::from_str(&t[start..=end]).unwrap_or_default()
-}
-/// B 答辩裁决系统提示词（§2.1.5 答辩的机器裁决——B 判不定才升级人工仲裁）。
-pub const DISPUTE_VERDICT_PREAMBLE: &str = r#"你是本体质量审计专家（校验者 Verifier），正在对建模者（A）就一条校验 warning 提出的答辩做裁决。给你：
-1. 被答辩的 issue（规则引擎产出的问题描述）
-2. A 的辩护理由（argument）
-3. A 引用的反驳证据原文（counter_evidence，已通过机械匹配）
-
-你的职责：基于证据与业务合理性独立判定——不是附和 A，也不是维护规则。
-输出严格 JSON（不要输出其他内容）：
-{ "verdict": "overruled" | "accepted" | "uncertain", "reason": "一句话理由" }
-- verdict=overruled：A 的证据与理由成立，撤销该 warning
-- verdict=accepted：A 的辩护不成立，维持原判（升级 error）
-- verdict=uncertain：证据与理由不足以判定 → 升级人工仲裁（不要强行二选一）"#;
-
-/// B 答辩裁决：对一条 disputed 的 issue 做机器裁决，返回原始输出（含 JSON 判定）。
-pub async fn run_dispute_verdict(
-    chat: &ChatService,
-    model_b: &str,
-    issue_message: &str,
-    argument: &str,
-    counter_evidence: &str,
-) -> Result<String, String> {
-    let prompt = format!(
-        "被答辩的 issue：\n{issue_message}\n\nA 的辩护理由：\n{argument}\n\nA 引用的反驳证据原文：\n{counter_evidence}\n\n请输出裁决 JSON。"
-    );
-    chat.run_llm_prompt(model_b, DISPUTE_VERDICT_PREAMBLE, &prompt)
-        .await
-        .map_err(|e| e.to_string())
+        .unwrap_or(t);
+    t.trim()
 }
 
 /// 构造 B 评审输入上下文（evidence 预注入——B 不做自主检索，由编排统一加载）。
@@ -352,31 +338,6 @@ pub fn build_b_review_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_a_dispute_plain_json() {
-        let raw = r#"[{"issue_id":"vi-1","action":"dispute","source_id":"src-a","quote":"供应商编号全局唯一","argument":"输入明示"}]"#;
-        let out = parse_a_dispute(raw);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].action, "dispute");
-        assert_eq!(out[0].source_id, "src-a");
-    }
-
-    #[test]
-    fn parse_a_dispute_tolerates_fence_and_separator() {
-        // 实测 LLM 会带 "---\n\n```json" 前缀（同 adversarial.rs 的坑）
-        let raw = "---\n\n```json\n[{\"issue_id\":\"vi-1\",\"action\":\"accept\"}]\n```";
-        let out = parse_a_dispute(raw);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].action, "accept");
-        assert_eq!(out[0].source_id, "", "accept 分支证据字段为默认空");
-    }
-
-    #[test]
-    fn parse_a_dispute_garbage_returns_empty() {
-        assert!(parse_a_dispute("抱歉我不能输出 JSON").is_empty());
-        assert!(parse_a_dispute("").is_empty());
-    }
 
     #[test]
     fn strip_code_fence_removes_turtle_fence() {
@@ -442,5 +403,50 @@ mod tests {
         assert!(s.contains("【设计宪章】") && s.contains("【29 句话输入】"));
         assert!(s.contains("【待评审 Turtle】") && s.contains("【L0-L3 校验报告】"));
         assert!(s.contains("【证据上下文】"));
+    }
+
+    // ── 收敛判定：仅显式 verdict=confirm 算收敛，其余一律未收敛 ──
+    #[test]
+    fn verdict_compact_question_is_not_confirm() {
+        // 修复前用 contains("\"verdict\": \"question\"")，这条紧凑 JSON 会被误判成 confirm
+        assert!(!verdict_is_confirm(r#"{"verdict":"question","remaining_issues":[]}"#));
+    }
+
+    #[test]
+    fn verdict_spaced_and_fenced_variants() {
+        assert!(verdict_is_confirm(r#"{"verdict": "confirm", "remaining_issues": []}"#));
+        assert!(verdict_is_confirm("```json\n{\"verdict\":\"confirm\"}\n```"));
+        assert!(verdict_is_confirm("判定如下：\n{\"verdict\":\"CONFIRM\"}\n"));
+        assert!(!verdict_is_confirm("```\n{\"verdict\":\"question\"}\n```"));
+    }
+
+    #[test]
+    fn verdict_fails_closed_on_unparseable_or_missing_field() {
+        assert!(!verdict_is_confirm(""));
+        assert!(!verdict_is_confirm("复核通过，没有问题"));
+        assert!(!verdict_is_confirm(r#"{"remaining_issues":[]}"#));
+        assert!(!verdict_is_confirm(r#"{"verdict":null}"#));
+        assert!(!verdict_is_confirm(r#"{"verdict":"confirmed"}"#)); // 未知取值
+        assert!(!verdict_is_confirm(r#"{"verdict":true}"#)); // 非字符串
+    }
+
+    // ── 核查基准条目数：绝不能把占位符送进模型 ──
+    #[test]
+    fn count_baseline_from_b_report_array() {
+        let arr = r#"[{"id":"B1"},{"id":"B2"},{"id":"B3"}]"#;
+        assert_eq!(count_baseline_items(arr), 3);
+        assert_eq!(count_baseline_items("```json\n[{\"id\":\"B1\"}]\n```"), 1);
+    }
+
+    #[test]
+    fn count_baseline_from_recheck_remaining_issues() {
+        let verdict = r#"{"verdict":"question","remaining_issues":[{"suggestion_id":"B1"},{"suggestion_id":"B2"}]}"#;
+        assert_eq!(count_baseline_items(verdict), 2);
+    }
+
+    #[test]
+    fn count_baseline_falls_back_to_lines_and_empty() {
+        assert_eq!(count_baseline_items(""), 0);
+        assert_eq!(count_baseline_items("- 条目一\n- 条目二\n"), 2);
     }
 }

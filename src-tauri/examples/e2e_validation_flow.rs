@@ -5,7 +5,7 @@
 //!   阶段② 语义评审：review_ontology → run_b_review（B 评审八维度）
 //!              → save_b_report → run_a_revise（A 修订）→ a_revise 落库
 //!              → run_b_recheck（B 复核）→ b_recheck 机器裁决
-//!   阶段② 答辩：dispute_issue → resolve_dispute（B 机器裁决 / 升级）
+//!   阶段② 答辩：dispute_issue 登记异议 → 阶段③ 人工 resolve_dispute（路线 B：B 不裁决异议）
 //!   阶段③ 人工仲裁：escalate → resolve（人工裁决入口）
 //!   出口：coverage_matrix（29 句话覆盖）+ issues 汇总（报告数据）
 //!
@@ -215,7 +215,7 @@ async fn main() {
 
     // A 修订（真实 LLM：整本 Turtle 重写）
     step("阶段②c A 修订：run_a_revise → a_revise 落库");
-    let (revised_ttl, reasoning) = run_a_revise(&chat_a, &cfg_a.model, &ttl, &b_out.suggestions_json)
+    let (revised_ttl, reasoning) = run_a_revise(&chat_a, &cfg_a.model, &ttl, &b_out.suggestions_json, "")
         .await
         .expect("A 修订失败");
     println!("A 修订输出 {} 字符，修订说明 {} 字符", revised_ttl.len(), reasoning.len());
@@ -232,7 +232,8 @@ async fn main() {
 
     // B 复核（只看修订产物，不看说明）
     step("阶段②d B 复核（机器裁决）：run_b_recheck → b_recheck");
-    let verdict = run_b_recheck(&chat_b, &cfg_b.model, &revised_ttl)
+    // 核查基准：B 上一轮提的建议清单（每次 LLM 调用无状态，须显式回传）
+    let verdict = run_b_recheck(&chat_b, &cfg_b.model, &revised_ttl, &b_out.suggestions_json)
         .await
         .expect("B 复核失败");
     println!("B 复核判定: {}", verdict.chars().take(120).collect::<String>());
@@ -246,7 +247,7 @@ async fn main() {
     );
 
     // ═══ 阶段② 答辩（对残留 warning issue）═══
-    step("阶段②e 答辩：dispute_issue → resolve_dispute");
+    step("阶段②e 答辩：dispute_issue（异议登记；裁决归阶段③ 人工）");
     let target = issues
         .iter()
         .find(|i| i.severity.as_str() == "warning")
@@ -287,15 +288,16 @@ async fn main() {
         )
         .expect("dispute_issue 失败");
     println!("答辩提交结果: {d}");
-    // 裁决（证据匹配通过 → overruled；否则 escalated）
+    // 路线 B（2026-11-03 裁定）：B 复核不再自动裁决异议——这里显式以人工身份演示裁决动作。
+    // 真实流程中该条目会保持 disputed，直到阶段③ 人工仲裁受理。
     let r = store
-        .resolve_dispute(&target.id, "overruled", "verifier")
-        .expect("resolve_dispute 失败");
+        .resolve_dispute(&target.id, "overruled", "human")
+        .expect("裁决失败");
     println!("答辩裁决: {r}");
 
     // ═══ 阶段③ 人工仲裁（分歧/升级项）═══
     step("阶段③ 人工仲裁：escalate → resolve");
-    let arb = store.escalate(&review.id).expect("escalate 失败");
+    let arb = store.escalate(&review.id, "manual_escalation", "").expect("escalate 失败");
     println!("升级仲裁 ✓ review status={}", arb.status);
     let arb_issues = store.list_issues(&ontology_iri).expect("list 失败");
     println!("仲裁队列可见 issue {} 条（含升级项）", arb_issues.len());

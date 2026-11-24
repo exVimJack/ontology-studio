@@ -120,6 +120,71 @@ pub enum SkillError {
 
 impl SkillError {}
 
+/// 读取并解析某目录下的 `SKILL.md`，**先把 CRLF 归一为 LF 再解析**。
+///
+/// 动机是实现事实而非偏好：`agent-skills 0.2.0` 的 frontmatter 切分器
+/// （`find_closing_delimiter`）用 `content.lines()` 迭代（`lines()` 会剥掉 `\r`），
+/// 却按 `line.len() + 1` 累计字节偏移——CRLF 每行少算 1 字节。累计漂移后
+/// `&after_opening[..pos]` / `[pos + 3..]` 会落进多字节字符中间（panic）或提前切到
+/// frontmatter 内部（正文起始带残片）。所以**所有**解析入口必须先归一化。
+///
+/// 归一化只作用于内存中的解析输入，MUST NOT 回写用户磁盘上的源文件。
+///
+/// 分步计时日志（metadata → read+parse）留在这里：当初为定位 Windows 上
+/// `SkillDirectory::load` 内部 fs 调用卡死而加，重构时不得削弱。
+pub(super) fn read_skill_md(dir: &Path) -> Result<agent_skills::Skill, SkillError> {
+    let skill_md = dir.join("SKILL.md");
+    // symlink_metadata 而非 skill_md.is_file()：后者调 std::fs::metadata，在 Windows
+    // 上对 reparse point / junction / 网络符号链接会阻塞解析（扫描未知目录时会卡死）。
+    let meta_t = std::time::Instant::now();
+    let md = std::fs::symlink_metadata(&skill_md);
+    let is_file = md.as_ref().map(|m| m.is_file()).unwrap_or(false);
+    tracing::debug!(
+        dir = %dir.display(),
+        skill_md_exists = md.is_ok(),
+        is_file,
+        elapsed_ms = meta_t.elapsed().as_millis() as u64,
+        "skill_md: metadata"
+    );
+    if !is_file {
+        return Err(SkillError::InvalidSkill(format!(
+            "{} 下没有 SKILL.md",
+            dir.display()
+        )));
+    }
+    let read_t = std::time::Instant::now();
+    let raw = std::fs::read_to_string(&skill_md)
+        .map_err(|e| SkillError::Load(format!("读取 SKILL.md 失败：{e}")))?;
+    let content = raw.replace("\r\n", "\n");
+    let skill = agent_skills::Skill::parse(&content)
+        .map_err(|e| SkillError::InvalidSkill(format!("SKILL.md 解析失败：{e}")))?;
+    tracing::debug!(
+        dir = %dir.display(),
+        bytes = content.len(),
+        elapsed_ms = read_t.elapsed().as_millis() as u64,
+        "skill_md: read+parse ok"
+    );
+    Ok(skill)
+}
+
+/// 加载并校验一个 skill 目录，校验语义与上游 `SkillDirectory::load` 逐条对齐
+/// （上游 `agent-skills-0.2.0/src/loader.rs` 共 5 条：目录存在且是目录 → SKILL.md
+/// 存在 → 可读 → 可解析 → frontmatter `name` == 目录名；无其它隐含校验）。
+///
+/// 项目内**所有**需要校验的 SKILL.md 读取路径都走这里，不再调用上游那个在 CRLF
+/// 上会 panic 的 API——目的不只是绕开缺陷，更是消除「发现路径修了、导入路径没修」
+/// 这类两处实现分叉。
+pub(super) fn load_skill_at(dir: &Path) -> Result<agent_skills::Skill, SkillError> {
+    let skill = read_skill_md(dir)?;
+    let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if skill.name().as_str() != dir_name {
+        return Err(SkillError::InvalidSkill(format!(
+            "SKILL.md 的 name「{}」与目录名「{dir_name}」不一致",
+            skill.name().as_str()
+        )));
+    }
+    Ok(skill)
+}
 /// agentskills.io 规范定义的 skill 资源子目录（除 SKILL.md 外的可选目录）。
 ///
 /// 规范目录结构：
@@ -189,9 +254,10 @@ pub(super) fn is_text_resource(path: &Path) -> bool {
 /// 扫描 skill 目录下某个规范子目录，返回所有可入库的文本文件路径
 /// （按文件名排序，保证 discover 顺序稳定）。目录不存在或无匹配文件返回空。
 ///
-/// 直接用 read_dir 扫规范子目录名（references/assets/scripts），不再依赖
-/// `agent_skills::SkillDirectory` 的枚举 API——后者只能经会 panic 的
-/// `SkillDirectory::load` 构造（CRLF frontmatter bug）。独立扫描更鲁棒。
+/// 直接用 read_dir 扫规范子目录名（references/assets/scripts），不依赖上游
+/// `agent_skills::SkillDirectory` 的枚举 API——它只能经 `SkillDirectory::load` 构造，
+/// 而该构造在 CRLF 输入上会 panic（见 `read_skill_md`）。独立扫描更鲁棒，且不要求
+/// 目录先通过校验。
 pub(super) fn scan_subdir_files(
     skill_dir: &Path,
     subdir: SkillSubdir,

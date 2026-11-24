@@ -18,6 +18,7 @@ import {
 } from "@/hooks/useOntologyValidation";
 import styles from "./ValidationPanel.module.css";
 import own from "./ReviewPanel.module.css";
+import { describeReview } from "@/lib/review-outcome";
 
 type Props = {
   ontologyIri: string | null;
@@ -31,7 +32,9 @@ const STATUS_TEXT: Record<string, string> = {
   in_progress: "进行中",
   resolved: "已通过",
   escalated: "已转人工仲裁",
+  interrupted: "已中断",
 };
+
 
 type Step = "b_review" | "a_revise" | "b_recheck";
 
@@ -50,6 +53,29 @@ function deriveStep(review: ValidationReview): Step | null {
   if (review.a_revision) return "b_recheck";
   if (review.b_report) return "a_revise";
   return "b_review";
+}
+
+/** 复核环节的核查基准条目数：B 上一轮提了多少条建议。
+ *  首轮取 b_report 数组长度，后续轮取 b_verdict.remaining_issues 长度。
+ *  仅用于展示——解析失败返回 0（不显示），不参与任何判定。 */
+function baselineCount(
+  review?: { b_report?: string; b_verdict?: string } | null,
+): number {
+  if (!review) return 0;
+  const arr = safeJson<unknown[]>(review.b_report ?? "");
+  if (Array.isArray(arr)) return arr.length;
+  const obj = safeJson<{ remaining_issues?: unknown[] }>(review.b_verdict ?? "");
+  return Array.isArray(obj?.remaining_issues) ? obj.remaining_issues.length : 0;
+}
+
+function safeJson<T>(raw: string): T | null {
+  const t = raw.trim();
+  if (!t) return null;
+  try {
+    return JSON.parse(t) as T;
+  } catch {
+    return null;
+  }
 }
 
 function RoundCard({
@@ -154,24 +180,19 @@ export function ReviewPanel({ ontologyIri, modelA, modelB }: Props) {
           ? current.step_ms?.a_revise
           : current.step_ms?.b_recheck;
     if (ms && ms > 0) return fmtMs(ms);
-    // 进行中环节：从评审创建时刻起估算（后端未落库前无精确分段计时）
+    // 进行中环节：以"最后动作时刻"为锚估算（与后端 step_ms_* 同口径）。用 created_at
+    // 会把任务不存在期间的死时间也算进去——僵尸评审重跑后显示"已用时 44 小时"就是这么
+    // 来的（2026-10-26 现场：一行在 in_progress 上挂了 44.8 小时）。
     if (step === s && running) {
-      const elapsed = Date.now() - current.created_at;
-      return `已用时 ${fmtMs(elapsed)}`;
+      const anchor = current.updated_at || current.created_at;
+      return `已用时 ${fmtMs(Math.max(0, Date.now() - anchor))}`;
     }
     return undefined;
   };
 
-  // 轮次文案：round 1=首轮评审中；2+ = 第 N-1 轮修订复核中（多轮对抗）
-  const roundText = current
-    ? current.status === "in_progress"
-      ? current.round === 1
-        ? "首轮评审中"
-        : `第 ${current.round - 1} 轮修订复核中`
-      : current.status === "escalated"
-        ? "复核未收敛，已升级仲裁"
-        : "复核通过"
-    : "";
+  // 轮次文案 + 结束归因：escalated 不再一律说成"复核未收敛"——中断 / 环节失败 /
+  // 复核封顶是三件不同的事，下一步动作也不同（重跑 / 重跑 / 去仲裁）。
+  const roundText = current ? describeReview(current) : "";
 
   const roundStatus = (s: Step): "done" | "active" | "wait" => {
     if (step === s) return "active";
@@ -208,9 +229,15 @@ export function ReviewPanel({ ontologyIri, modelA, modelB }: Props) {
           </div>
         )}
         {running && <div className={styles.hint}>自动轮转中，无需人工介入。</div>}
+        {!running && current?.status === "interrupted" && (
+          <div className={styles.hint}>
+            上次评审的后台任务已不在（进程重启或崩溃），库里那一行停在 in_progress 只会
+            让界面永远显示"进行中"。现已标为中断，点「重新评审」从头跑一轮即可。
+          </div>
+        )}
         {!running && current?.status === "escalated" && (
           <div className={styles.hint}>
-            上一轮评审复核未收敛，已升级人工仲裁。B 建议与 A 回应保留在下方逐条卡片，
+            {describeReview(current)}。B 建议与 A 回应保留在下方逐条卡片，
             可到阶段③人工仲裁逐条裁决。
           </div>
         )}
@@ -253,6 +280,12 @@ export function ReviewPanel({ ontologyIri, modelA, modelB }: Props) {
           status={roundStatus("b_recheck")}
           time={stepTime("b_recheck")}
         >
+          {baselineCount(current) > 0 && (
+            <div className={styles.hint}>
+              核查基准：上一轮建议 {baselineCount(current)} 条——B 只按修订后产物逐条判落实，
+              看不到 A 的理由；异议不由 B 裁决，一律直通人工仲裁
+            </div>
+          )}
           {current?.b_verdict && (
             <details className={own.fold}>
               <summary className={own.foldSummary}>复核判定 JSON</summary>

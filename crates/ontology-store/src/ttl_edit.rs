@@ -43,6 +43,36 @@ pub struct TtlPropertyEdit {
     pub range: String,
 }
 
+/// 类的读写视图（版本 diff 用：label/comment 修改检测，属性编辑不碰类块）。
+/// 与 `TtlPropertyEdit` 同字段语义（kind 恒为 "class"）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Default)]
+pub struct TtlClassMeta {
+    /// 类 IRI 全形（原文，可能含双 #）。
+    pub iri: String,
+    /// rdfs:label（去引号去语言标签后的纯文本；空 = 未设置）。
+    #[serde(default)]
+    pub label: String,
+    /// rdfs:comment（同上）。
+    #[serde(default)]
+    pub comment: String,
+}
+
+/// 类的编辑视图（概念图谱编辑用）：label/comment/subClassOf 受管，其余谓词原样保留。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Default)]
+pub struct TtlClassEdit {
+    /// 类 IRI 全形（原文，可能含双 #）。不可改（身份）。
+    pub iri: String,
+    /// rdfs:label（纯文本；空 = 删除该谓词）。
+    #[serde(default)]
+    pub label: String,
+    /// rdfs:comment（同上）。
+    #[serde(default)]
+    pub comment: String,
+    /// 父类 IRI 列表（rdfs:subClassOf，可多个；空 = 无父类）。
+    #[serde(default)]
+    pub parents: Vec<String>,
+}
+
 // ════════════════════════════════════════════════════════════════
 // 1. Token 化（带字节位置）
 // ════════════════════════════════════════════════════════════════
@@ -667,6 +697,10 @@ const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
 const RDFS_COMMENT: &str = "http://www.w3.org/2000/01/rdf-schema#comment";
 const RDFS_DOMAIN: &str = "http://www.w3.org/2000/01/rdf-schema#domain";
 const RDFS_RANGE: &str = "http://www.w3.org/2000/01/rdf-schema#range";
+const RDFS_SUBCLASSOF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+const OWL_RESTRICTION: &str = "http://www.w3.org/2002/07/owl#Restriction";
+const OWL_ON_PROPERTY: &str = "http://www.w3.org/2002/07/owl#onProperty";
+const OWL_EQUIVALENT_CLASS: &str = "http://www.w3.org/2002/07/owl#equivalentClass";
 const SKOS_EDITORIAL_NOTE: &str = "http://www.w3.org/2004/02/skos/core#editorialNote";
 
 /// 完整字面量解析：`"text"@zh` → (text, Some("zh"))；`"text"` → (text, None)。
@@ -714,7 +748,7 @@ fn property_kind(stmt: &Statement, prefixes: &[(String, String)]) -> Option<&'st
 
 /// 从原文提取全部属性（DatatypeProperty / ObjectProperty）的结构化视图。
 /// 散块聚合（同主语多语句合并）；label/comment/domain/range 取首见值。
-pub(crate) fn list_properties(ttl: &str) -> Vec<TtlPropertyEdit> {
+pub fn list_properties(ttl: &str) -> Vec<TtlPropertyEdit> {
     let prefixes = extract_prefixes(ttl);
     let tokens = tokenize(ttl);
     let stmts = statements(ttl, &tokens);
@@ -773,7 +807,7 @@ pub(crate) fn list_properties(ttl: &str) -> Vec<TtlPropertyEdit> {
 
 /// 提取本本体已声明的全部类 IRI（domain/range 下拉选项用）。
 /// 只认 `a owl:Class`（对齐 validate 第 2 类规范）。
-pub(crate) fn list_class_iris(ttl: &str) -> Vec<String> {
+pub fn list_class_iris(ttl: &str) -> Vec<String> {
     let prefixes = extract_prefixes(ttl);
     let tokens = tokenize(ttl);
     let stmts = statements(ttl, &tokens);
@@ -787,6 +821,83 @@ pub(crate) fn list_class_iris(ttl: &str) -> Vec<String> {
             {
                 out.push(subject_full_iri(subject, &prefixes));
             }
+        }
+    }
+    out
+}
+
+/// 提取全部 `rdfs:subClassOf` 边（child, parent），全形 IRI；去重。
+/// 与 `list_class_metas` 同一原文 tokenize 坐标系（双 # 保留）。
+pub fn list_subclass_of_edges(ttl: &str) -> Vec<(String, String)> {
+    let prefixes = extract_prefixes(ttl);
+    let tokens = tokenize(ttl);
+    let stmts = statements(ttl, &tokens);
+    let mut seen = std::collections::HashSet::<(String, String)>::new();
+    let mut out = Vec::new();
+    for stmt in &stmts {
+        let Some(subject) = &stmt.subject else { continue };
+        let child = subject_full_iri(subject, &prefixes);
+        for po in parse_pred_objs(&stmt.rest) {
+            if pred_full(&po.pred, &prefixes) != RDFS_SUBCLASSOF || !po.is_iri {
+                continue;
+            }
+            let parent = obj_full_iri(&po.obj, &prefixes);
+            if parent.is_empty() {
+                continue;
+            }
+            if seen.insert((child.clone(), parent.clone())) {
+                out.push((child.clone(), parent));
+            }
+        }
+    }
+    out
+}
+
+/// 提取本本体已声明的全部类（含 label/comment 元数据，版本 diff 用）。
+/// 只认 `a owl:Class`（对齐 list_class_iris）；散块聚合：同一类的 label/comment
+/// 散在多处时按 IRI 合并。与 `list_properties` 同一原文 tokenize 坐标系。
+pub(crate) fn list_class_metas(ttl: &str) -> Vec<TtlClassMeta> {
+    let prefixes = extract_prefixes(ttl);
+    let tokens = tokenize(ttl);
+    let stmts = statements(ttl, &tokens);
+    let mut out: Vec<TtlClassMeta> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for stmt in &stmts {
+        let Some(subject) = &stmt.subject else { continue };
+        let full_iri = subject_full_iri(subject, &prefixes);
+        // 只认 a owl:Class 的声明块（或已入索引的散块）
+        let is_class_decl = parse_pred_objs(&stmt.rest).iter().any(|po| {
+            pred_full(&po.pred, &prefixes) == RDF_TYPE
+                && po.is_iri
+                && obj_full_iri(&po.obj, &prefixes) == "http://www.w3.org/2002/07/owl#Class"
+        });
+        if !is_class_decl && !index.contains_key(&full_iri) {
+            continue;
+        }
+        let mut entry = match index.get(&full_iri) {
+            Some(&i) => out[i].clone(),
+            None => TtlClassMeta {
+                iri: full_iri.clone(),
+                ..Default::default()
+            },
+        };
+        for po in parse_pred_objs(&stmt.rest) {
+            let pf = pred_full(&po.pred, &prefixes);
+            match pf.as_str() {
+                RDFS_LABEL if po.is_literal && entry.label.is_empty() => {
+                    entry.label = parse_literal(&po.obj);
+                }
+                RDFS_COMMENT if po.is_literal && entry.comment.is_empty() => {
+                    entry.comment = parse_literal(&po.obj);
+                }
+                _ => {}
+            }
+        }
+        if let Some(&i) = index.get(&full_iri) {
+            out[i] = entry;
+        } else {
+            index.insert(full_iri, out.len());
+            out.push(entry);
         }
     }
     out
@@ -913,6 +1024,7 @@ fn escape_literal(text: &str) -> String {
 }
 
 /// 收集目标属性全部散块的下标（按出现顺序）。
+/// 删除 / 改写类块（`target_statement_indices` 定位全部同主语语句）。
 fn target_statement_indices(ttl: &str, iri: &str) -> Vec<usize> {
     let prefixes = extract_prefixes(ttl);
     let tokens = tokenize(ttl);
@@ -930,7 +1042,208 @@ fn target_statement_indices(ttl: &str, iri: &str) -> Vec<usize> {
         .collect()
 }
 
-/// 编辑已有属性（散块合并：首块位置重生成，其余删除）。
+/// 删除属性时一并清理引用它的 `owl:Restriction` 约束。
+///
+/// 两种形态都要覆盖（真实本体里都存在）：
+/// 1. 内联空白节点：`C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; ... ]`
+/// 2. 具名约束：`:R a owl:Restriction ; owl:onProperty :p ; ...`（整块删）
+///
+/// 关系删除后，针对它的基数/限定约束已无意义；留着会变成悬空引用，被
+/// `check_dangling_property_refs` 判为 error 而阻断整笔编辑落库。
+///
+/// 实现走原文扫描（`[...]` 是一个 Group token，内部结构不产出 token，无法
+/// 用谓词/宾语模型直接摘值）：先按语句切分，再在语句原文里定位 `onProperty`
+/// 命中的 `[ ... ]` 区间，连同其前面的谓词一起删除。
+fn drop_restrictions_on_property(ttl: &str, prop_iri: &str) -> StoreResult<String> {
+    let prefixes = extract_prefixes(ttl);
+    let tokens = tokenize(ttl);
+    let stmts = statements(ttl, &tokens);
+    let targets = |iri: &str| iri_loose_eq(iri, prop_iri);
+
+    // ① 具名约束块：主语自身 rdf:type owl:Restriction 且 onProperty 命中 → 整块删
+    let mut named_hits: Vec<usize> = Vec::new();
+    for (i, s) in stmts.iter().enumerate() {
+        let Some(subject) = &s.subject else { continue };
+        let _ = subject;
+        let pos = parse_pred_objs(&s.rest);
+        let is_restriction = pos.iter().any(|po| {
+            pred_full(&po.pred, &prefixes) == RDF_TYPE
+                && po.is_iri
+                && obj_full_iri(&po.obj, &prefixes) == OWL_RESTRICTION
+        });
+        if !is_restriction {
+            continue;
+        }
+        if pos.iter().any(|po| {
+            pred_full(&po.pred, &prefixes) == OWL_ON_PROPERTY
+                && po.is_iri
+                && targets(&obj_full_iri(&po.obj, &prefixes))
+        }) {
+            named_hits.push(i);
+        }
+    }
+
+    // ② 逐语句重建：先跳过具名块，再在内联约束语句上做值级摘除
+    let mut out = String::with_capacity(ttl.len());
+    let mut pos = 0usize;
+    for (i, s) in stmts.iter().enumerate() {
+        if named_hits.contains(&i) {
+            out.push_str(&ttl[pos..s.start]);
+            pos = s.end;
+            continue;
+        }
+        let raw = &ttl[s.start..s.end];
+        let Some(cleaned) = strip_inline_restrictions(raw, prop_iri, &prefixes) else {
+            continue;
+        };
+        out.push_str(&ttl[pos..s.start]);
+        // 摘完若已不剩任何「谓词-宾语」，整条丢弃；否则写入处理后原文。
+        // （只判非空会把 `:C .` 这种无谓词残句留下来，解析器报
+        //   ". is not a valid predicate"，整笔编辑被拒。）
+        if statement_has_predicate_object(&cleaned) {
+            out.push_str(&cleaned);
+        }
+        pos = s.end;
+    }
+    out.push_str(&ttl[pos..]);
+    Ok(out)
+}
+
+/// 判断一段语句原文是否仍含至少一个 `谓词 宾语`（用于丢弃被摘空的语句）。
+fn statement_has_predicate_object(stmt_raw: &str) -> bool {
+    let tokens = tokenize(stmt_raw);
+    let stmts = statements(stmt_raw, &tokens);
+    let Some(s) = stmts.first() else { return false };
+    parse_pred_objs(&s.rest).iter().any(|po| {
+        // 只留下孤立的谓词（有 pred 无 obj）也不算合法三元组
+        !po.obj.trim().is_empty()
+    })
+}
+
+/// 在一条语句原文里摘掉所有 `onProperty` 命中 prop_iri 的内联 `[ ... ]` 限制值。
+///
+/// 返回 `None` = 该语句不含目标约束（原样保留）；返回 `Some(文本)` = 处理后的
+/// 语句原文（可能已不含任何三元组，调用方据此决定是否整条丢弃）。
+fn strip_inline_restrictions(
+    stmt_raw: &str,
+    prop_iri: &str,
+    prefixes: &[(String, String)],
+) -> Option<String> {
+    if !stmt_raw.contains("onProperty") {
+        return None;
+    }
+    // 找出所有 `[ ... ]` 区间（括号配平，跳过字符串/IRI 内部）
+    let ranges = group_bracket_ranges(stmt_raw);
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for (bs, be) in ranges {
+        let inner = &stmt_raw[bs + 1..be - 1];
+        for po in parse_pred_objs(&tokenize_rest_of(inner)) {
+            if pred_full(&po.pred, prefixes) == OWL_ON_PROPERTY
+                && po.is_iri
+                && iri_loose_eq(&obj_full_iri(&po.obj, prefixes), prop_iri)
+            {
+                hits.push((bs, be));
+                break;
+            }
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+
+    let mut working = stmt_raw.to_string();
+    // 从后往前删，避免字节偏移失效
+    for (bs, be) in hits.into_iter().rev() {
+        // 往前吃掉谓词名（`rdfs:subClassOf` / `owl:equivalentClass` 等）与空白
+        let before = &working[..bs];
+        let mut start = bs;
+        let bb = before.as_bytes();
+        while start > 0 && matches!(bb[start - 1], b' ' | b'\t' | b'\r' | b'\n') {
+            start -= 1;
+        }
+        let word_end = start;
+        while start > 0 && !matches!(bb[start - 1], b' ' | b'\t' | b'\r' | b'\n' | b';' | b',') {
+            start -= 1;
+        }
+        let word = &before[start..word_end];
+        let drop_pred = matches!(
+            pred_full(word, prefixes).as_str(),
+            RDFS_SUBCLASSOF | OWL_EQUIVALENT_CLASS
+        );
+        if !drop_pred {
+            start = word_end;
+        }
+        // 往后吃掉空白与分隔符
+        let mut end = be;
+        let bytes = working.as_bytes();
+        while end < bytes.len() && matches!(bytes[end], b' ' | b'\t' | b'\r' | b'\n' | b',' | b';')
+        {
+            end += 1;
+        }
+        // 往前再吃掉紧邻的 `;`（避免留下空谓词）
+        let mut s2 = start;
+        while s2 > 0 && matches!(working.as_bytes()[s2 - 1], b' ' | b'\t' | b'\r' | b'\n') {
+            s2 -= 1;
+        }
+        if s2 > 0 && working.as_bytes()[s2 - 1] == b';' {
+            start = s2 - 1;
+        }
+        let mut rep = String::with_capacity(working.len());
+        rep.push_str(&working[..start]);
+        rep.push_str(&working[end..]);
+        working = rep;
+    }
+    Some(working)
+}
+
+/// 语句原文中所有顶层/嵌套 `[ ... ]` 的字节区间（含方括号本身）。
+fn group_bracket_ranges(s: &str) -> Vec<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    let mut in_str: Option<u8> = None;
+    let mut in_iri = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        if in_iri {
+            if c == b'>' {
+                in_iri = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => in_str = Some(c),
+            b'<' => in_iri = true,
+            b'[' => stack.push(i),
+            b']' => {
+                if let Some(s0) = stack.pop() {
+                    out.push((s0, i + 1));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 取一段空白节点内容的谓语/宾语序列（用于判断 onProperty 目标）。
+fn tokenize_rest_of(inner: &str) -> Vec<Token> {
+    tokenize(inner)
+}
 /// 块内非受管谓词（label/comment/domain/range/a 之外的）原文保留。
 pub(crate) fn edit_property(ttl: &str, edit: &TtlPropertyEdit) -> StoreResult<String> {
     let targets = target_statement_indices(ttl, &edit.iri);
@@ -1008,7 +1321,8 @@ pub(crate) fn add_property(ttl: &str, edit: &TtlPropertyEdit) -> StoreResult<Str
     Ok(out)
 }
 
-/// 删除属性（同主语散块全删）。
+/// 删除属性（同主语散块全删）。针对它的 `owl:Restriction` 约束一并摘除——
+/// 否则留下悬空 `owl:onProperty`，校验会拒绝整笔落库（删类/删属性都被挡住）。
 pub(crate) fn delete_property(ttl: &str, iri: &str) -> StoreResult<String> {
     let targets = target_statement_indices(ttl, iri);
     if targets.is_empty() {
@@ -1026,7 +1340,359 @@ pub(crate) fn delete_property(ttl: &str, iri: &str) -> StoreResult<String> {
         cursor = b.end;
     }
     out.push_str(&ttl[cursor..]);
+    drop_restrictions_on_property(&out, iri)
+}
+
+/// 渲染类声明块：`subj a owl:Class ; label? comment? subClassOf? .` + kept 原文谓词。
+fn render_class_block(
+    edit: &TtlClassEdit,
+    kept: &[String],
+    prefixes: &[(String, String)],
+) -> String {
+    let subj = abbreviate_iri(&edit.iri, prefixes);
+    let class_abbr = abbreviate_iri(OWL_CLASS, prefixes);
+    // 首行同样带 `;`：否则后面接 label/comment/subClassOf 时缺谓词-宾语分隔符，
+    // 产出非法 Turtle（surgery 校验会失败/静默丢字段）。
+    let mut lines = vec![format!("{subj} a {class_abbr} ;")];
+    if !edit.label.is_empty() {
+        lines.push(format!("    rdfs:label {} ;", escape_literal(&edit.label)));
+    }
+    if !edit.comment.is_empty() {
+        lines.push(format!("    rdfs:comment {} ;", escape_literal(&edit.comment)));
+    }
+    if !edit.parents.is_empty() {
+        let objs = edit
+            .parents
+            .iter()
+            .map(|p| abbreviate_iri(p, prefixes))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("    rdfs:subClassOf {objs} ;"));
+    }
+    for k in kept {
+        lines.push(format!("    {k} ;"));
+    }
+    // 收尾：最后一个 `;` 换成 `.`（kept 为空且 parents/label/comment 全空时也要闭合）
+    let mut out = lines.join("\n");
+    if let Some(stripped) = out.strip_suffix(" ;") {
+        out = format!("{stripped} .");
+    } else {
+        out.push_str(" .");
+    }
+    out.push('\n');
+    out
+}
+
+/// 编辑类声明块（label/comment/subClassOf 受管重写，散块合并回首块；其余谓词原样保留）。
+/// 与 edit_property 同构：目标按 subject IRI 匹配，要求目标确为 `a owl:Class` 声明。
+pub(crate) fn edit_class(ttl: &str, edit: &TtlClassEdit) -> StoreResult<String> {
+    let targets = target_statement_indices(ttl, &edit.iri);
+    if targets.is_empty() {
+        return Err(StoreError::NotFound(format!(
+            "类 '{}' 未找到（无法编辑）",
+            edit.iri
+        )));
+    }
+    let prefixes = extract_prefixes(ttl);
+    let tokens = tokenize(ttl);
+    let stmts = statements(ttl, &tokens);
+    let is_class = parse_pred_objs(&stmts[targets[0]].rest).iter().any(|po| {
+        pred_full(&po.pred, &prefixes) == RDF_TYPE
+            && po.is_iri
+            && obj_full_iri(&po.obj, &prefixes) == OWL_CLASS
+    });
+    if !is_class {
+        return Err(StoreError::Other(anyhow::anyhow!(
+            "'{}' 不是 owl:Class 声明（类编辑仅作用于类块）",
+            edit.iri
+        )));
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for &ti in &targets {
+        for po in parse_pred_objs(&stmts[ti].rest) {
+            let pf = pred_full(&po.pred, &prefixes);
+            let managed =
+                matches!(pf.as_str(), RDF_TYPE | RDFS_LABEL | RDFS_COMMENT | RDFS_SUBCLASSOF);
+            if !managed {
+                kept.push(format!("{} {}", po.pred, po.obj_raw));
+            }
+        }
+    }
+    let rendered = render_class_block(edit, &kept, &prefixes);
+    let first = &stmts[targets[0]];
+    let mut out = String::with_capacity(ttl.len() + rendered.len());
+    out.push_str(&ttl[..first.start]);
+    out.push_str(&rendered);
+    let mut cursor = first.end;
+    for &ti in &targets[1..] {
+        let b = &stmts[ti];
+        out.push_str(&ttl[cursor..b.start]);
+        cursor = b.end;
+    }
+    out.push_str(&ttl[cursor..]);
     Ok(out)
+}
+
+/// 提取某主语在 TTL 中的全部原始语句块（含结尾 `.`），按出现顺序拼接。
+/// 用于「从生效版恢复已删元素」时原样迁回工作区。
+pub(crate) fn extract_subject_raw_blocks(ttl: &str, iri: &str) -> StoreResult<String> {
+    let targets = target_statement_indices(ttl, iri);
+    if targets.is_empty() {
+        return Err(StoreError::NotFound(format!(
+            "主语 '{iri}' 在对照文本中未找到"
+        )));
+    }
+    let tokens = tokenize(ttl);
+    let stmts = statements(ttl, &tokens);
+    let mut out = String::new();
+    for &ti in &targets {
+        let b = &stmts[ti];
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(ttl[b.start..b.end].trim());
+        if !out.ends_with('.') {
+            out.push('.');
+        }
+    }
+    Ok(out)
+}
+
+/// 将原始语句块追加到 TTL 末尾（用于恢复已删元素）。
+pub(crate) fn append_raw_blocks(ttl: &str, blocks: &str) -> String {
+    let trimmed = ttl.trim_end();
+    if blocks.trim().is_empty() {
+        return trimmed.to_string();
+    }
+    format!("{trimmed}\n\n{}\n", blocks.trim())
+}
+
+/// 删除类声明块（同主语散块全删）。引用检查在 store 层做（删除前）。
+pub(crate) fn delete_class(ttl: &str, iri: &str) -> StoreResult<String> {
+    let targets = target_statement_indices(ttl, iri);
+    if targets.is_empty() {
+        return Err(StoreError::NotFound(format!(
+            "类 '{iri}' 未找到（无法删除）"
+        )));
+    }
+    let tokens = tokenize(ttl);
+    let stmts = statements(ttl, &tokens);
+    let mut out = String::with_capacity(ttl.len());
+    let mut cursor = 0;
+    for &ti in &targets {
+        let b = &stmts[ti];
+        out.push_str(&ttl[cursor..b.start]);
+        cursor = b.end;
+    }
+    out.push_str(&ttl[cursor..]);
+    Ok(out)
+}
+
+/// IRI 末段（local name）；缩写形（`:Route` / `ns:Route`）再剥一层前缀。
+fn iri_local_name(iri: &str) -> &str {
+    let tail = iri.rsplit(['#', '/']).next().unwrap_or(iri);
+    tail.rsplit(':').next().unwrap_or(tail)
+}
+
+/// 松散 IRI 相等（末段 local name 相同）；空串一律不相等。
+fn iri_loose_eq(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let sa = iri_local_name(a);
+    let sb = iri_local_name(b);
+    !sa.is_empty() && sa == sb
+}
+
+/// 收集属性全部 `rdfs:domain`（多定义域；与 list_properties 首见值不同）。
+pub(crate) fn collect_property_domains(ttl: &str, prop_iri: &str) -> Vec<String> {
+    let prefixes = extract_prefixes(ttl);
+    let tokens = tokenize(ttl);
+    let stmts = statements(ttl, &tokens);
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    for stmt in &stmts {
+        let Some(subject) = &stmt.subject else { continue };
+        if subject_full_iri(subject, &prefixes) != prop_iri {
+            continue;
+        }
+        for po in parse_pred_objs(&stmt.rest) {
+            if pred_full(&po.pred, &prefixes) != RDFS_DOMAIN || !po.is_iri {
+                continue;
+            }
+            let d = obj_full_iri(&po.obj, &prefixes);
+            if !d.is_empty() && seen.insert(d.clone()) {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+/// 重写属性定义域列表（可多个）；保留 label/comment/range/非受管谓词。
+fn set_property_domains(ttl: &str, prop_iri: &str, domains: &[String]) -> StoreResult<String> {
+    let props = list_properties(ttl);
+    let Some(mut edit) = props.into_iter().find(|p| p.iri == prop_iri) else {
+        return Err(StoreError::NotFound(format!(
+            "属性 '{prop_iri}' 未找到（无法改定义域）"
+        )));
+    };
+    let prefixes = extract_prefixes(ttl);
+    let targets = target_statement_indices(ttl, prop_iri);
+    let tokens = tokenize(ttl);
+    let stmts = statements(ttl, &tokens);
+    let mut kept: Vec<String> = Vec::new();
+    for &ti in &targets {
+        for po in parse_pred_objs(&stmts[ti].rest) {
+            let pf = pred_full(&po.pred, &prefixes);
+            let managed = matches!(
+                pf.as_str(),
+                RDF_TYPE | RDFS_LABEL | RDFS_COMMENT | RDFS_DOMAIN | RDFS_RANGE
+            );
+            if !managed {
+                kept.push(format!("{} {}", po.pred, po.obj_raw));
+            }
+        }
+    }
+    edit.domain = domains.first().cloned().unwrap_or_default();
+    for d in domains.iter().skip(1) {
+        kept.push(format!("rdfs:domain {}", abbreviate_iri(d, &prefixes)));
+    }
+    let rendered = render_property_block(&edit, &kept, &prefixes);
+    let first = &stmts[targets[0]];
+    let mut out = String::with_capacity(ttl.len() + rendered.len());
+    out.push_str(&ttl[..first.start]);
+    out.push_str(&rendered);
+    let mut cursor = first.end;
+    for &ti in &targets[1..] {
+        let b = &stmts[ti];
+        out.push_str(&ttl[cursor..b.start]);
+        cursor = b.end;
+    }
+    out.push_str(&ttl[cursor..]);
+    Ok(out)
+}
+
+/// 卡片硬删类：按业务规则级联后删类（不因属性/关系引用拒绝）。
+/// - datatype：唯一定义域为 C → 删属性；多定义域含 C → 摘掉 C
+/// - object：domain 或 range 触及 C → 删整条关系
+/// - 其他类以 C 为父的 subClassOf → 从父类列表去掉 C
+/// - 最后删类块；若仍有无法清理的引用（如实例 rdf:type）→ 人话错误
+pub(crate) fn delete_class_cascade(ttl: &str, class_iri: &str) -> StoreResult<String> {
+    let metas = list_class_metas(ttl);
+    // 规范 IRI：前端给的就是文档里的全形 IRI 时严格比较（不同命名空间的同名类
+    // 不被误删）；只有拿到缩写/短名时才退回 local name 兜底匹配。
+    let strict = metas.iter().any(|m| m.iri == class_iri);
+    let class_iri: String = if strict {
+        class_iri.to_string()
+    } else {
+        metas
+            .iter()
+            .find(|m| iri_loose_eq(&m.iri, class_iri))
+            .map(|m| m.iri.clone())
+            .unwrap_or_else(|| class_iri.to_string())
+    };
+    let is_c = |iri: &str| {
+        if strict {
+            iri == class_iri
+        } else {
+            iri_loose_eq(iri, &class_iri)
+        }
+    };
+
+    let mut ws = ttl.to_string();
+    for p in list_properties(&ws) {
+        let domains = collect_property_domains(&ws, &p.iri);
+        let domain_hits = domains.iter().any(|d| is_c(d));
+        if p.kind == "object" {
+            if domain_hits || is_c(&p.range) {
+                ws = delete_property(&ws, &p.iri)?;
+            }
+            continue;
+        }
+        // datatype（及其他非 object）：独占则删，共享则仅摘掉 C
+        if !domain_hits {
+            continue;
+        }
+        let others: Vec<String> = domains.into_iter().filter(|d| !is_c(d)).collect();
+        if others.is_empty() {
+            ws = delete_property(&ws, &p.iri)?;
+        } else {
+            ws = set_property_domains(&ws, &p.iri, &others)?;
+        }
+    }
+
+    // 其他类以 C 为父：从各自父类列表去掉 C（保留其余父类）
+    let children_of_c: Vec<String> = list_subclass_of_edges(&ws)
+        .into_iter()
+        .filter(|(_, parent)| is_c(parent))
+        .map(|(child, _)| child)
+        .filter(|child| !is_c(child))
+        .collect();
+    for child in children_of_c {
+        let meta = metas.iter().find(|m| m.iri == child);
+        let parents: Vec<String> = list_subclass_of_edges(&ws)
+            .into_iter()
+            .filter(|(c, _)| c == &child)
+            .map(|(_, p)| p)
+            .filter(|p| !is_c(p))
+            .collect();
+        let edit = TtlClassEdit {
+            iri: child,
+            label: meta.map(|m| m.label.clone()).unwrap_or_default(),
+            comment: meta.map(|m| m.comment.clone()).unwrap_or_default(),
+            parents,
+        };
+        ws = edit_class(&ws, &edit)?;
+    }
+
+    // 属性/关系/继承已清；剩余（实例数据、等价类等）需用户自行处理，
+    // 错误只给业务语言，不列出引用方 IRI。
+    if !find_class_references(&ws, &class_iri).is_empty() {
+        return Err(StoreError::Other(anyhow::anyhow!(
+            "该类仍被其他定义引用，这里无法自动清理，请先移除相关引用后再删除"
+        )));
+    }
+    delete_class(&ws, &class_iri)
+}
+
+/// 类引用检查：全原文扫描 iri 被谁使用（排除它自己的声明块）。
+/// 返回人类可读引用描述（非空则删除应被拒绝）。
+pub(crate) fn find_class_references(ttl: &str, iri: &str) -> Vec<String> {
+    let prefixes = extract_prefixes(ttl);
+    let tokens = tokenize(ttl);
+    let stmts = statements(ttl, &tokens);
+    let mut refs: Vec<String> = Vec::new();
+    for stmt in &stmts {
+        let Some(subject) = &stmt.subject else { continue };
+        let subj_iri = subject_full_iri(subject, &prefixes);
+        if subj_iri == iri {
+            continue; // 自身声明块不算引用
+        }
+        for po in parse_pred_objs(&stmt.rest) {
+            let pf = pred_full(&po.pred, &prefixes);
+            let used = match pf.as_str() {
+                p if p == RDFS_DOMAIN || p == RDFS_RANGE || p == RDFS_SUBCLASSOF => {
+                    po.is_iri && obj_full_iri(&po.obj, &prefixes) == iri
+                }
+                p if p == RDF_TYPE => po.is_iri && obj_full_iri(&po.obj, &prefixes) == iri,
+                _ => false,
+            };
+            if used {
+                let what = match pf.as_str() {
+                    p if p == RDFS_DOMAIN => "rdfs:domain",
+                    p if p == RDFS_RANGE => "rdfs:range",
+                    p if p == RDFS_SUBCLASSOF => "rdfs:subClassOf（子类）",
+                    _ => "rdf:type（实例）",
+                };
+                refs.push(format!("{subj_iri} 的 {what}"));
+            }
+        }
+    }
+    refs
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1412,5 +2078,314 @@ ns:b a owl:DatatypeProperty .
             "属性证据注解应被提取"
         );
         assert!(notes_by_element.get(&prop.0).unwrap()[0].starts_with("evidence:"));
+    }
+    #[test]
+    fn edit_class_rewrites_managed_and_keeps_rest() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+:Policy a owl:Class ;
+    rdfs:label "保单" ;
+    rdfs:seeAlso <https://ext.example/ref> .
+:Company a owl:Class .
+"#;
+        let edited = edit_class(
+            ttl,
+            &TtlClassEdit {
+                iri: "https://x.org/t#Policy".into(),
+                label: "保险单".into(),
+                comment: "核心业务对象".into(),
+                parents: vec!["https://x.org/t#Contract".into()],
+            },
+        )
+        .unwrap();
+        assert!(edited.contains("rdfs:label \"保险单\""));
+        assert!(edited.contains("rdfs:comment \"核心业务对象\""));
+        assert!(edited.contains("rdfs:subClassOf :Contract"));
+        // 未受管谓词原样保留
+        assert!(edited.contains("rdfs:seeAlso <https://ext.example/ref>"));
+        // 其他类块不动
+        assert!(edited.contains(":Company a owl:Class"));
+        // 原有的空 label/comment/subClassOf 不再重复
+        assert!(!edited.contains("\"保单\""));
+        // 块结构合法：`a owl:Class ;` 起头，后续谓词可被重新解析回来
+        assert!(edited.contains(":Policy a owl:Class ;"), "edited: {edited}");
+        let metas = list_class_metas(&edited);
+        let policy = metas
+            .iter()
+            .find(|m| m.iri == "https://x.org/t#Policy")
+            .expect("Policy 元数据应可回读");
+        assert_eq!(policy.label, "保险单");
+        assert_eq!(policy.comment, "核心业务对象");
+        assert!(
+            list_subclass_of_edges(&edited)
+                .iter()
+                .any(|(c, p)| c == "https://x.org/t#Policy"
+                    && p == "https://x.org/t#Contract"),
+            "父类边应可回读: {edited}"
+        );
+    }
+
+    #[test]
+    fn edit_class_rejects_non_class_subject() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:holders a owl:ObjectProperty ;
+    rdfs:domain :Policy .
+:Policy a owl:Class .
+"#;
+        let err = edit_class(
+            ttl,
+            &TtlClassEdit {
+                iri: "https://x.org/t#holders".into(),
+                ..Default::default()
+            },
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn find_class_references_covers_domain_type_subclass() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:Policy a owl:Class .
+:holder a owl:Class ; rdfs:subClassOf :Party .
+:insures a owl:ObjectProperty ; rdfs:domain :Policy ; rdfs:range :Party .
+:alice a :Party .
+"#;
+        let refs = find_class_references(ttl, "https://x.org/t#Party");
+        assert_eq!(refs.len(), 3, "subClassOf + range + rdf:type：{refs:?}");
+        // 自身声明块不算引用
+        assert!(find_class_references(ttl, "https://x.org/t#Policy")
+            .iter()
+            .all(|r| !r.contains("Policy a") && !r.contains("Policy 的")));
+    }
+
+    #[test]
+    fn delete_class_removes_block_only() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+:Policy a owl:Class ;
+    rdfs:label "保单" .
+:Company a owl:Class .
+"#;
+        let deleted = delete_class(ttl, "https://x.org/t#Policy").unwrap();
+        assert!(!deleted.contains(":Policy"));
+        assert!(deleted.contains(":Company a owl:Class"));
+    }
+
+    #[test]
+    fn delete_property_drops_named_restriction_block() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:TestDrive a owl:Class .
+:convertsLead a owl:ObjectProperty ;
+    rdfs:domain :TestDrive ;
+    rdfs:range :Lead .
+:R a owl:Restriction ;
+    owl:onProperty :convertsLead ;
+    owl:minCardinality "1"^^xsd:nonNegativeInteger .
+"#;
+        let out = delete_property(ttl, "https://x.org/t#convertsLead").unwrap();
+        assert!(!out.contains(":convertsLead a owl:ObjectProperty"));
+        assert!(!out.contains("owl:onProperty"), "具名约束块应一并删除: {out}");
+        assert!(out.contains(":TestDrive a owl:Class"));
+    }
+
+    #[test]
+    fn delete_property_drops_inline_restriction_value() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:TestDrive a owl:Class .
+:Lead a owl:Class .
+:convertsLead a owl:ObjectProperty ;
+    rdfs:domain :TestDrive ;
+    rdfs:range :Lead .
+:TestDrive rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :convertsLead ; owl:minCardinality "1"^^xsd:nonNegativeInteger ] .
+:TestDrive rdfs:subClassOf :OtherClass .
+"#;
+        let out = delete_property(ttl, "https://x.org/t#convertsLead").unwrap();
+        assert!(!out.contains("convertsLead"), "内联约束值应摘除: {out}");
+        assert!(!out.contains("onProperty"), "不应留下悬空 onProperty: {out}");
+        // 其他 subClassOf 值必须保留
+        assert!(out.contains(":OtherClass"), "无关的 subClassOf 值应保留: {out}");
+        assert!(out.contains(":TestDrive a owl:Class"));
+    }
+
+    /// 语句只剩被删约束时，整条语句必须丢弃——否则留下 `:C .` 残句，
+    /// 解析器报 ". is not a valid predicate"，整笔编辑被拒（真实库踩过）。
+    #[test]
+    fn delete_property_removes_statement_left_without_predicate() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:TestDrive a owl:Class .
+:Lead a owl:Class .
+:convertsLead a owl:ObjectProperty ;
+    rdfs:domain :TestDrive ;
+    rdfs:range :Lead .
+:TestDrive rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :convertsLead ; owl:minCardinality "1"^^xsd:nonNegativeInteger ] .
+"#;
+        let out = delete_property(ttl, "https://x.org/t#convertsLead").unwrap();
+        assert!(!out.contains("onProperty"), "约束应整条移除: {out}");
+        // 不得留下只有主语 + `.` 的残句
+        for line in out.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            assert!(
+                !t.ends_with(" .") || t.matches(char::is_whitespace).count() > 1,
+                "出现无谓词残句: {t:?}\n全部输出:\n{out}"
+            );
+        }
+        // 必须仍能被 oxigraph 解析
+        use oxigraph::io::{RdfFormat, RdfParser};
+        let temp = oxigraph::store::Store::new().unwrap();
+        temp.load_from_reader(RdfParser::from_format(RdfFormat::Turtle), out.as_bytes())
+            .unwrap_or_else(|e| panic!("输出不是合法 Turtle: {e}\n{out}"));
+    }
+
+    #[test]
+    fn delete_class_cascade_removes_restrictions_on_deleted_relation() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:TestDrive a owl:Class .
+:Lead a owl:Class .
+:convertsLead a owl:ObjectProperty ;
+    rdfs:domain :TestDrive ;
+    rdfs:range :Lead .
+:TestDrive rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :convertsLead ; owl:minCardinality "1"^^xsd:nonNegativeInteger ] .
+"#;
+        let out = delete_class_cascade(ttl, "https://x.org/t#TestDrive").unwrap();
+        assert!(!out.contains(":TestDrive a owl:Class"));
+        assert!(!out.contains("convertsLead"), "关系删除时其约束应一并清理: {out}");
+        assert!(!out.contains("onProperty"), "不得留下悬空 onProperty: {out}");
+        assert!(out.contains(":Lead a owl:Class"));
+    }
+
+    #[test]
+    fn delete_class_cascade_removes_exclusive_attrs_and_relations() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:Route a owl:Class .
+:Store a owl:Class .
+:name a owl:DatatypeProperty ;
+    rdfs:domain :Route ;
+    rdfs:range xsd:string .
+:belongsTo a owl:ObjectProperty ;
+    rdfs:domain :Route ;
+    rdfs:range :Store .
+"#;
+        let out = delete_class_cascade(ttl, "https://x.org/t#Route").unwrap();
+        assert!(!out.contains(":Route a owl:Class"));
+        assert!(!out.contains(":name a owl:DatatypeProperty"));
+        assert!(!out.contains(":belongsTo a owl:ObjectProperty"));
+        assert!(out.contains(":Store a owl:Class"));
+    }
+
+    #[test]
+    fn delete_class_cascade_strips_shared_multi_domain() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:Route a owl:Class .
+:Lead a owl:Class .
+:note a owl:DatatypeProperty ;
+    rdfs:domain :Route ;
+    rdfs:domain :Lead ;
+    rdfs:range xsd:string .
+"#;
+        let domains = collect_property_domains(ttl, "https://x.org/t#note");
+        assert_eq!(domains.len(), 2);
+        let out = delete_class_cascade(ttl, "https://x.org/t#Route").unwrap();
+        assert!(!out.contains(":Route a owl:Class"));
+        assert!(out.contains(":note a owl:DatatypeProperty"));
+        let left = collect_property_domains(&out, "https://x.org/t#note");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0], "https://x.org/t#Lead");
+    }
+
+    #[test]
+    fn delete_class_cascade_removes_range_side_relation() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:Lead a owl:Class .
+:Route a owl:Class .
+:fromLead a owl:ObjectProperty ;
+    rdfs:domain :Lead ;
+    rdfs:range :Route .
+"#;
+        let out = delete_class_cascade(ttl, "https://x.org/t#Route").unwrap();
+        assert!(!out.contains(":Route a owl:Class"));
+        // 关系仅 range 触及 C 也整条删除
+        assert!(!out.contains(":fromLead"));
+        assert!(out.contains(":Lead a owl:Class"));
+    }
+
+    #[test]
+    fn delete_class_cascade_keeps_other_parents_of_children() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:Base a owl:Class .
+:Route a owl:Class ;
+    rdfs:subClassOf :Base .
+:Express a owl:Class ;
+    rdfs:subClassOf :Route , :Base .
+"#;
+        let out = delete_class_cascade(ttl, "https://x.org/t#Route").unwrap();
+        assert!(!out.contains(":Route a owl:Class"));
+        assert!(!out.contains(":Route ;") && !out.contains(":Route ,"));
+        let edges = list_subclass_of_edges(&out);
+        assert!(edges
+            .iter()
+            .any(|(c, p)| c == "https://x.org/t#Express" && p == "https://x.org/t#Base"));
+        assert!(!edges
+            .iter()
+            .any(|(_, p)| p == "https://x.org/t#Route"));
+    }
+
+    #[test]
+    fn delete_class_cascade_reports_friendly_error_on_instance_refs() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+:Route a owl:Class .
+:route1 a :Route .
+"#;
+        let err = delete_class_cascade(ttl, "https://x.org/t#Route").unwrap_err();
+        let msg = err.to_string();
+        // 人话错误：不堆引用方 IRI
+        assert!(!msg.contains("https://x.org/t#route1"), "msg: {msg}");
+        assert!(msg.contains("引用"), "msg: {msg}");
+    }
+
+    #[test]
+    fn delete_class_cascade_accepts_abbreviated_iri() {
+        let ttl = r#"@prefix : <https://x.org/t#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:Route a owl:Class .
+:name a owl:DatatypeProperty ;
+    rdfs:domain :Route ;
+    rdfs:range xsd:string .
+"#;
+        let out = delete_class_cascade(ttl, ":Route").unwrap();
+        assert!(!out.contains(":Route a owl:Class"));
+        assert!(!out.contains(":name"));
     }
 }

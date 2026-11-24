@@ -665,7 +665,7 @@ pub async fn cancel_stream(
 
 /// 把本体设计宪章（不变点）摘要追加到 conversation-scope 注脚。
 ///
-/// Palantir `OntologyCharter` 与 W3C `TtlCharter` 字段一致（业务场景/业务本质），
+/// Palantir `OntologyCharter` 与 W3C `TtlCharter` 字段一致（业务场景/业务目标），
 /// 调用方取其字段 String 传入即可，避免泛型/重复代码。
 /// 完整 charter 走只读工具获取。
 /// 宪章两字段全空 = 未填写（手工导入的本体常见）
@@ -693,14 +693,14 @@ impl CharterFields for ontology_store::payload::OntologyCharter {
 /// import 撞宪章空检测闸门（白白浪费十几分钟工作）
 fn append_charter_missing_notice(buf: &mut String) {
     buf.push_str("  ⚠️ 该本体的设计宪章为空（多为此前手工导入）。设计宪章是建模的业务意图基线：\n");
-    buf.push_str("  **若本轮任务涉及修改/迭代该本体，请先知会用户在「设计宪章」面板补全业务场景/业务本质两字段\n");
+    buf.push_str("  **若本轮任务涉及修改/迭代该本体，请先知会用户在「设计宪章」面板补全业务场景/业务目标两字段\n");
     buf.push_str("  （可起草建议稿供用户修改确认，写入由用户操作），不要开始建模工作。**\n");
     buf.push_str("  （import 时宪章空检测闸门会拒绝导入。）\n");
 }
 
 fn append_charter_summary(buf: &mut String, business_essence: &str) {
     if !business_essence.is_empty() {
-        buf.push_str(&format!("  业务本质：{business_essence}
+        buf.push_str(&format!("  业务目标：{business_essence}
 "));
     }
 }
@@ -725,7 +725,7 @@ impl CharterFields for CharterSummary {
 /// 保持本函数无状态可测。语义约定（与 send_message 调用点一致）：
 /// - charter 闭包返回 None = store 查询 Err（不追加任何内容）
 /// - 返回 Some 且两字段全空白 = 宪章未填写（追加缺失知会）
-/// - 返回 Some 且 business_essence 非空 = 追加业务本质摘要
+/// - 返回 Some 且 business_essence 非空 = 追加业务目标摘要
 fn render_conversation_scope(
     source_tables: &[(String, Vec<String>)],
     active_folders: &[String],
@@ -773,8 +773,8 @@ fn render_conversation_scope(
     // 本体引用（混存两种：Palantir api_name 或 W3C 本体 IRI，二者不冲突）。
     //  - W3C：IRI 含 `://`（如 https://...#Ont），用 export_ontology_ttl / query_ontology_sparql 钻取
     //  - Palantir：PascalCase api_name，用 describe_ontology / describe_object_type 钻取
-    // 注脚附 charter 摘要（业务本质）——让 AI 无需调工具
-    // 就知道本体是干什么的、有哪些红线（决策：本体不变点，向 AI 说明业务本质）。
+    // 注脚附 charter 摘要（业务目标）——让 AI 无需调工具
+    // 就知道本体是干什么的、有哪些红线（决策：本体不变点，向 AI 说明业务目标）。
     if !active_ontologies.is_empty() {
         let (mut ttl_refs, mut palantir_refs) = (Vec::new(), Vec::new());
         for ont in active_ontologies {
@@ -796,7 +796,7 @@ fn render_conversation_scope(
             }
         }
         if !ttl_refs.is_empty() {
-            buf.push_str("\n[本体·W3C 标准] 可用 export_ontology_ttl(ontology_iri) 取 Turtle 全文，query_ontology_sparql(ontology_iri, sparql) 跑 SPARQL 查询（类/属性/规则/实例）：\n");
+            buf.push_str("\n[本体·W3C 标准] export_ontology_ttl(iri) 默认读已发布生效摘要；mode=\"full\" 读工作区草稿做增量编辑；query_ontology_sparql 跑 SPARQL：\n");
             for iri in ttl_refs {
                 buf.push_str(&format!("- {iri}\n"));
                 match ttl_charter(iri) {
@@ -888,7 +888,7 @@ mod tests {
 
     #[test]
     fn scope_footer_ontologies_split_by_scheme_with_charter_summary() {
-        // Palantir api_name（无 ://）与 W3C IRI（含 ://）分组；charter 有值时附业务本质
+        // Palantir api_name（无 ://）与 W3C IRI（含 ://）分组；charter 有值时附业务目标
         let with_charter = |ont: &str| {
             let _ = ont;
             Some(CharterSummary {
@@ -903,14 +903,14 @@ mod tests {
         );
         assert!(out.contains("\n[本体·平台私有]"));
         assert!(out.contains("- CarOntology\n"));
-        assert!(out.contains("  业务本质：成交意愿的结构化表达\n"));
+        assert!(out.contains("  业务目标：成交意愿的结构化表达\n"));
         assert!(out.contains("\n[本体·W3C 标准]"));
         assert!(out.contains("- https://example.com#Ont\n"));
     }
 
     #[test]
     fn scope_footer_empty_charter_appends_missing_notice() {
-        // 宪章两字段全空白 = 未填写 → 追加缺失知会（不追加业务本质行）
+        // 宪章两字段全空白 = 未填写 → 追加缺失知会（不追加业务目标行）
         let empty_charter = |ont: &str| {
             let _ = ont;
             Some(CharterSummary {
@@ -924,7 +924,7 @@ mod tests {
             &empty_charter, &no_charter,
         );
         assert!(out.contains("设计宪章为空"));
-        assert!(!out.contains("业务本质："));
+        assert!(!out.contains("业务目标："));
     }
 
     #[test]
@@ -937,7 +937,7 @@ mod tests {
         );
         assert!(out.contains("- Ont\n"));
         assert!(!out.contains("设计宪章为空"));
-        assert!(!out.contains("业务本质："));
+        assert!(!out.contains("业务目标："));
     }
 }
 

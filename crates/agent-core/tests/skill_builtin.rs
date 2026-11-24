@@ -1,15 +1,20 @@
 //! 内置 skill 兼容性自测（AGENTS.md 工作守则 6）。
 //!
-//! 验证内置 skill（src-tauri/resources/skills/）能被 SkillDirectory::load
-//! 成功加载、name 匹配目录名、description 非空且 ≤1024 字符、body 非空、
-//! references 可读。
+//! 验证内置 skill（src-tauri/resources/skills/）能被**项目自己的加载路径**成功
+//! 发现并入库：name 匹配目录名、description 非空且 ≤1024 字符、body 非空且开头
+//! 无 frontmatter 残片、references 四类契约文档齐全且可按 path 读到。
+//!
+//! 这里刻意不调 `agent_skills::SkillDirectory::load`：上游那个构造在 CRLF 输入上
+//! 会 panic（`find_closing_delimiter` 每行少算 1 字节），而生产代码已经不走它了
+//! ——测一个用不到的 API 只会把上游缺陷伪装成我们的红灯。测 `SkillManager` 这条
+//! 真实链路才能同时守住「内置技能合规」与「Windows CRLF 检出下仍然可用」两件事。
 //!
 //! 内置 skill 随应用分发，必须在发版前保证格式合规。
 //! 新增/移除内置 skill 时，同步更新下方 `EXPECTED` 列表。
 
-use agent_core::skill::SkillManager;
-use agent_skills::SkillDirectory;
+use agent_core::skill::{SkillManager, SkillSource};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// 当前实际分发的内置 skill 集合（目录名 = skill name）。
 /// 与 `src-tauri/resources/skills/` 下的子目录一一对应。
@@ -38,35 +43,59 @@ fn builtin_dir_exists() -> bool {
     builtin_skills_dir().exists()
 }
 
+/// 用内置目录构造一个管理器（user/external 指向不存在的路径，只扫内置）。
+fn manager_for_builtin() -> SkillManager {
+    let mem = Arc::new(memory::Memory::open_in_memory().unwrap());
+    SkillManager::new(
+        mem,
+        builtin_skills_dir(),
+        PathBuf::from("/nonexistent/user"),
+        vec![],
+    )
+}
+
 #[test]
 fn builtin_skills_load_successfully() {
     if !builtin_dir_exists() {
         eprintln!("[skip] builtin skills dir not found, skipping");
         return;
     }
-    let dir = builtin_skills_dir();
+    let mgr = manager_for_builtin();
+    let mut all = mgr.discover_all();
     for name in EXPECTED {
-        let skill_dir = dir.join(name);
+        let rec = all
+            .iter_mut()
+            .find(|r| r.name == *name)
+            .unwrap_or_else(|| panic!("内置 skill {name} 未被发现（SKILL.md 解析失败或 name 与目录名不一致）"));
         assert!(
-            skill_dir.exists(),
-            "内置 skill 目录缺失: {}",
-            skill_dir.display()
+            matches!(rec.source, SkillSource::Builtin),
+            "{name} 来源应为 Builtin"
         );
-        let loaded = SkillDirectory::load(&skill_dir)
-            .unwrap_or_else(|e| panic!("加载内置 skill {} 失败: {e}", name));
-        // name 匹配目录名（SkillDirectory::load 强校验）
-        assert_eq!(loaded.skill().name().as_str(), *name);
         // description 非空且 ≤1024 字符
-        let desc = loaded.skill().description().as_str();
-        assert!(!desc.is_empty(), "{} description 为空", name);
+        assert!(!rec.description.is_empty(), "{name} description 为空");
         assert!(
-            desc.chars().count() <= 1024,
+            rec.description.chars().count() <= 1024,
             "{} description 超 1024 字符（{}）",
             name,
-            desc.chars().count()
+            rec.description.chars().count()
         );
-        // body 非空
-        assert!(!loaded.skill().body().trim().is_empty(), "{} body 为空", name);
+        // body 经真实入库路径可读到，且开头不是 frontmatter 残片
+        // （CRLF 缺陷的「不 panic 但错位」那一档正是从 body 头部露出 `---`）
+        let id = mgr
+            .ensure_skill_documented(rec)
+            .unwrap_or_else(|e| panic!("{name} 入库失败: {e}"));
+        let read = mgr
+            .memory()
+            .read_document(&id, None, None)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name} 入库后读不到"));
+        let (_, _, _, body, _) = read;
+        assert!(!body.trim().is_empty(), "{name} body 为空");
+        assert!(
+            !body.trim_start().starts_with('-'),
+            "{name} body 开头疑似 frontmatter 残片: {:?}",
+            &body.chars().take(40).collect::<String>()
+        );
     }
 }
 
@@ -76,29 +105,34 @@ fn builtin_ontology_modeling_has_references() {
         eprintln!("[skip] builtin skills dir not found, skipping");
         return;
     }
-    let dir = builtin_skills_dir();
-    let skill_dir = dir.join("ontology-modeling");
-    let loaded = SkillDirectory::load(&skill_dir).expect("load ontology-modeling skill");
-    assert!(
-        loaded.has_references(),
-        "ontology-modeling skill 应有 references/ 目录"
-    );
-    let refs = loaded.references().expect("list references");
-    // 四份契约文档必须齐全
+    let mgr = manager_for_builtin();
+    let mut all = mgr.discover_all();
+    let rec = all
+        .iter_mut()
+        .find(|r| r.name == "ontology-modeling")
+        .expect("内置 ontology-modeling skill 应被发现");
+    mgr.ensure_skill_documented(rec)
+        .expect("入库应成功");
+
+    let paths = rec.resource_doc_paths.clone().unwrap_or_default();
+    // 四份契约文档必须齐全，且能按 doc path 读到非空内容（模型侧就靠这条路取资源）
     for expected_ref in &[
         "gaia-schema-contract.md",
         "material-to-ontology.md",
         "naming-conventions.md",
         "ontology-package-format.md",
     ] {
+        let want = format!("skill://ontology-modeling/references/{expected_ref}");
         assert!(
-            refs.iter().any(|p| p.file_name().is_some_and(|n| n == *expected_ref)),
-            "references/ 应含 {expected_ref}"
+            paths.iter().any(|p| p == &want),
+            "references 未入库: {want}，实际={paths:?}"
         );
-        let content = loaded
-            .read_reference(expected_ref)
-            .unwrap_or_else(|e| panic!("read {expected_ref}: {e}"));
-        assert!(!content.is_empty(), "{expected_ref} 内容为空");
+        let read = mgr
+            .memory()
+            .read_document_by_path(&want)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{expected_ref} 应按 path 可查"));
+        assert!(!read.3.is_empty(), "{expected_ref} 内容为空");
     }
 }
 
@@ -108,16 +142,14 @@ fn builtin_skills_discoverable_via_manager() {
         eprintln!("[skip] builtin skills dir not found, skipping");
         return;
     }
-    let dir = builtin_skills_dir();
-    let mem = std::sync::Arc::new(memory::Memory::open_in_memory().unwrap());
-    let mgr = SkillManager::new(
-        mem,
-        dir,
-        PathBuf::from("/nonexistent/user"),
-        vec![],
-    );
+    let mgr = manager_for_builtin();
     let all = mgr.discover_all();
-    assert_eq!(all.len(), EXPECTED.len(), "应发现 {} 个内置 skill", EXPECTED.len());
+    assert_eq!(
+        all.len(),
+        EXPECTED.len(),
+        "应发现 {} 个内置 skill",
+        EXPECTED.len()
+    );
     let names: Vec<_> = all.iter().map(|r| r.name.clone()).collect();
     for expected in EXPECTED {
         assert!(
@@ -127,5 +159,5 @@ fn builtin_skills_discoverable_via_manager() {
         );
     }
     // 全部标记为 Builtin
-    assert!(all.iter().all(|r| matches!(r.source, agent_core::skill::SkillSource::Builtin)));
+    assert!(all.iter().all(|r| matches!(r.source, SkillSource::Builtin)));
 }

@@ -42,15 +42,25 @@ import type {
   TtlCharter,
   TtlChangelog,
   TtlPropertyEdit,
+  TtlClassEdit,
+  TtlClassMeta,
+  TtlVersionDiff,
+  TtlVersionSummary,
   ValidationIssue,
   ValidationReview,
-  AutoDisputeItem,
-  AutoDisputeState,
+  ReviewRound,
   PostArbitrationState,
   CoverageMatrix,
   BReviewOutput,
   AReviseResult,
   SetProviderInput_Deserialize,
+  ElementMapping,
+  ElementMappingItem,
+  MappingCoverage,
+  MappingElementRef,
+  MappingIntegrityReport,
+  MappingSuggestion,
+  MappingWriteResult,
 } from "@/lib/ipc/bindings";
 import type {
   ActiveScopeDto,
@@ -300,6 +310,102 @@ export const ipc = {
   /** 执行导入（DAG 落库），返回 ImportResult JSON 字符串。 */
   listElementEvidence: (standard: string, ontologyKey: string) =>
     unwrap<string>(raw.listElementEvidence(standard, ontologyKey) as never),
+
+  // ── 元素映射绑定层（决策 25）─────────────────────────────────
+  // standard: "palantir"（ontology_key = 本体 api_name）或 "w3c"（= 本体 IRI）。
+  /** 某本体的全部映射。 */
+  listElementMappings: (standard: string, ontologyKey: string) =>
+    unwrap<ElementMapping[]>(
+      raw.listElementMappings(standard, ontologyKey) as never,
+    ),
+  /** 某元素的映射（属性卡/关系卡渲染用）。 */
+  listElementMappingsFor: (
+    standard: string,
+    ontologyKey: string,
+    elementType: string,
+    elementId: string,
+  ) =>
+    unwrap<ElementMapping[]>(
+      raw.listElementMappingsFor(
+        standard,
+        ontologyKey,
+        elementType,
+        elementId,
+      ) as never,
+    ),
+  /** 本体元素全集（缺口清单/候选建议输入；不含映射状态）。 */
+  listMappingElements: (standard: string, ontologyKey: string) =>
+    unwrap<MappingElementRef[]>(
+      raw.listMappingElements(standard, ontologyKey) as never,
+    ),
+  /** 覆盖率（类/属性/关系分别统计）。 */
+  mappingCoverage: (standard: string, ontologyKey: string) =>
+    unwrap<MappingCoverage>(
+      raw.mappingCoverage(standard, ontologyKey) as never,
+    ),
+  /** 完整性报告（孤儿/失效/未核对）。 */
+  mappingIntegrity: (standard: string, ontologyKey: string) =>
+    unwrap<MappingIntegrityReport>(
+      raw.mappingIntegrity(standard, ontologyKey) as never,
+    ),
+  /** 保存映射（按元素整组替换；空集合 = 清空该元素映射）。 */
+  saveElementMappings: (
+    standard: string,
+    ontologyKey: string,
+    items: ElementMappingItem[],
+  ) =>
+    unwrap<MappingWriteResult>(
+      raw.saveElementMappings(standard, ontologyKey, items) as never,
+    ),
+  /** 删除某元素的全部映射（返回删除行数）。 */
+  deleteElementMappings: (
+    standard: string,
+    ontologyKey: string,
+    elementType: string,
+    elementId: string,
+  ) =>
+    unwrap<number>(
+      raw.deleteElementMappings(
+        standard,
+        ontologyKey,
+        elementType,
+        elementId,
+      ) as never,
+    ),
+  /** 清理孤儿映射（需用户显式确认；返回清理行数）。 */
+  purgeOrphanMappings: (standard: string, ontologyKey: string) =>
+    unwrap<number>(raw.purgeOrphanMappings(standard, ontologyKey) as never),
+  /** 候选建议（只读；未传 elements 时用本体元素全集）。 */
+  suggestElementMappings: (
+    standard: string,
+    ontologyKey: string,
+    elements?: MappingElementRef[],
+  ) =>
+    unwrap<MappingSuggestion[]>(
+      raw.suggestElementMappings(
+        standard,
+        ontologyKey,
+        elements ?? null,
+      ) as never,
+    ),
+  /** 导出映射为多工作表工作簿并落盘，返回实际写入路径（scope: all / gap）。 */
+  exportElementMapping: (
+    standard: string,
+    ontologyKey: string,
+    scope: "all" | "gap",
+    targetPath: string,
+  ) =>
+    unwrap<string>(
+      raw.exportElementMapping(
+        standard,
+        ontologyKey,
+        scope,
+        targetPath,
+      ) as never,
+    ),
+  /** 历史属性级来源字段回填进映射表（幂等；返回回填行数）。 */
+  backfillElementMappings: (ontologyKey: string) =>
+    unwrap<number>(raw.backfillElementMappings(ontologyKey) as never),
   importOntology: async (
     payload: OntologyPayload,
     overwrite: string[],
@@ -322,7 +428,7 @@ export const ipc = {
   /** 列出本体变更历史（git commit log 式，revision 倒序）。 */
   listOntologyChangelog: (apiName: string) =>
     unwrap<OntologyChangelog[]>(raw.listOntologyChangelog(apiName)),
-  /** 读取本体设计宪章（不变点：业务场景 / 本质 / 设计意图 / 补充说明）。 */
+  /** 读取本体设计宪章（不变点：业务场景 / 业务目标）。 */
   getOntologyCharter: (apiName: string) =>
     unwrap<OntologyCharter>(raw.getOntologyCharter(apiName)),
   /** 写入/更新本体设计宪章（只有用户明确要求调整时才调用）。 */
@@ -342,9 +448,15 @@ export const ipc = {
   // ── W3C Turtle 本体（对齐 skill ontology-modeling-w3c）──
   /** 列出所有已存 W3C Turtle 本体。 */
   listOntologyTtl: () => unwrap<TtlOntologySummary[]>(raw.listOntologyTtl()),
-  /** 导出指定本体 IRI 的 Turtle 文本。 */
+  /** 导出生效发布 Turtle（文件导出；从未发布则失败）。 */
   exportOntologyTtl: (iri: string) =>
     unwrap<string>(raw.exportOntologyTtl(iri)),
+  /** 导出工作区草稿 Turtle（编辑态预览）。 */
+  exportOntologyTtlWorkspace: (iri: string) =>
+    unwrap<string>(raw.exportOntologyTtlWorkspace(iri)),
+  /** 工作区是否有未发布修改。 */
+  getOntologyWorkspaceDirty: (iri: string) =>
+    unwrap<boolean>(raw.getOntologyWorkspaceDirty(iri)),
   /** 校验 Turtle（dry-run）。 */
   validateOntologyTtl: (ttl: string) =>
     unwrap<TtlValidation>(raw.validateOntologyTtl(ttl)),
@@ -398,6 +510,13 @@ export const ipc = {
   /** 列出本体全部类的 IRI（domain/range 下拉用）。 */
   listOntologyTtlClassIris: (iri: string) =>
     unwrap<string[]>(raw.listOntologyTtlClassIris(iri)),
+  listOntologyTtlClassMetas: (iri: string) =>
+    unwrap<TtlClassMeta[]>(raw.listOntologyTtlClassMetas(iri)),
+  editOntologyTtlClass: (iri: string, edit: TtlClassEdit) =>
+    unwrap<string>(raw.editOntologyTtlClass(iri, edit)),
+  deleteOntologyTtlClass: (iri: string, classIri: string) =>
+    unwrap<string>(raw.deleteOntologyTtlClass(iri, classIri)),
+
   /** 新增属性表单的默认 IRI 前缀（与既有属性 namespace 一致）。 */
   getOntologyTtlDefaultPropertyNs: (iri: string) =>
     unwrap<string>(raw.getOntologyTtlDefaultPropertyNs(iri)),
@@ -410,33 +529,60 @@ export const ipc = {
   /** 删除属性（被引用时后端拒绝），返回手术后的完整 TTL。 */
   deleteOntologyTtlProperty: (iri: string, propertyIri: string) =>
     unwrap<string>(raw.deleteOntologyTtlProperty(iri, propertyIri)),
+  /** 变更清单逐条撤销，返回手术后的完整 TTL。 */
+  revokeOntologyWorkspaceDiffItem: (
+    iri: string,
+    item: import("@/lib/ipc/bindings").WorkspaceDiffRevokeItem,
+  ) => unwrap<string>(raw.revokeOntologyWorkspaceDiffItem(iri, item)),
+  /** 类行级联撤销（撤新增 / 恢复删除），返回手术后的完整 TTL。 */
+  revokeOntologyWorkspaceClassCascade: (
+    iri: string,
+    classIri: string,
+    op: "add" | "remove",
+  ) => unwrap<string>(raw.revokeOntologyWorkspaceClassCascade(iri, classIri, op)),
+
+  // ── W3C Turtle 本体版本管理（显式发布才留快照；回退切指针不新建版本）──
+  /** 发布当前内容为新版本（版本=里程碑），返回新 revision 号。 */
+  publishOntologyVersion: (
+    iri: string,
+    label: string,
+    description: string,
+    author: string,
+  ) => unwrap<number>(raw.publishOntologyVersion(iri, label, description, author)),
+  /** 版本历史（revision 降序；active_revision 对应条目前端标"已启用"）。 */
+  listOntologyVersions: (iri: string) =>
+    unwrap<TtlVersionSummary[]>(raw.listOntologyVersions(iri)),
+  /** 取某版本完整 TTL（正数=versions revision）。 */
+  getOntologyVersionTtl: (iri: string, revision: number) =>
+    unwrap<string>(raw.getOntologyVersionTtl(iri, revision)),
+  /** 回退到指定版本（切指针覆盖当前内容，不新建版本）。 */
+  revertOntologyVersion: (iri: string, revision: number, author: string) =>
+    unwrap<null>(raw.revertOntologyVersion(iri, revision, author)),
+  /** 当前生效发布版本（null=从未发布）。 */
+  getOntologyActiveRevision: (iri: string) =>
+    unwrap<number | null>(raw.getOntologyActiveRevision(iri)),
+  /** 删除单个版本快照（当前启用版本拒绝删除；changelog 记录保留）。 */
+  deleteOntologyVersion: (iri: string, revision: number) =>
+    unwrap<null>(raw.deleteOntologyVersion(iri, revision)),
+  /** 两版本结构化 diff（rev=0 = 当前工作区内容）。 */
+  diffOntologyVersions: (iri: string, revA: number, revB: number) =>
+    unwrap<TtlVersionDiff>(raw.diffOntologyVersions(iri, revA, revB)),
+  /** 版本上限（默认 20）。 */
+  getVersionLimit: () => unwrap<number>(raw.getVersionLimit()),
+  /** 设置版本上限（0 回退默认）。 */
+  setVersionLimit: (limit: number) => unwrap<number>(raw.setVersionLimit(limit)),
 
   // ── 校验对抗（VALIDATION-DESIGN.md v0.3.1）──
-  /** A 对 warning 级 issue 发起答辩（L3 第二层，counterEvidence 机械匹配）。 */
-  disputeIssue: (
-    issueId: string,
-    argument: string,
-    counterSourceId: string,
-    counterQuote: string,
-  ) => unwrap<string>(raw.disputeIssue(issueId, argument, counterSourceId, counterQuote)),
-  /** 裁决答辩（B 复核或人工调用；不作为 A 工具暴露）。 */
+  /** 裁决答辩（人工仲裁调用；不作为 A 工具暴露）。合并方案 v0.8：独立答辩通道已删。 */
   resolveDispute: (issueId: string, verdict: string, resolvedBy: string) =>
     unwrap<string>(raw.resolveDispute(issueId, verdict, resolvedBy)),
-  /** 自动答辩状态缓存（running + items，切窗回来恢复"进行中"展示）。 */
-  getAutoDisputeResult: (ontologyIri: string) =>
-    unwrap<AutoDisputeState>(raw.getAutoDisputeResult(ontologyIri)),
   getPostArbitrationState: (ontologyIri: string) =>
     unwrap<PostArbitrationState>(raw.getPostArbitrationState(ontologyIri)),
   runPostArbitrationRevise: (ontologyIri: string) =>
     unwrap<null>(raw.runPostArbitrationRevise(ontologyIri)),
-  resolveDisputeLlm: (issueId: string, modelB: string) =>
-    unwrap<string>(raw.resolveDisputeLlm(issueId, modelB)),
-  /** 答辩提交 + B 自动机器裁决（一步到位，Rust 侧落库，切窗安全）。 */
-  disputeAndJudge: (issueId: string, argument: string, counterSourceId: string, counterQuote: string, modelB: string) =>
-    unwrap<string>(raw.disputeAndJudge(issueId, argument, counterSourceId, counterQuote, modelB)),
-  /** A 自动答辩（对全部 rules 来源 open warning 后端跑 A 决策→提交→B 裁决）。 */
-  runAutoDispute: (ontologyIri: string) =>
-    unwrap<AutoDisputeItem[]>(raw.runAutoDispute(ontologyIri)),
+  /** 轮次清单（合并方案 v0.8）：每轮 发现/已修改/异议/裁决。 */
+  listReviewRounds: (reviewId: string) =>
+    unwrap<ReviewRound[]>(raw.listReviewRounds(reviewId)),
   /** 查询本体的全部 issue（对抗状态展示 + 报告）。 */
   listValidationIssues: (ontologyIri: string) =>
     unwrap<ValidationIssue[]>(raw.listValidationIssues(ontologyIri)),
@@ -481,8 +627,11 @@ export const ipc = {
   runAReviseLlm: (modelA: string, ttlV1: string, bSuggestions: string) =>
     unwrap<AReviseResult>(raw.runAReviseLlm(modelA, ttlV1, bSuggestions)),
   /** 运行 B 复核（LLM 编排）。 */
-  runBRecheckLlm: (modelB: string, aRevision: string) =>
-    unwrap<string>(raw.runBRecheckLlm(modelB, aRevision)),
+  runBRecheckLlm: (
+    modelB: string,
+    aRevision: string,
+    baselineSuggestions: string,
+  ) => unwrap<string>(raw.runBRecheckLlm(modelB, aRevision, baselineSuggestions)),
   /** 一次性触发后端完整语义评审循环（后端驱动：B评审→A修订→B复核→裁决）。
    *  返回 review id；进度轮询 latestValidationReview。 */
   runReviewLoop: (ontologyIri: string, ttlContent: string, charterSummary: string, issuesJson: string) =>

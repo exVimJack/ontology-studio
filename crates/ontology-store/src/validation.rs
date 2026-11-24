@@ -169,6 +169,36 @@ pub struct AActionRecord {
     pub reason: String,
 }
 
+/// 轮次清单行（合并方案 v0.8）：该轮 issue 快照 + 统计，前端可按轮次查看
+/// 「每轮发现多少 / A 修改多少 / 异议多少 / 裁决结果」。
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct ReviewRound {
+    /// rr-{uuid simple}
+    pub id: String,
+    /// 归属评审 id
+    pub review_id: String,
+    /// 轮次：1=首轮 B 评审，2/3=修订复核轮
+    #[specta(type = specta_typescript::Number)] // i64 → TS number（轮次数值小，无精度风险）
+    pub round: i64,
+    /// 该轮结束时 issue 清单快照 JSON：[{id,severity,rule,status,a_action}]
+    pub snapshot_json: String,
+    /// 该轮累计发现数
+    #[specta(type = specta_typescript::Number)]
+    pub found_count: i64,
+    /// A 接受（已修改）数
+    #[specta(type = specta_typescript::Number)]
+    pub accepted_count: i64,
+    /// A 异议（待裁决）数
+    #[specta(type = specta_typescript::Number)]
+    pub disputed_count: i64,
+    /// 该轮后 review 状态：in_progress|resolved|escalated
+    pub verdict: Option<String>,
+    #[specta(type = specta_typescript::Number)] // 时间戳 < 2^53，IPC 导出降级 number
+    pub created_at: i64,
+    #[specta(type = specta_typescript::Number)]
+    pub updated_at: i64,
+}
+
 impl ValidationIssue {
     /// 构造 error 级 issue（简化构造器，S2 规则用）。
     pub fn error(id: &str, layer: &str, rule: &str, message: impl Into<String>) -> Self {
@@ -263,6 +293,14 @@ pub struct ValidationReview {
     /// unix ms
     #[specta(type = specta_typescript::Number)]
     pub updated_at: i64,
+    /// 结束归因：`verdict_capped` | `step_failed` | `interrupted` | `manual_escalation` |
+    /// `write_back_conflict` | `unknown`（历史行不可追溯）。`in_progress` 期间为空串。
+    /// 界面文案 MUST 按此分支，MUST NOT 把所有 escalated 一律说成"复核未收敛"。
+    #[serde(default)]
+    pub outcome_reason: String,
+    /// 失败时的实际错误文本：仅进日志与 tooltip，主界面不直接显示（不向用户堆实现细节）。
+    #[serde(default)]
+    pub outcome_detail: String,
 }
 
 /// 评审环节耗时快照（unix ms，0=未完成）。
@@ -295,6 +333,8 @@ impl Default for ValidationReview {
             b_verdict: String::new(),
             step_ms: ReviewStepMs::default(),
             status: "in_progress".to_string(),
+            outcome_reason: String::new(),
+            outcome_detail: String::new(),
             created_at: 0,
             updated_at: 0,
         }

@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::data_type::is_valid_data_type;
 use crate::error::{StoreError, StoreResult};
 use crate::evidence::EvidenceSource;
+use crate::mapping::MappingRef;
 use crate::naming::{
     is_valid_dataset_api_name, is_valid_object_type_api_name, is_valid_property_api_name,
 };
@@ -752,49 +753,83 @@ impl OntologyStore {
                 ));
             }
         }
-        // P3 反向校验（docs/EVIDENCE-CHAIN.md §4 E4 变体）：VIRTUAL 属性的
-        // backing_table.backing_column 必须能在已登记 db_column 源的 schema 文本中
-        // 找到——防 LLM 臆造不存在的物理列。未登记任何 db_column 源时不告警。
-        let db_column_sources: Vec<crate::evidence::EvidenceSource> = {
-            let sources = crate::evidence::load_sources_map(&conn)
-                .unwrap_or_default();
-            sources
+        // P3 反向校验（决策 D12）：payload 中**全部**属性的 backing_mapping 与已登记的
+        // 物理结构（`db_table` / `db_column` 证据源，归一化解析为表/列快照）比对，
+        // 不再只对 VIRTUAL 生效、也不再靠裸字符串包含匹配。
+        //
+        // 告警口径：**单条聚合**（逐条会让大本体的 preview 输出被淹没），
+        // 且 warn_only——用户已确认「映射缺失/未核对不阻断导入」。
+        // 未登记任何物理结构源时快照为空，`verify_mapping` 返回 Skipped，不告警。
+        let mapping_snapshot = {
+            let sources = crate::evidence::load_sources_map(&conn).unwrap_or_default();
+            let evidence_sources: Vec<crate::evidence::EvidenceSource> = sources
                 .into_values()
-                .filter(|s| s.kind == "db_column")
+                .filter(|s| s.kind == "db_table" || s.kind == "db_column")
                 .filter(|s| {
                     s.ontology_api_name.is_empty()
                         || s.ontology_api_name == payload.api_name
                 })
-                .collect()
+                .collect();
+            crate::mapping_verify::parse_evidence_physical(evidence_sources)
         };
-        let db_column_sources = &db_column_sources;
-        for ot in &payload.object_types {
-            for p in &ot.properties {
-                if p.backing_mapping.is_none() && ot.storage_type == "VIRTUAL" {
-                    warnings.push(format!(
-                        "VIRTUAL ObjectType '{}' 的属性 '{}' 缺 backing_mapping（虚拟类型通常需声明物理列映射）",
-                        ot.api_name, p.api_name
-                    ));
-                    continue;
-                }
-                if let Some(m) = &p.backing_mapping {
-                    if !db_column_sources.is_empty()
-                        && !m.backing_table.is_empty()
-                        && !m.backing_column.is_empty()
+        // ① 缺映射：VIRTUAL 类型通常需声明物理列映射（聚合一条）
+        let missing_mapping: Vec<String> = payload
+            .object_types
+            .iter()
+            .filter(|ot| ot.storage_type == "VIRTUAL")
+            .flat_map(|ot| {
+                ot.properties
+                    .iter()
+                    .filter(|p| p.backing_mapping.is_none())
+                    .map(move |p| format!("{}.{}", ot.api_name, p.api_name))
+            })
+            .collect();
+        if !missing_mapping.is_empty() {
+            let shown = sample_join(&missing_mapping, 5);
+            warnings.push(format!(
+                "{} 个虚拟对象的属性缺物理列映射（{}）：虚拟类型通常需声明物理列映射，可稍后在本体工作台补充",
+                missing_mapping.len(),
+                shown
+            ));
+        }
+        // ② 未核对：物理位置在已登记结构中找不到（聚合一条，列出可定位的少量样本）
+        if !mapping_snapshot.is_empty() {
+            let mut unverified: Vec<String> = Vec::new();
+            for ot in &payload.object_types {
+                for p in &ot.properties {
+                    let Some(m) = &p.backing_mapping else { continue };
+                    let source = crate::mapping::MappingEndpoint {
+                        catalog: m.backing_catalog.clone(),
+                        schema: m.backing_schema.clone(),
+                        table: m.backing_table.clone(),
+                        column: m.backing_column.clone(),
+                    };
+                    if source.is_empty() {
+                        continue;
+                    }
+                    if let crate::mapping_verify::MappingVerifyOutcome::Unverified(_) =
+                        crate::mapping_verify::verify_mapping(
+                            &source,
+                            &crate::mapping::MappingEndpoint::default(),
+                            &mapping_snapshot,
+                        )
                     {
-                        let needle = format!("{}.{}", m.backing_table, m.backing_column);
-                        let found = db_column_sources.iter().any(|s| {
-                            s.content.contains(&needle)
-                                || s.title.contains(&needle)
-                        });
-                        if !found {
-                            warnings.push(format!(
-                                "属性 '{}.{}' 的物理列 {} 未在任何已登记 DB schema 源中找到（可能为臆造列，请核对或用 register_evidence_source 登记 schema）",
-                                ot.api_name, p.api_name, needle
-                            ));
-                        }
+                        unverified.push(format!(
+                            "{}.{} → {}",
+                            ot.api_name,
+                            p.api_name,
+                            source.locator()
+                        ));
                     }
                 }
+            }
+            if !unverified.is_empty() {
+                let shown = sample_join(&unverified, 5);
+                warnings.push(format!(
+                    "{} 个属性的物理列未在任何已登记 DB schema 源中找到（{}）：可能为臆造列，请核对或用 register_evidence_source 登记 schema",
+                    unverified.len(),
+                    shown
+                ));
             }
         }
 
@@ -1166,6 +1201,12 @@ impl OntologyStore {
 
         tx.commit()?;
 
+        // ── 8. 来源字段回填（决策 25）：payload 里带的 backing_mapping 同步进绑定层 ──
+        // 放在提交之后：单个属性的回填失败不该回滚已落库的本体定义；此路径幂等。
+        if let Err(e) = backfill_palantir_payload_mappings(&conn, payload, now_ms()) {
+            errors.push(format!("来源字段回填失败：{e}"));
+        }
+
         // 通知前端刷新（无论是否部分失败，库已变更）。
         self.notify_change();
 
@@ -1331,11 +1372,43 @@ impl OntologyStore {
             },
         )?;
 
-        // properties（复用 export 的查询逻辑）
+        // properties（复用 export 的查询逻辑）；映射绑定层注入 backing（决策 25）
+        let mapping_by_prop: std::collections::HashMap<String, MappingRef> =
+            crate::mapping::list_element_mappings(
+                &conn,
+                crate::mapping::STANDARD_PALANTIR,
+                ontology_api_name,
+            )?
+            .into_iter()
+            .filter(|m| m.element_type == crate::mapping::ETYPE_PROPERTY)
+            .fold(std::collections::HashMap::new(), |mut acc, m| {
+                // 一个属性多行映射时取 verified 优先 / 最近更新作为 hint
+                let ref_ = MappingRef::from_endpoint(&m.source, m.verified);
+                match acc.get(&m.element_id) {
+                    Some(existing) if existing.verified || !m.verified => acc,
+                    _ => {
+                        acc.insert(m.element_id.clone(), ref_);
+                        acc
+                    }
+                }
+            });
+        let ot_backing = crate::mapping::list_element_mappings_for(
+            &conn,
+            crate::mapping::STANDARD_PALANTIR,
+            ontology_api_name,
+            crate::mapping::ETYPE_OBJECT_TYPE,
+            object_type_api_name,
+        )?
+        .into_iter()
+        .map(|m| MappingRef::from_endpoint(&m.source, m.verified))
+        .next();
         let properties: Vec<PropertyReadView> = self
             .export_properties(&conn, &ot_id)?
             .into_iter()
-            .map(|p| p.to_read_view())
+            .map(|p| {
+                let backing = mapping_by_prop.get(&p.api_name).cloned();
+                p.to_read_view().with_backing(backing)
+            })
             .collect();
         // outbound/inbound links：对齐 Gaia，只返 api_name 列表（详情调 describe_link_type）
         let outbound_links: Vec<String> = self
@@ -1369,6 +1442,7 @@ impl OntologyStore {
             outbound_links,
             inbound_links,
             actions,
+            backing: ot_backing,
         })
     }
 
@@ -1514,6 +1588,616 @@ impl OntologyStore {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// 映射绑定层（决策 25）：Palantir 侧入口
+//
+// 读写逻辑全部在 `mapping.rs`（两套标准共用一份实现），这里只做
+// 「锁定连接 + 委托」；W3C 侧的同名方法在 `ttl/crud.rs`（standard='w3c'）。
+// ═══════════════════════════════════════════════════════════════════
+
+impl OntologyStore {
+    /// 保存映射（按元素整组替换语义）。
+    ///
+    /// `snapshot` 为已登记物理结构快照：给出则按系统判定写核对状态，
+    /// 未给出（None）则新行一律未核对、已存在的行保留原状态。
+    /// 返回写入/移除行数与聚合告警（**不阻断**：告警只是提示）。
+    pub fn save_element_mappings(
+        &self,
+        ontology_api_name: &str,
+        items: impl IntoIterator<Item = crate::mapping::ElementMappingItem>,
+        snapshot: Option<&crate::mapping_verify::PhysicalSchemaSnapshot>,
+    ) -> StoreResult<crate::mapping::MappingWriteOutcome> {
+        let conn = self.conn.lock().unwrap();
+        // Palantir 双写：payload 契约里的 backing_* 与本表同步，保证 export 出的
+        // payload 仍带映射（设计 Migration Plan #3，唯一的双写点）。
+        let outcome = crate::mapping::upsert_element_mappings(
+            &conn,
+            crate::mapping::STANDARD_PALANTIR,
+            ontology_api_name,
+            items,
+            snapshot,
+            now_ms(),
+        )?;
+        if outcome.written > 0 || outcome.removed > 0 {
+            let _ = self.sync_property_backing(&conn, ontology_api_name);
+            self.notify_change();
+        }
+        Ok(outcome)
+    }
+
+    /// 列出某本体的全部映射。
+    pub fn list_element_mappings(
+        &self,
+        ontology_api_name: &str,
+    ) -> StoreResult<Vec<crate::mapping::ElementMapping>> {
+        let conn = self.conn.lock().unwrap();
+        crate::mapping::list_element_mappings(
+            &conn,
+            crate::mapping::STANDARD_PALANTIR,
+            ontology_api_name,
+        )
+    }
+
+    /// 删除某元素的全部映射（`save` 传空集合的等价操作）。
+    pub fn delete_element_mappings_for_element(
+        &self,
+        ontology_api_name: &str,
+        element_type: &str,
+        element_id: &str,
+    ) -> StoreResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = crate::mapping::delete_element_mappings_for_element(
+            &conn,
+            crate::mapping::STANDARD_PALANTIR,
+            ontology_api_name,
+            element_type,
+            element_id,
+        )?;
+        if n > 0 {
+            let _ = self.sync_property_backing(&conn, ontology_api_name);
+            self.notify_change();
+        }
+        Ok(n)
+    }
+
+    /// 某元素的映射列表（Agent 只读视图注入用）。
+    pub fn list_element_mappings_for(
+        &self,
+        ontology_api_name: &str,
+        element_type: &str,
+        element_id: &str,
+    ) -> StoreResult<Vec<crate::mapping::ElementMapping>> {
+        let conn = self.conn.lock().unwrap();
+        crate::mapping::list_element_mappings_for(
+            &conn,
+            crate::mapping::STANDARD_PALANTIR,
+            ontology_api_name,
+            element_type,
+            element_id,
+        )
+    }
+
+    /// 映射覆盖率（类/属性/关系分别统计，互不推导）。
+    pub fn mapping_coverage(
+        &self,
+        ontology_api_name: &str,
+    ) -> StoreResult<crate::mapping::MappingCoverage> {
+        let conn = self.conn.lock().unwrap();
+        let elements = palantir_elements(&conn, ontology_api_name)?;
+        let mappings = crate::mapping::list_element_mappings(
+            &conn,
+            crate::mapping::STANDARD_PALANTIR,
+            ontology_api_name,
+        )?;
+        Ok(crate::mapping::compute_coverage(
+            crate::mapping::STANDARD_PALANTIR,
+            ontology_api_name,
+            &elements,
+            &mappings,
+        ))
+    }
+
+    /// 映射完整性报告（孤儿 / 失效 / 未核对；均不删除、不阻断）。
+    pub fn mapping_integrity(
+        &self,
+        ontology_api_name: &str,
+        snapshot: Option<&crate::mapping_verify::PhysicalSchemaSnapshot>,
+    ) -> StoreResult<crate::mapping::MappingIntegrityReport> {
+        let conn = self.conn.lock().unwrap();
+        let elements = palantir_elements(&conn, ontology_api_name)?;
+        let mappings = crate::mapping::list_element_mappings(
+            &conn,
+            crate::mapping::STANDARD_PALANTIR,
+            ontology_api_name,
+        )?;
+        Ok(crate::mapping::compute_integrity(
+            crate::mapping::STANDARD_PALANTIR,
+            ontology_api_name,
+            &elements,
+            &mappings,
+            snapshot,
+        ))
+    }
+
+    /// 清理孤儿映射（**仅在用户确认后调用**；不做后台自动删除）。
+    pub fn purge_orphan_mappings(
+        &self,
+        ontology_api_name: &str,
+        snapshot: Option<&crate::mapping_verify::PhysicalSchemaSnapshot>,
+    ) -> StoreResult<usize> {
+        let report = self.mapping_integrity(ontology_api_name, snapshot)?;
+        let ids = crate::mapping::orphan_mapping_ids(&report);
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().unwrap();
+        let n = crate::mapping::delete_element_mappings_by_ids(&conn, &ids)?;
+        let _ = self.sync_property_backing(&conn, ontology_api_name);
+        self.notify_change();
+        Ok(n)
+    }
+
+    /// 候选建议（只读，不落库）。
+    pub fn suggest_element_mappings(
+        &self,
+        ontology_api_name: &str,
+        elements: &[crate::mapping::MappingElementRef],
+        snapshot: &crate::mapping_verify::PhysicalSchemaSnapshot,
+    ) -> StoreResult<Vec<crate::mapping::MappingSuggestion>> {
+        // 同表先验证：该本体已确认的映射所在的表（先验权重用）
+        let known = {
+            let conn = self.conn.lock().unwrap();
+            crate::mapping::list_element_mappings(
+                &conn,
+                crate::mapping::STANDARD_PALANTIR,
+                ontology_api_name,
+            )?
+        };
+        Ok(crate::mapping_suggest::suggest(elements, snapshot, &known))
+    }
+
+/// 列出本体的元素全集（含建议所需元数据：显示名/类型/同表线索）。
+///
+/// 前端「缺口清单」与「候选建议」都以它为输入：元素清单来自本体内容，
+/// 映射状态另从 `list_element_mappings` 取，两者不互相推导。
+pub fn list_mapping_elements(
+    &self,
+    ontology_api_name: &str,
+) -> StoreResult<Vec<crate::mapping::MappingElementRef>> {
+    let conn = self.conn.lock().unwrap();
+    palantir_element_refs(&conn, ontology_api_name)
+}
+
+/// 装配映射导出数据集（xlsx 渲染与 Agent 文本预览共用）。
+    pub fn mapping_dataset(
+        &self,
+        ontology_api_name: &str,
+        scope: crate::mapping::MappingExportScope,
+        snapshot: Option<&crate::mapping_verify::PhysicalSchemaSnapshot>,
+        exported_at: &str,
+    ) -> StoreResult<crate::mapping_export::ExportDataset> {
+        let conn = self.conn.lock().unwrap();
+        let elements = palantir_element_refs(&conn, ontology_api_name)?;
+        let primary_keys = palantir_primary_keys(&conn, ontology_api_name)?;
+        let mappings = crate::mapping::list_element_mappings(
+            &conn,
+            crate::mapping::STANDARD_PALANTIR,
+            ontology_api_name,
+        )?;
+        // 本体显示名（概览页用）；缺失时回退到 api_name
+        let display: String = conn
+            .query_row(
+                "SELECT display_name FROM ontologies WHERE api_name=?1",
+                rusqlite::params![ontology_api_name],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
+        Ok(crate::mapping_export::build_dataset(
+            crate::mapping_export::DatasetInput {
+                standard: crate::mapping::STANDARD_PALANTIR,
+                ontology_key: ontology_api_name,
+                ontology_name: &display,
+                scope,
+                elements: &elements,
+                mappings: &mappings,
+                snapshot,
+                primary_keys: &primary_keys,
+                exported_at,
+            },
+        ))
+    }
+
+    /// 导出映射为 xlsx 工作簿字节（多工作表：概览 + 类 + 属性 + 关系）。
+    pub fn mapping_workbook(
+        &self,
+        ontology_api_name: &str,
+        scope: crate::mapping::MappingExportScope,
+        snapshot: Option<&crate::mapping_verify::PhysicalSchemaSnapshot>,
+        exported_at: &str,
+    ) -> StoreResult<Vec<u8>> {
+        let ds = self.mapping_dataset(ontology_api_name, scope, snapshot, exported_at)?;
+        crate::mapping_export::render_workbook(&ds)
+    }
+
+    /// 回填：把 `properties.backing_*` 已有数据迁入 `element_mapping`（幂等）。
+    ///
+    /// 仅在该本体的映射集合为空时执行（避免覆盖用户在新视图里做过的修改）；
+    /// 回填行 `source_kind='manual'`、`verified=0`（旧数据没有核对语义）。
+    pub fn backfill_mappings_from_properties(
+        &self,
+        ontology_api_name: &str,
+    ) -> StoreResult<usize> {
+        let conn = self.conn.lock().unwrap();
+        backfill_palantir_mappings(&conn, ontology_api_name, now_ms())
+    }
+
+    /// Palantir 双写：把 `element_mapping` 的 property 行回写到 `properties.backing_*`。
+    ///
+    /// 只处理"该属性恰好一条映射"的情形——多条候选列时 payload 契约字段无法表达
+    /// （它只有一组 backing），此时保留原有 backing 列的取值不动，避免产生歧义。
+    fn sync_property_backing(
+        &self,
+        conn: &Connection,
+        ontology_api_name: &str,
+    ) -> StoreResult<()> {
+        let mappings = crate::mapping::list_element_mappings(
+            conn,
+            crate::mapping::STANDARD_PALANTIR,
+            ontology_api_name,
+        )?;
+        let Some(ontology_id) = conn
+            .query_row(
+                "SELECT id FROM ontologies WHERE api_name=?1",
+                rusqlite::params![ontology_api_name],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        else {
+            return Ok(());
+        };
+        for m in mappings
+            .iter()
+            .filter(|m| m.element_type == crate::mapping::ETYPE_PROPERTY)
+        {
+            // 同一属性的行数 >1 时跳过（契约字段无法表达多列）
+            let count = mappings
+                .iter()
+                .filter(|x| x.element_type == m.element_type && x.element_id == m.element_id)
+                .count();
+            if count > 1 {
+                continue;
+            }
+            conn.execute(
+                "UPDATE properties
+                    SET backing_table=?3, backing_column=?4, backing_catalog=?5,
+                        backing_schema=?6, updated_at=?7
+                  WHERE object_type_id IN (SELECT id FROM object_types WHERE ontology_id=?1)
+                    AND api_name=?2",
+                rusqlite::params![
+                    ontology_id,
+                    m.element_id,
+                    m.source.table,
+                    m.source.column,
+                    m.source.catalog,
+                    m.source.schema,
+                    now_ms()
+                ],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Palantir 侧元素全集（class=object_type / property / relation=link）。
+fn palantir_elements(
+    conn: &Connection,
+    ontology_api_name: &str,
+) -> StoreResult<Vec<(String, String)>> {
+    Ok(palantir_element_refs(conn, ontology_api_name)?
+        .into_iter()
+        .map(|e| (e.element_type, e.element_id))
+        .collect())
+}
+
+/// Palantir 侧元素全集 + 建议所需元数据 + 导出所需语义上下文。
+///
+/// 语义上下文（`owner_*` / `target_*` / 端点属性 / 基数 / 描述）取自本体自身的
+/// 定义（`object_types` / `properties` / `link_types`），**不从映射记录反推**——
+/// 关系两端对象与两端属性是概念声明，导出时不该靠物理端点猜（见
+/// `design.md` D3 与规格 `Relation export sheet presents semantic endpoints`）。
+fn palantir_element_refs(
+    conn: &Connection,
+    ontology_api_name: &str,
+) -> StoreResult<Vec<crate::mapping::MappingElementRef>> {
+    use crate::mapping::{ETYPE_LINK, ETYPE_OBJECT_TYPE, ETYPE_PROPERTY};
+    let ontology_id: String = conn
+        .query_row(
+            "SELECT id FROM ontologies WHERE api_name=?1",
+            rusqlite::params![ontology_api_name],
+            |r| r.get(0),
+        )
+        .map_err(|_| StoreError::NotFound(format!("ontology '{ontology_api_name}'")))?;
+
+    let mut out = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT api_name, display_name, description FROM object_types
+         WHERE ontology_id=?1 ORDER BY api_name",
+    )?;
+    let ots = stmt
+        .query_map(rusqlite::params![ontology_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (api_name, display_name, description) in &ots {
+        out.push(crate::mapping::MappingElementRef {
+            element_type: ETYPE_OBJECT_TYPE.to_string(),
+            element_id: api_name.clone(),
+            display_name: display_name.clone(),
+            data_type: String::new(),
+            same_table_hint: String::new(),
+            description: description.clone(),
+            ..Default::default()
+        });
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT p.api_name, p.display_name, p.data_type, p.description,
+                o.api_name, o.display_name
+           FROM properties p
+           JOIN object_types o ON o.id = p.object_type_id
+          WHERE o.ontology_id=?1
+          ORDER BY o.api_name, p.api_name",
+    )?;
+    let props = stmt
+        .query_map(rusqlite::params![ontology_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (api_name, display_name, data_type, description, owner_id, owner_name) in props {
+        out.push(crate::mapping::MappingElementRef {
+            element_type: ETYPE_PROPERTY.to_string(),
+            element_id: api_name,
+            display_name,
+            data_type,
+            same_table_hint: String::new(),
+            owner_id,
+            owner_name,
+            description,
+            ..Default::default()
+        });
+    }
+
+    // 关系：两端对象与两端属性都取自 link_types + 目标对象主键，不用物理映射反推。
+    let mut stmt = conn.prepare(
+        "SELECT l.api_name, l.display_name, l.description,
+                l.source_object_type_api_name, l.target_object_type_api_name,
+                l.foreign_key_property_api_name, l.cardinality,
+                so.display_name, to_.display_name, to_.primary_key
+           FROM link_types l
+           LEFT JOIN object_types so ON so.ontology_id = l.ontology_id
+                                    AND so.api_name = l.source_object_type_api_name
+           LEFT JOIN object_types to_ ON to_.ontology_id = l.ontology_id
+                                     AND to_.api_name = l.target_object_type_api_name
+          WHERE l.ontology_id=?1
+          ORDER BY l.api_name",
+    )?;
+    let links = stmt
+        .query_map(rusqlite::params![ontology_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (
+        api_name,
+        display_name,
+        description,
+        source_ot,
+        target_ot,
+        fk_property,
+        cardinality,
+        source_name,
+        target_name,
+        target_pk,
+    ) in links
+    {
+        out.push(crate::mapping::MappingElementRef {
+            element_type: ETYPE_LINK.to_string(),
+            element_id: api_name,
+            display_name,
+            data_type: String::new(),
+            same_table_hint: String::new(),
+            owner_id: source_ot,
+            owner_name: source_name.unwrap_or_default(),
+            target_id: target_ot,
+            target_name: target_name.unwrap_or_default(),
+            endpoint_property: fk_property.unwrap_or_default(),
+            // 目标端属性恒为目标对象主键（Palantir LinkType 的语义即如此）；
+            // 目标对象缺失时不编造。
+            target_property: target_pk.unwrap_or_default(),
+            cardinality,
+            description,
+        });
+    }
+    Ok(out)
+}
+
+/// Palantir 侧属主键标记：`(对象 api_name, 属性 api_name)` → 是否主键。
+///
+/// 键**必须**是复合的：`properties` 的唯一约束是 `UNIQUE(object_type_id, api_name)`
+/// （见 `schema.rs`），属性名只在对象内唯一。多个对象都有 `id` / `name` 时，
+/// 单键 Map 会互相覆盖，导致「是否主键」标记串台（详见 `design.md` D5）。
+fn palantir_primary_keys(
+    conn: &Connection,
+    ontology_api_name: &str,
+) -> StoreResult<std::collections::HashMap<(String, String), bool>> {
+    let mut stmt = conn.prepare(
+        "SELECT o.api_name, p.api_name, p.is_primary_key
+           FROM properties p
+           JOIN object_types o ON o.id = p.object_type_id
+          WHERE o.ontology_id = (SELECT id FROM ontologies WHERE api_name=?1)",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![ontology_api_name], |r| {
+            Ok((
+                (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+                r.get::<_, i64>(2)? != 0,
+            ))
+        })?
+        .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
+    Ok(rows)
+}
+
+/// 导入路径回填：payload 里带 `backing_mapping` 的属性写入 `element_mapping`。
+///
+/// 只补「该元素在绑定层还没有任何映射」的情形——payload 契约每个属性只有一组
+/// `backing_*`，若用户已在新视图里绑定了多列，用这单列覆盖会把新增信息抹掉。
+/// 幂等：重复导入同一 payload 不会产生重复行（位置键唯一）。
+fn backfill_palantir_payload_mappings(
+    conn: &Connection,
+    payload: &OntologyPayload,
+    now: i64,
+) -> StoreResult<usize> {
+    let standard = crate::mapping::STANDARD_PALANTIR;
+    let existing = crate::mapping::list_element_mappings(conn, standard, &payload.api_name)?;
+    let mapped: std::collections::HashSet<(&str, &str)> = existing
+        .iter()
+        .map(|m| (m.element_type.as_str(), m.element_id.as_str()))
+        .collect();
+
+    let mut items: Vec<crate::mapping::ElementMappingItem> = Vec::new();
+    for ot in &payload.object_types {
+        for p in &ot.properties {
+            let Some(m) = &p.backing_mapping else { continue };
+            let source = crate::mapping::MappingEndpoint {
+                catalog: m.backing_catalog.clone(),
+                schema: m.backing_schema.clone(),
+                table: m.backing_table.clone(),
+                column: m.backing_column.clone(),
+            };
+            if !source.has_table() {
+                continue;
+            }
+            if mapped.contains(&(crate::mapping::ETYPE_PROPERTY, p.api_name.as_str())) {
+                continue;
+            }
+            items.push(crate::mapping::ElementMappingItem {
+                element_type: crate::mapping::ETYPE_PROPERTY.to_string(),
+                element_id: p.api_name.clone(),
+                mappings: vec![crate::mapping::ElementMappingInput {
+                    source,
+                    ..Default::default()
+                }],
+            });
+        }
+    }
+    if items.is_empty() {
+        return Ok(0);
+    }
+    let outcome = crate::mapping::upsert_element_mappings(
+        conn,
+        standard,
+        &payload.api_name,
+        items,
+        None,
+        now,
+    )?;
+    Ok(outcome.written)
+}
+
+/// 把 `properties.backing_*` 回填进 `element_mapping`（幂等；本体映射为空时才执行）。
+fn backfill_palantir_mappings(
+    conn: &Connection,
+    ontology_api_name: &str,
+    now: i64,
+) -> StoreResult<usize> {
+    let existing = crate::mapping::list_element_mappings(
+        conn,
+        crate::mapping::STANDARD_PALANTIR,
+        ontology_api_name,
+    )?;
+    if !existing.is_empty() {
+        return Ok(0);
+    }
+    let ontology_id: String = conn
+        .query_row(
+            "SELECT id FROM ontologies WHERE api_name=?1",
+            rusqlite::params![ontology_api_name],
+            |r| r.get(0),
+        )
+        .map_err(|_| StoreError::NotFound(format!("ontology '{ontology_api_name}'")))?;
+
+    let mut items: Vec<crate::mapping::ElementMappingItem> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT p.api_name, p.backing_catalog, p.backing_schema, p.backing_table, p.backing_column
+               FROM properties p
+               JOIN object_types o ON o.id = p.object_type_id
+              WHERE o.ontology_id=?1
+                AND p.backing_table IS NOT NULL AND TRIM(p.backing_table) <> ''
+              ORDER BY o.api_name, p.api_name",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![ontology_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (api_name, catalog, schema, table, column) in rows {
+            items.push(crate::mapping::ElementMappingItem {
+                element_type: crate::mapping::ETYPE_PROPERTY.to_string(),
+                element_id: api_name,
+                mappings: vec![crate::mapping::ElementMappingInput {
+                    source: crate::mapping::MappingEndpoint {
+                        catalog: catalog.unwrap_or_default(),
+                        schema: schema.unwrap_or_default(),
+                        table: table.unwrap_or_default(),
+                        column: column.unwrap_or_default(),
+                    },
+                    ..Default::default()
+                }],
+            });
+        }
+    }
+    if items.is_empty() {
+        return Ok(0);
+    }
+    let outcome = crate::mapping::upsert_element_mappings(
+        conn,
+        crate::mapping::STANDARD_PALANTIR,
+        ontology_api_name,
+        items,
+        None,
+        now,
+    )?;
+    Ok(outcome.written)
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // 内部辅助
 // ═══════════════════════════════════════════════════════════════════
 
@@ -1587,6 +2271,20 @@ fn now_ms() -> i64 {
 
 fn new_id() -> String {
     Uuid::new_v4().simple().to_string()
+}
+
+/// 取前 `max` 项拼成一句可读样本（超出时以「等」结尾）。
+///
+/// 聚合告警用：大本体的映射缺口动辄几十条，逐条刷屏会让 preview 输出淹没
+/// 其他告警（证据链的 `grandfathered` 已踩过这个坑）。
+fn sample_join(items: &[String], max: usize) -> String {
+    let head: Vec<&str> = items.iter().take(max).map(|s| s.as_str()).collect();
+    let joined = head.join("、");
+    if items.len() > max {
+        format!("{joined} 等")
+    } else {
+        joined
+    }
 }
 
 fn dataset_results_push(
@@ -2577,6 +3275,152 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("suppliers.supplier_id 未在")),
             "已登记列不应告警"
+        );
+    }
+
+    #[test]
+    fn preview_mapping_warning_covers_all_storage_types() {
+        // 决策 D12：反向校验不再只对 VIRTUAL 生效——MANAGED 类型的臆造列同样告警
+        let store = OntologyStore::open_in_memory().unwrap();
+        store
+            .register_evidence_source(
+                "db_table",
+                "ERP schema",
+                "CREATE TABLE suppliers (\n  supplier_id varchar(64) NOT NULL,\n  supplier_name varchar(128)\n);",
+                "SupplyChain",
+                "",
+            )
+            .unwrap();
+        let mut payload = sample_payload();
+        assert_eq!(payload.object_types[0].storage_type, "MANAGED");
+        use crate::payload::BackingMapping;
+        payload.object_types[0].properties[1].backing_mapping = Some(BackingMapping {
+            dataset_api_name: String::new(),
+            backing_catalog: String::new(),
+            backing_schema: String::new(),
+            backing_table: "suppliers".into(),
+            backing_column: "ghost_column".into(),
+        });
+        let req = ImportRequest {
+            payload,
+            overwrite_object_types: vec![],
+            overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
+        };
+        let preview = store.preview_import(&req).unwrap();
+        let w = preview
+            .warnings
+            .iter()
+            .find(|w| w.contains("suppliers.ghost_column"))
+            .unwrap_or_else(|| panic!("MANAGED 类型的臆造列也应告警: {:?}", preview.warnings));
+        assert!(w.contains("1 个属性"), "应按数量聚合: {w}");
+    }
+
+    #[test]
+    fn preview_mapping_warning_is_aggregated_single_entry() {
+        // 多条未命中只产出一条聚合告警（逐条会淹没 preview 输出）
+        let store = OntologyStore::open_in_memory().unwrap();
+        store
+            .register_evidence_source(
+                "db_column",
+                "ERP schema",
+                "suppliers.supplier_id",
+                "SupplyChain",
+                "",
+            )
+            .unwrap();
+        let mut payload = sample_payload();
+        payload.object_types[0].storage_type = "VIRTUAL".to_string();
+        use crate::payload::BackingMapping;
+        for (i, p) in payload.object_types[0].properties.iter_mut().enumerate() {
+            p.backing_mapping = Some(BackingMapping {
+                dataset_api_name: String::new(),
+                backing_catalog: String::new(),
+                backing_schema: String::new(),
+                backing_table: format!("ghost_table_{i}"),
+                backing_column: format!("ghost_col_{i}"),
+            });
+        }
+        let req = ImportRequest {
+            payload,
+            overwrite_object_types: vec![],
+            overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
+        };
+        let preview = store.preview_import(&req).unwrap();
+        let hits: Vec<&String> = preview
+            .warnings
+            .iter()
+            .filter(|w| w.contains("未在任何已登记 DB schema 源中找到"))
+            .collect();
+        assert_eq!(hits.len(), 1, "应为单条聚合告警: {:?}", preview.warnings);
+        assert!(hits[0].contains("2 个属性"), "聚合口径应含总数: {}", hits[0]);
+        assert!(hits[0].contains("ghost_table_0.ghost_col_0"));
+    }
+
+    #[test]
+    fn preview_mapping_warning_uses_normalized_matching() {
+        // 归一化：DDL 里带类型/约束的列能被识别（不再是裸字符串包含）
+        let store = OntologyStore::open_in_memory().unwrap();
+        store
+            .register_evidence_source(
+                "db_table",
+                "ERP schema",
+                "orders(order_no varchar(64) NOT NULL, amount decimal(10,2))",
+                "SupplyChain",
+                "",
+            )
+            .unwrap();
+        let mut payload = sample_payload();
+        use crate::payload::BackingMapping;
+        payload.object_types[0].properties[1].backing_mapping = Some(BackingMapping {
+            dataset_api_name: String::new(),
+            backing_catalog: String::new(),
+            backing_schema: String::new(),
+            backing_table: "orders".into(),
+            backing_column: "amount".into(),
+        });
+        let req = ImportRequest {
+            payload,
+            overwrite_object_types: vec![],
+            overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
+        };
+        let preview = store.preview_import(&req).unwrap();
+        assert!(
+            !preview
+                .warnings
+                .iter()
+                .any(|w| w.contains("orders.amount")),
+            "已登记列不应告警: {:?}",
+            preview.warnings
+        );
+    }
+
+    #[test]
+    fn preview_no_mapping_warning_without_schema_sources() {
+        // 未登记任何物理结构源 → 快照为空 → 不校验、不告警（冷启动不产生噪声）
+        let store = OntologyStore::open_in_memory().unwrap();
+        let mut payload = sample_payload();
+        use crate::payload::BackingMapping;
+        payload.object_types[0].properties[0].backing_mapping = Some(BackingMapping {
+            dataset_api_name: String::new(),
+            backing_catalog: String::new(),
+            backing_schema: String::new(),
+            backing_table: "whatever".into(),
+            backing_column: "whatever_id".into(),
+        });
+        let req = ImportRequest {
+            payload,
+            overwrite_object_types: vec![],
+            overwrite_data_sources: vec![],
+            evidence_mode: String::new(),
+        };
+        let preview = store.preview_import(&req).unwrap();
+        assert!(
+            !preview.warnings.iter().any(|w| w.contains("whatever_id")),
+            "无 schema 源时不应告警: {:?}",
+            preview.warnings
         );
     }
 

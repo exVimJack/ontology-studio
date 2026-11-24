@@ -17,6 +17,7 @@ import { AppShell } from "@/components/shell/AppShell";
 import { CommandPalette } from "@/components/shell/CommandPalette";
 import { ModelSettingsModal } from "@/components/settings/ModelSettingsPanel";
 import { McpSettingsModal } from "@/components/settings/McpSettingsPanel";
+import { OntologySettingsModal } from "@/components/settings/OntologySettingsPanel";
 import { FileDropZone } from "@/components/library/FileDropZone";
 import { useUiStore, applyTheme } from "@/stores/ui-store";
 import { useCreateConversation } from "@/hooks/useConversations";
@@ -36,6 +37,8 @@ function RootComponent() {
   const theme = useUiStore((s) => s.theme);
   const modelSettingsOpen = useUiStore((s) => s.modelSettingsOpen);
   const mcpSettingsOpen = useUiStore((s) => s.mcpSettingsOpen);
+  const ontologySettingsOpen = useUiStore((s) => s.ontologySettingsOpen);
+  const setOntologySettingsOpen = useUiStore((s) => s.setOntologySettingsOpen);
 
   // 切会话清理上一会话残留的已结束摄入任务（原 setCurrentConversation 副作用，
   // 现由路由派生的 id 变化触发）。
@@ -128,6 +131,9 @@ function RootComponent() {
       )}
       {mcpSettingsOpen && (
         <McpSettingsModal onClose={() => setMcpSettingsOpen(false)} />
+      )}
+      {ontologySettingsOpen && (
+        <OntologySettingsModal onClose={() => setOntologySettingsOpen(false)} />
       )}
     </div>
   );

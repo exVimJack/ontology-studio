@@ -11,7 +11,7 @@ type CharterTextField =
   | "business_essence"
 
 
-/** 宪章字段 ↔ TTL 头部 W3C 原生词汇映射：业务场景 → dcterms:description；业务本质 → skos:definition。 */
+/** 宪章字段 ↔ TTL 头部 W3C 原生词汇映射：业务场景 → dcterms:description；业务目标 → skos:definition。 */
 const CHARTER_PREDICATE_TO_FIELD: Record<string, CharterTextField> = {
   // 前缀快捷键写法
   "dcterms:description": "business_scenario",

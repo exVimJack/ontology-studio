@@ -53,9 +53,13 @@ function ProviderForm({ role }: { role: "modeler" | "verifier" }) {
   const isVerifier = role === "verifier"
   const aQ = useProvider()
   const bQ = useVerifierProvider()
+  // Rules of Hooks：两个 mutation hook 必须无条件调用（role 是 props，
+  // 但同一组件实例可能因父级重建而换 role，条件调用会导致 hook 数量不一致 → #310）
+  const setModeler = useSetProvider()
+  const setVerifier = useSetVerifierProvider()
   const provider = isVerifier ? bQ.data : aQ.data
   const isLoading = isVerifier ? bQ.isLoading : aQ.isLoading
-  const setProvider = isVerifier ? useSetVerifierProvider() : useSetProvider()
+  const setProvider = isVerifier ? setVerifier : setModeler
   const title = isVerifier ? "校验者（B）" : "建模者（A）· 对话 + 本体建模"
   const roleHint = isVerifier
     ? "Verifier · 建议配置不同厂商的模型（如 A=火山方舟 / B=DeepSeek），独立性档位升「完整」"

@@ -60,6 +60,17 @@ import {
   type EvidenceStatus,
 } from "@/hooks/useOntology";
 import { OntologyTtlView } from "@/components/ontology/OntologyTtlView";
+import {
+  ElementMappingEditor,
+  MappingCoverageCard,
+  MappingExportButton,
+  MappingGapPanel,
+  MappingStateBadge,
+  SourceFieldCell,
+  useMappingRowsByElement,
+} from "@/components/ontology/ElementMappingPanel";
+import { useMappingCoverage } from "@/hooks/useElementMapping";
+import { endpointLocator, mappingStateOf } from "@/lib/mapping-display";
 import type { OntologyTtlViewHandle } from "@/components/ontology/OntologyTtlView";
 import { ConceptGraph } from "@/components/ontology/ConceptGraph";
 import { CreateOntologyWizard } from "@/components/ontology/CreateOntologyWizard";
@@ -67,6 +78,8 @@ import { payloadToGraphData, describeObjectType } from "@/lib/palantir-graph";
 import {
   DATA_TYPES,
   CARDINALITIES,
+  CARDINALITY_HELP,
+  CARDINALITY_HINTS,
   propertyToDraft,
   draftToProperty,
   linkToDraft,
@@ -98,6 +111,7 @@ import type {
   ImportPreviewItem,
   OntologyChangelog,
   OntologyCharter,
+  ElementMapping,
 } from "@/lib/domain";
 
 // ── 预演项状态图标/颜色 ──
@@ -225,6 +239,13 @@ export function OntologyView() {
                 <RefreshCw size={14} />
               </button>
               <button
+                onClick={() => ttlViewRef.current?.openCreate()}
+                className="flex items-center gap-1 rounded-md bg-accent/10 px-2 py-1 text-xs font-medium text-accent hover:bg-accent/20"
+                title="先完成设计宪章，再创建本体（AI 建模以宪章为前提）"
+              >
+                <Plus size={12} /> 新建本体
+              </button>
+              <button
                 onClick={() => ttlViewRef.current?.openImport()}
                 className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-accent hover:bg-bg-hover"
                 title="导入 Turtle 文件"
@@ -244,7 +265,9 @@ export function OntologyView() {
       </div>
 
       {ontologyTab === "w3c" ? (
-        <OntologyTtlView ref={ttlViewRef} />
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <OntologyTtlView ref={ttlViewRef} />
+        </div>
       ) : (
         <div className="flex min-h-0 flex-1">
           {/* 左栏：本体列表 */}
@@ -618,6 +641,12 @@ function OntologyDetail({
     { key: "links" as const, label: "关系", count: linkCount, icon: Link2 },
     { key: "actions" as const, label: "动作", count: actionCount, icon: Zap },
     {
+      key: "mapping" as const,
+      label: "来源字段",
+      count: 0,
+      icon: Plug,
+    },
+    {
       key: "datasets" as const,
       label: "数据集",
       count: datasetCount,
@@ -634,6 +663,7 @@ function OntologyDetail({
     (t) =>
       t.key === "overview" ||
       t.key === "history" ||
+      t.key === "mapping" ||
       t.key === "datasets" ||
       t.key === "sources" ||
       t.count > 0,
@@ -810,6 +840,8 @@ function OntologyDetail({
 
         {tab === "datasets" && <DatasetsTab apiName={payload.api_name} />}
 
+        {tab === "mapping" && <MappingTab apiName={payload.api_name} />}
+
         {tab === "sources" && <DataSourcesTab apiName={payload.api_name} />}
 
         {tab === "history" && <HistoryTab apiName={payload.api_name} />}
@@ -855,12 +887,12 @@ function ConceptGraphPanel({ payload }: { payload: OntologyPayload }) {
     );
   }
   return (
-    <div className="relative h-full">
+    <div className="relative flex min-h-0 h-full flex-1 flex-col">
       <ConceptGraph
         nodes={nodes}
         edges={edges}
         storageKey={`palantir-${payload.api_name}`}
-        className="h-full"
+        className="min-h-0 flex-1"
         onJumpToSource={handleInspect}
       />
       {detailIri && (
@@ -900,6 +932,7 @@ type DetailTab =
   | "objects"
   | "links"
   | "actions"
+  | "mapping"
   | "datasets"
   | "sources"
   | "history";
@@ -927,6 +960,8 @@ function OverviewTab({
   const actionCount = payload.action_types?.length ?? 0;
   const datasetCount = payload.datasets?.length ?? 0;
   const dataSourceCount = payload.data_sources?.length ?? 0;
+  // 来源字段覆盖率（决策 25）：类/属性/关系分别计数，下钻到缺口清单
+  const coverage = useMappingCoverage("palantir", payload.api_name);
 
   const stats: {
     key: DetailTab;
@@ -968,7 +1003,7 @@ function OverviewTab({
 
   return (
     <div className="space-y-5">
-      {/* 本体设计宪章（不变点）：业务场景 / 业务本质（设计意图/补充说明不对业务呈现） */}
+      {/* 本体设计宪章（不变点）：业务场景 / 业务目标（设计意图/补充说明不对业务呈现） */}
       <CharterPanel
         charter={charter}
         loading={charterLoading}
@@ -1016,6 +1051,41 @@ function OverviewTab({
           </div>
         </div>
       )}
+
+      {/* 来源字段覆盖率（类/属性/关系分别计数，点击下钻缺口清单） */}
+      {coverage.data && (
+        <MappingCoverageCard
+          coverage={coverage.data}
+          onDrilldown={() => onJump("mapping")}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── 来源字段 Tab（Palantir 标准侧，决策 25）──
+// 概念定义与物理来源分离：本页只处理「对象类型/属性/关系 ↔ 数据源表字段」的绑定，
+// 不修改 payload 的概念字段（映射保存在独立绑定层，仅属性级单条映射回写 backing_mapping）。
+function MappingTab({ apiName }: { apiName: string }) {
+  const { data: coverage } = useMappingCoverage("palantir", apiName);
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border px-3 py-2">
+        <div>
+          <div className="text-xs font-medium text-fg-muted">来源字段绑定</div>
+          <p className="mt-0.5 text-[10px] text-fg-subtle">
+            指定对象类型、属性与关系来自数据源的哪些表和字段；不改变本体定义本身
+          </p>
+        </div>
+        <MappingExportButton
+          standard="palantir"
+          ontologyKey={apiName}
+          coverage={coverage}
+        />
+      </div>
+      <div className="rounded-lg border border-border">
+        <MappingGapPanel standard="palantir" ontologyKey={apiName} />
+      </div>
     </div>
   );
 }
@@ -1050,7 +1120,7 @@ function HistoryTab({ apiName }: { apiName: string }) {
 
 // ── 单条变更记录卡 ──
 // ── 本体设计宪章（不变点）面板 ──
-// 头部常驻展示业务场景/业务本质（设计意图/补充说明偏开发视角，不对业务呈现），支持编辑切换。
+// 头部常驻展示业务场景/业务目标（设计意图/补充说明偏开发视角，不对业务呈现），支持编辑切换。
 // charter 不随历史变化——编辑入口仅为「用户明确要求调整不变点」时使用。
 function CharterPanel({
   charter,
@@ -1105,13 +1175,13 @@ function CharterPanel({
         />
         <CharterFieldEditor
           label="业务场景"
-          hint="服务于什么业务目标、谁用、解决什么问题"
+          hint="定义本体建模的使用范围以及对象"
           value={draft.business_scenario}
           onChange={(v) => setDraft({ ...draft, business_scenario: v })}
         />
         <CharterFieldEditor
-          label="业务本质"
-          hint="核心业务对象/状态/关系/动态行为的一句话本质概括"
+          label="业务目标"
+          hint="定义本体建模的使用目标"
           value={draft.business_essence}
           onChange={(v) => setDraft({ ...draft, business_essence: v })}
         />
@@ -1151,7 +1221,7 @@ function CharterPanel({
     return (
       <div className="mt-2 flex items-center justify-between rounded-md border border-dashed border-border px-2.5 py-1.5">
         <span className="text-[10px] text-fg-subtle">
-          未定义设计宪章（业务场景/本质/意图）—— 冷启动建模时应补充，作为 AI
+          未定义设计宪章（业务场景/业务目标）—— 冷启动建模时应补充，作为 AI
           理解业务的基线
         </span>
         <button
@@ -1182,7 +1252,7 @@ function CharterPanel({
       </div>
       <div className="mt-1.5 space-y-1.5">
         <CharterFieldRead label="业务场景" value={c.business_scenario} />
-        <CharterFieldRead label="业务本质" value={c.business_essence} />
+        <CharterFieldRead label="业务目标" value={c.business_essence} />
       </div>
     </div>
   );
@@ -1201,7 +1271,7 @@ type CharterFieldKey = "business_scenario" | "business_essence";
 
 const CHARTER_FIELDS: { key: CharterFieldKey; label: string }[] = [
   { key: "business_scenario", label: "业务场景" },
-  { key: "business_essence", label: "业务本质" },
+  { key: "business_essence", label: "业务目标" },
 ];
 
 /** 从 OntologyPayload 构建实体上下文：对象类型 + 属性 + 关系摘要（限长，供 LLM 参考）。 */
@@ -1665,6 +1735,13 @@ function ObjectTypeCard({
   const [busy, setBusy] = useState(false);
   const previewMut = usePreviewImport();
   const importMut = useImportOntology();
+  // 来源字段（决策 25）：元素键 → 映射行，按本体一次取全量、表格内本地索引
+  const { byElement: mappingByElement } = useMappingRowsByElement(
+    "palantir",
+    payload.api_name,
+  );
+  const mappingRowsOf = (elementType: string, elementId: string) =>
+    mappingByElement.get(`${elementType}\u0000${elementId}`) ?? [];
 
   // 编辑/新增/删除后的统一落库：预演通过 → import overwrite=[该OT]
   async function applyToStore(next: OntologyPayload, title: string) {
@@ -1776,6 +1853,9 @@ function ObjectTypeCard({
         {ot.description && (
           <p className="mt-1 text-[10px] text-fg-muted">{ot.description}</p>
         )}
+        <ObjectTypeSourceSection
+          rows={mappingRowsOf("object_type", ot.api_name)}
+        />
       </div>
 
       {/* 属性表 */}
@@ -1788,6 +1868,7 @@ function ObjectTypeCard({
                 <th className="py-1 pr-2 font-medium">类型</th>
                 <th className="py-1 pr-2 font-medium">标识</th>
                 <th className="py-1 pr-2 font-medium">搜索</th>
+                <th className="py-1 pr-2 font-medium">来源字段</th>
                 <th className="py-1 font-medium">操作</th>
               </tr>
             </thead>
@@ -1822,6 +1903,14 @@ function ObjectTypeCard({
                     ) : (
                       <span className="text-fg-subtle">—</span>
                     )}
+                  </td>
+                  <td className="py-1 pr-2">
+                    <SourceFieldCell
+                      rows={mappingRowsOf("property", p.api_name)}
+                      onCopy={(text) => {
+                        void navigator.clipboard?.writeText(text);
+                      }}
+                    />
                   </td>
                   <td className="py-1">
                     <div className="flex items-center gap-0.5">
@@ -1866,6 +1955,14 @@ function ObjectTypeCard({
             {ot.links.map((link) => (
               <div key={link.api_name} className="group/link flex items-center">
                 <LinkInlineRow link={link} />
+                <span className="ml-2 shrink-0">
+                  <SourceFieldCell
+                    rows={mappingRowsOf("link", link.api_name)}
+                    onCopy={(text) => {
+                      void navigator.clipboard?.writeText(text);
+                    }}
+                  />
+                </span>
                 <div className="ml-2 flex items-center gap-0.5 opacity-0 transition group-hover/link:opacity-100">
                   <button
                     onClick={() =>
@@ -1969,6 +2066,20 @@ function ObjectTypeCard({
   );
 }
 
+// ── 对象类型卡上的来源表分区（未映射时不出现来源行） ──
+function ObjectTypeSourceSection({ rows }: { rows: ElementMapping[] }) {
+  if (rows.length === 0) return null;
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-1.5 border-t border-border/60 pt-1.5">
+      <span className="text-[10px] text-fg-subtle">来源表</span>
+      <MappingStateBadge state={mappingStateOf(rows)} count={rows.length} />
+      <span className="min-w-0 truncate font-mono text-[10px] text-fg-muted">
+        {rows.map((r) => endpointLocator(r.source)).join(" · ")}
+      </span>
+    </div>
+  );
+}
+
 // ── 属性/关系建模编辑弹层（对齐 W3C PropertiesPanel 表单交互） ──
 function ModelingEditorDialog({
   payload,
@@ -2019,7 +2130,7 @@ function ModelingEditorDialog({
       displayName: "",
       description: "",
       targetObjectTypeName: "",
-      cardinality: "MANY_TO_ONE",
+      cardinality: "MANY",
     };
   });
   const [formErr, setFormErr] = useState<string | null>(null);
@@ -2071,6 +2182,33 @@ function ModelingEditorDialog({
       setFormErr(e instanceof Error ? e.message : String(e));
     }
   }
+
+  // 来源字段分区（决策 25）：仅对既有元素开放——新增的元素在保存后才出现物理绑定。
+  const mappingEditor = isNew ? null : (
+    <div className="border-t border-border pt-3">
+      <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-fg-subtle">
+        数据来源
+      </div>
+      <ElementMappingEditor
+        standard="palantir"
+        ontologyKey={payload.api_name}
+        elementType={isProp ? "property" : "link"}
+        elementId={editingName}
+        displayName={
+          isProp
+            ? (ot?.properties.find((x) => x.api_name === editingName)
+                ?.display_name ?? "")
+            : (ot?.links.find((x) => x.api_name === editingName)?.display_name ??
+              "")
+        }
+        dataType={isProp ? (draft as PropertyDraft).dataType : ""}
+        sameTableHint={objectTypeName}
+      />
+      <p className="mt-1 text-[10px] text-fg-subtle">
+        来源字段单独保存，不改变本体定义本身
+      </p>
+    </div>
+  );
 
   const title = `${isNew ? "新增" : "编辑"}${isProp ? "属性" : "关系"} · ${objectTypeName}`;
 
@@ -2311,13 +2449,18 @@ function ModelingEditorDialog({
                 >
                   {CARDINALITIES.map((c) => (
                     <option key={c} value={c}>
-                      {c}
+                      {CARDINALITY_HINTS[c]}
                     </option>
                   ))}
                 </select>
+                <p className="mt-1 text-[10px] leading-relaxed text-fg-subtle">
+                  {CARDINALITY_HELP}
+                </p>
               </div>
             </>
           )}
+
+          {mappingEditor}
 
           {/* 错误提示 */}
           {formErr && (

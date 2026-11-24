@@ -5,13 +5,18 @@
  *  1. rowsToGraphData：SPARQL 查询行 → ConceptNode/ConceptEdge（GraphPanel 数据处理）
  *  2. computeDepth：沿 subClassOf 计算类节点深度（用于分层染色）
  *  3. depthStyle / nodeStyle / edgeStyle：主题感知的节点/边样式工厂
- *  4. buildGraphData：组装 G6 GraphData（含 showDatatypes 过滤 + 深度染色）
+ *  4. buildGraphData：组装 G6 GraphData（含数据类型可见性过滤 + 深度染色）
+ *  5. filterDatatypeVisibility：全局 ☐属性 ∨ 按类双击展开集合
+ *  6. buildClassDeleteConfirmMessage：删除类确认框文案（属性/关系/继承摘要）
  *
  * 运行测试：npm test（vitest，见 ontology-graph.test.ts）
  */
 import type { GraphData } from "@antv/g6";
 
 // ── 类型 ──
+
+/** 相对生效版的差异状态（概念图谱 overlay） */
+export type DiffStatus = "added" | "modified" | "removed";
 
 export interface ConceptNode {
     id: string;
@@ -20,6 +25,8 @@ export interface ConceptNode {
     kind: "class" | "datatype";
     /** 语义标签覆盖：tooltip/详情面板优先显示（缺省按 kind 映射 RDF 术语） */
     kindText?: string;
+    /** 相对生效版：新增 / 修改 / 删除（幽灵） */
+    diffStatus?: DiffStatus;
 }
 
 export interface ConceptEdge {
@@ -28,40 +35,48 @@ export interface ConceptEdge {
     target: string;
     label?: string;
     kind: "hierarchy" | "object" | "datatype";
+    /** 谓词 IRI（object/datatype 边 = 属性定义 IRI；hierarchy 边为空） */
+    predIri?: string;
     /** 语义标签覆盖：tooltip 优先显示（缺省按 kind 映射 RDF 术语） */
     kindText?: string;
+    /** 相对生效版：新增 / 修改 / 删除（幽灵） */
+    diffStatus?: DiffStatus;
 }
 
 export type GraphRow = Record<string, string>;
 
 // ── 主题色板 ──
 
+// 浅色节点底 + 细灰蓝关系线：给「相对生效」绿/黄/红差异留对比度；
+// 避免原深蓝实心底 + 粗翠绿边把新增绿淹没。
 const THEME: Record<string, Record<string, Record<string, string>>> = {
     light: {
         bg: { canvas: "#ffffff", surface: "#f8fafc" },
-        class: { fill: "#dbeafe", stroke: "#3b82f6", labelFill: "#1e3a8a" },
-        datatype: { fill: "#fef3c7", stroke: "#f59e0b", labelFill: "#78350f" },
-        hierarchy: { stroke: "#94a3b8", labelFill: "#64748b" },
-        object: { stroke: "#10b981", labelFill: "#065f46" },
-        datatypeEdge: { stroke: "#f59e0b", labelFill: "#b45309" },
-        root: { fill: "#4f46e5", stroke: "#4338ca", labelFill: "#ffffff" },
-        tier1: { fill: "#2563eb", stroke: "#1d4ed8", labelFill: "#ffffff" },
-        tier2: { fill: "#60a5fa", stroke: "#3b82f6", labelFill: "#1e3a8a" },
-        tier3: { fill: "#93c5fd", stroke: "#60a5fa", labelFill: "#1e3a8a" },
-        tier4: { fill: "#dbeafe", stroke: "#93c5fd", labelFill: "#1e3a8a" },
+        class: { fill: "#ffffff", stroke: "#94a3b8", labelFill: "#334155" },
+        datatype: { fill: "#fffbeb", stroke: "#d97706", labelFill: "#78350f" },
+        hierarchy: { stroke: "#cbd5e1", labelFill: "#334155" },
+        // 关系边标签与类节点标签同色，避免边上字发灰发淡
+        object: { stroke: "#64748b", labelFill: "#334155" },
+        datatypeEdge: { stroke: "#d97706", labelFill: "#92400e" },
+        // 层级仅用极浅冷灰区分，不再用实心靛蓝
+        root: { fill: "#f1f5f9", stroke: "#64748b", labelFill: "#0f172a" },
+        tier1: { fill: "#f8fafc", stroke: "#94a3b8", labelFill: "#1e293b" },
+        tier2: { fill: "#ffffff", stroke: "#94a3b8", labelFill: "#334155" },
+        tier3: { fill: "#ffffff", stroke: "#cbd5e1", labelFill: "#475569" },
+        tier4: { fill: "#ffffff", stroke: "#e2e8f0", labelFill: "#64748b" },
     },
     dark: {
         bg: { canvas: "#0f172a", surface: "#1e293b" },
-        class: { fill: "#1e3a5f", stroke: "#60a5fa", labelFill: "#bfdbfe" },
-        datatype: { fill: "#5c3d0e", stroke: "#fbbf24", labelFill: "#fde68a" },
-        hierarchy: { stroke: "#64748b", labelFill: "#94a3b8" },
-        object: { stroke: "#34d399", labelFill: "#a7f3d0" },
+        class: { fill: "#1e293b", stroke: "#64748b", labelFill: "#e2e8f0" },
+        datatype: { fill: "#422006", stroke: "#fbbf24", labelFill: "#fde68a" },
+        hierarchy: { stroke: "#475569", labelFill: "#e2e8f0" },
+        object: { stroke: "#94a3b8", labelFill: "#e2e8f0" },
         datatypeEdge: { stroke: "#fbbf24", labelFill: "#fde68a" },
-        root: { fill: "#6366f1", stroke: "#818cf8", labelFill: "#e0e7ff" },
-        tier1: { fill: "#3b82f6", stroke: "#60a5fa", labelFill: "#bfdbfe" },
-        tier2: { fill: "#2563eb", stroke: "#3b82f6", labelFill: "#bfdbfe" },
-        tier3: { fill: "#1d4ed8", stroke: "#2563eb", labelFill: "#bfdbfe" },
-        tier4: { fill: "#1e3a5f", stroke: "#1d4ed8", labelFill: "#bfdbfe" },
+        root: { fill: "#334155", stroke: "#94a3b8", labelFill: "#f8fafc" },
+        tier1: { fill: "#1e293b", stroke: "#64748b", labelFill: "#e2e8f0" },
+        tier2: { fill: "#1e293b", stroke: "#475569", labelFill: "#cbd5e1" },
+        tier3: { fill: "#0f172a", stroke: "#475569", labelFill: "#94a3b8" },
+        tier4: { fill: "#0f172a", stroke: "#334155", labelFill: "#94a3b8" },
     },
 };
 
@@ -76,6 +91,26 @@ export function termToShort(term: string): string {
     const local = parts.length > 1 ? parts[parts.length - 1] : "";
     return local || s;
 }
+
+/**
+ * 元素 kind → 对外 RDF 术语。节点/边共用概念图谱 tooltip：
+ * 只按 class/非 class 二分会把 object 关系边标成 owl:DatatypeProperty。
+ */
+export function rdfTermForKind(kind?: string): string {
+    switch (kind) {
+        case "class":
+            return "owl:Class";
+        case "object":
+            return "owl:ObjectProperty";
+        case "hierarchy":
+            return "rdfs:subClassOf";
+        case "datatype":
+            return "owl:DatatypeProperty";
+        default:
+            return "";
+    }
+}
+
 
 /** 从 labelMap 查中文显示名，查不到回退到 IRI 短名。 */
 export function labelOf(
@@ -142,13 +177,16 @@ export function rowsToGraphData(
             const pKey = termToShort(p);
             const dom = termToShort(s);
             const rng = termToShort(o);
-            if (dom !== rng) {
+            // 允许自环（domain=range，如「上级来源」）；删除态幽灵边本就可画，
+            // 若此处过滤则恢复后关系从图谱消失。
+            if (dom && rng && pKey) {
                 edgeList.push({
                     id: `o-${pKey}-${dom}-${rng}`,
                     source: dom,
                     target: rng,
                     label: labelOf(labelMap, p),
                     kind: "object",
+                    predIri: p,
                 });
             }
         } else if (type === "datatypeProperty" && p) {
@@ -171,6 +209,7 @@ export function rowsToGraphData(
                     target: pKey,
                     label,
                     kind: "datatype",
+                    predIri: p,
                 });
             }
         }
@@ -229,7 +268,9 @@ export function nodeStyle(
               size: 52,
               fill: s.fill,
               stroke: s.stroke,
-              lineWidth: 2,
+              lineWidth: 1.5,
+              lineDash: [],
+              opacity: 1,
               labelFill: s.labelFill,
               labelFontSize: 11,
               labelFontWeight: 600,
@@ -239,7 +280,9 @@ export function nodeStyle(
               size: [88, 32],
               fill: s.fill,
               stroke: s.stroke,
-              lineWidth: 1.5,
+              lineWidth: 1,
+              lineDash: [],
+              opacity: 1,
               radius: 6,
               labelFill: s.labelFill,
               labelFontSize: 10,
@@ -263,12 +306,16 @@ export function edgeStyle(
     const isHierarchy = kind === "hierarchy";
     return {
         stroke: s.stroke,
-        lineWidth: isHierarchy ? 1.5 : 2,
-        lineDash: isHierarchy ? [6, 4] : kind === "datatype" ? [4, 3] : undefined,
+        // 默认关系线保持细线；差异态边再加粗（见 applyDiffEdgeStyle）
+        lineWidth: isHierarchy ? 1 : 1.25,
+        // object 边默认实心，但必须**显式写出** lineDash：缺键会让上一帧的虚线残留（G6 只更新给到的属性）
+        lineDash: isHierarchy ? [5, 4] : kind === "datatype" ? [4, 3] : [],
+        opacity: 1,
         endArrow: true,
+        endArrowSize: 6,
         endArrowFill: s.stroke,
         labelFill: s.labelFill,
-        labelFontSize: isHierarchy ? 10 : kind === "datatype" ? 9 : 10,
+        labelFontSize: isHierarchy ? 9 : kind === "datatype" ? 9 : 10,
         labelFontWeight: 500,
         labelBackground: true,
         labelBackgroundFill: t.bg.surface,
@@ -277,33 +324,140 @@ export function edgeStyle(
     };
 }
 
-/** 组装 G6 GraphData：showDatatypes 过滤 + 类节点深度染色 + 边标签兜底。 */
+/** 松散 IRI 相等：整串相等，或以末段 local name 相等（与 ConceptGraph 清单对齐）。 */
+export function iriLooseEq(a: string, b: string): boolean {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    const sa = a.split(/[#/]/).pop() ?? "";
+    const sb = b.split(/[#/]/).pop() ?? "";
+    return !!sa && sa === sb;
+}
+
+// ── 删除类确认摘要（卡片删除用） ──
+
+/** 删除类确认框的输入摘要（组件按 propsQ / 图数据计算，纯函数负责成文）。 */
+export interface ClassDeleteSummary {
+    /** 待删类 IRI（只用于取名，不进文案） */
+    classIri: string;
+    /** 将被删除的数据属性（定义域仅该类） */
+    datatypeProps: ReadonlyArray<{ iri: string; label?: string }>;
+    /** 将被删除的关系（domain 或 range 触及该类） */
+    objectProps: ReadonlyArray<{ iri: string; label?: string }>;
+    /** 将被解除继承的父类显示名 */
+    parentLabels: ReadonlyArray<string>;
+    /** 将被解除继承的子类显示名 */
+    childLabels: ReadonlyArray<string>;
+}
+
+const shortIri = (iri: string) => iri.split(/[#/]/).pop() || iri;
+
+/** 列表裁剪：最多 8 项，余下省略号（避免确认框被长清单撑爆）。 */
+function clipNames(xs: ReadonlyArray<string>): string {
+    return `${xs.slice(0, 8).join("、")}${xs.length > 8 ? "…" : ""}`;
+}
+
+/**
+ * 删除类确认框文案：业务语言摘要将一并处理的属性/关系/继承。
+ * 不出现引用方 IRI 列表，也不描述后端实现细节。
+ */
+export function buildClassDeleteConfirmMessage(s: ClassDeleteSummary): string {
+    const names = (ps: ClassDeleteSummary["datatypeProps"]) =>
+        ps.map((p) => p.label || shortIri(p.iri));
+    // 继承分「父类/子类」两组，避免每个名字都重复前缀
+    const inheritParts: string[] = [];
+    if (s.parentLabels.length) inheritParts.push(`父类 ${s.parentLabels.join("、")}`);
+    if (s.childLabels.length) inheritParts.push(`子类 ${s.childLabels.join("、")}`);
+    const lines = [`确定删除「${shortIri(s.classIri)}」及其相关定义吗？`];
+    if (s.datatypeProps.length) lines.push(`将删除属性：${clipNames(names(s.datatypeProps))}`);
+    if (s.objectProps.length) lines.push(`将删除关系：${clipNames(names(s.objectProps))}`);
+    if (inheritParts.length) lines.push(`将解除继承：${inheritParts.join("；")}`);
+    if (!s.datatypeProps.length && !s.objectProps.length && !inheritParts.length) {
+        lines.push("该对象暂无关联的属性、关系或继承。");
+    }
+    lines.push("共享属性若同时属于其他类，将仅去掉对本类的定义。");
+    if (s.objectProps.length) {
+        lines.push("关系上的基数/限定约束将随之移除。");
+    }
+    return lines.join("\n");
+}
+
+/**
+ * 数据属性可见性：全局开 → 全显；否则仅 domain∈expandedAttrClassIris 的 datatype 节点。
+ * 关系（object）边不参与此过滤；无 domain 的孤儿属性仅全局开时可见。
+ */
+export function filterDatatypeVisibility(
+    nodes: ConceptNode[],
+    edges: ConceptEdge[],
+    showDatatypes: boolean,
+    expandedAttrClassIris: ReadonlySet<string> = new Set(),
+): { nodes: ConceptNode[]; edges: ConceptEdge[] } {
+    if (showDatatypes) return { nodes, edges };
+
+    const classIriById = new Map(
+        nodes.filter((n) => n.kind === "class").map((n) => [n.id, n.iri]),
+    );
+    const domainIriByDtId = new Map<string, string>();
+    for (const e of edges) {
+        if (e.kind !== "datatype") continue;
+        const classIri = classIriById.get(e.source);
+        if (classIri) domainIriByDtId.set(e.target, classIri);
+    }
+
+    const expandedHas = (iri: string) => {
+        for (const x of expandedAttrClassIris) {
+            if (iriLooseEq(x, iri)) return true;
+        }
+        return false;
+    };
+
+    const visibleNodes = nodes.filter((n) => {
+        if (n.kind !== "datatype") return true;
+        const domain = domainIriByDtId.get(n.id);
+        if (!domain) return false;
+        return expandedHas(domain);
+    });
+    const nodeIds = new Set(visibleNodes.map((n) => n.id));
+    const visibleEdges = edges.filter(
+        (e) => nodeIds.has(e.source) && nodeIds.has(e.target),
+    );
+    return { nodes: visibleNodes, edges: visibleEdges };
+}
+
+/** 组装 G6 GraphData：数据类型可见性过滤 + 类节点深度染色 + 边标签兜底。 */
 export function buildGraphData(
     nodes: ConceptNode[],
     edges: ConceptEdge[],
     theme: string,
     showDatatypes: boolean,
+    expandedAttrClassIris: ReadonlySet<string> = new Set(),
 ): GraphData {
-    const visibleNodes = showDatatypes
-        ? nodes
-        : nodes.filter((n) => n.kind !== "datatype");
-    const nodeIds = new Set(visibleNodes.map((n) => n.id));
-    const visibleEdges = edges.filter(
-        (e) => nodeIds.has(e.source) && nodeIds.has(e.target),
+    const { nodes: visibleNodes, edges: visibleEdges } = filterDatatypeVisibility(
+        nodes,
+        edges,
+        showDatatypes,
+        expandedAttrClassIris,
     );
     const depthMap = computeDepth(visibleNodes, visibleEdges);
     const gNodes = visibleNodes.map((n) => {
         const style = nodeStyle(theme, n.kind);
-        // 类节点：按层级深度染色（根深叶浅）
-        if (n.kind === "class") {
+        // 有差异态时跳过深度蓝填充——否则只改描边几乎看不出「新增」
+        if (n.kind === "class" && !n.diffStatus) {
             const d = depthMap.get(n.id);
             if (d !== undefined) {
                 Object.assign(style, depthStyle(theme, d));
             }
         }
+        applyDiffNodeStyle(style, n.diffStatus);
         return {
             id: n.id,
-            data: { id: n.id, label: n.label, iri: n.iri, kind: n.kind, kindText: n.kindText },
+            data: {
+                id: n.id,
+                label: n.label,
+                iri: n.iri,
+                kind: n.kind,
+                kindText: n.kindText,
+                diffStatus: n.diffStatus,
+            },
             style: {
                 ...style,
                 labelText: n.label, // G6 v5 显示标签需要 labelText
@@ -312,16 +466,59 @@ export function buildGraphData(
     });
     const gEdges = visibleEdges.map((e) => {
         const base = edgeStyle(theme, e.kind);
+        applyDiffEdgeStyle(base, e.diffStatus);
+        const isLoop = e.source === e.target;
         return {
             id: e.id,
             source: e.source,
             target: e.target,
-            data: { kind: e.kind, label: e.label, kindText: e.kindText },
+            data: {
+                kind: e.kind,
+                label: e.label,
+                kindText: e.kindText,
+                diffStatus: e.diffStatus,
+            },
             style: {
                 ...base,
+                // G6 v5：source===target 时自动走 loop 路径；给个默认方位避免贴节点
+                ...(isLoop
+                    ? { loopPlacement: "top" as const, loopDist: 36 }
+                    : {}),
                 labelText: e.label ?? (e.kind === "hierarchy" ? "subClassOf" : ""),
             },
         };
     });
     return { nodes: gNodes, edges: gEdges };
+}
+
+/**
+ * 图上统一变更色（粉底虚线）：新增 / 修改 / 删除**完全同形**，不保留任何视觉差异。
+ * 类型与「是否仍在草稿里」由变更清单与撤销回执承担；removed 的降透明度肉眼几乎不可辨，
+ * 留着只会让「撤销后仍粉虚线」被读成「撤销没生效」，故一并取消。
+ */
+function applyDiffNodeStyle(
+    style: Record<string, unknown>,
+    status?: DiffStatus,
+): void {
+    if (!status) return;
+    style.fill = "#fecaca";
+    style.stroke = "#b91c1c";
+    style.labelFill = "#7f1d1d";
+    style.lineWidth = 1.5;
+    style.lineDash = [5, 4];
+    style.opacity = 1;
+}
+
+function applyDiffEdgeStyle(
+    style: Record<string, unknown>,
+    status?: DiffStatus,
+): void {
+    if (!status) return;
+    style.stroke = "#dc2626";
+    style.endArrowFill = "#dc2626";
+    // 与变更态类节点标签同色（此前边标签仍用灰蓝，幽灵/新增关系字发淡）
+    style.labelFill = "#7f1d1d";
+    style.lineWidth = 1.5;
+    style.lineDash = [5, 4];
+    style.opacity = 1;
 }

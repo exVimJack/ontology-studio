@@ -447,6 +447,35 @@ use super::*;
         );
     }
 
+    /// 删本体 → validation_issues/validation_reviews 级联删：孤儿行会让其他
+    /// 本体 persist 同名规则 id 撞全局主键（UNIQUE constraint failed）。
+    #[test]
+    fn delete_ontology_cascades_validation_issues() {
+        let store = TtlStore::open_in_memory().unwrap();
+        let iri = "https://example.org/ontology/test#TestOntology";
+        store.import_ttl(sample_ttl(), true).unwrap();
+        store
+            .persist_issues(
+                iri,
+                "v1",
+                &[crate::validation::ValidationIssue::error("L3-3", "L3", "c", "m")],
+            )
+            .unwrap();
+        assert!(store.delete_ontology(iri).unwrap());
+        assert!(
+            store.list_issues(iri).unwrap().is_empty(),
+            "删本体后 validation_issues 应级联删"
+        );
+        // 孤儿行清空后，其他本体落同名规则 id 不再撞全局主键
+        store
+            .persist_issues(
+                "https://example.org/ontology/other#",
+                "v2",
+                &[crate::validation::ValidationIssue::error("L3-3", "L3", "c", "m")],
+            )
+            .unwrap();
+    }
+
     // ── 属性/关系结构化编辑（ttl_edit 手术链）──────────────────
 
     const EDIT_IRI: &str = "https://example.org/ontology/test#supplierId";
@@ -983,8 +1012,10 @@ use super::*;
     }
 
     #[test]
-    fn delete_property_blocked_by_restriction() {
-        // 删除被 owl:onProperty 引用的属性 → 手术结果校验失败 → 拒绝落库
+    fn delete_property_also_drops_its_restrictions() {
+        // 删除被 owl:onProperty 引用的属性：约束已失去意义，随属性一并摘除。
+        // 旧语义是「校验失败 → 拒绝落库」，会让含约束的本体上任何属性/类删除
+        // 永远失败（用户明确要删却被技术细节挡住）。
         let store = TtlStore::open_in_memory().unwrap();
         let ttl = r#"@prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
@@ -1000,11 +1031,17 @@ use super::*;
 "#;
         store.import_ttl(ttl, true).unwrap();
         let iri = "https://example.org/ontology/test#TestOntology";
-        let r = store.delete_ttl_property(iri, "https://example.org/ontology/test#supplies");
-        assert!(r.is_err(), "删除被引用属性应被拒: {r:?}");
-        // 属性仍在库中
+        store
+            .delete_ttl_property(iri, "https://example.org/ontology/test#supplies")
+            .expect("删除应成功并清理其约束");
         let props = store.list_ttl_properties(iri).unwrap();
-        assert!(props.iter().any(|p| p.iri.ends_with("#supplies")));
+        assert!(!props.iter().any(|p| p.iri.ends_with("#supplies")));
+        let after = store.export_ttl(iri).unwrap();
+        assert!(
+            !after.contains("onProperty"),
+            "不得留下悬空 onProperty: {after}"
+        );
+        assert!(after.contains(":Supplier a owl:Class"));
     }
 
     #[test]
@@ -1074,4 +1111,1022 @@ use super::*;
             .find(|p| p.iri.contains("closeProbability"))
             .expect("前端属性列表应有 closeProbability");
         assert_eq!(p.iri, prop_row.element_id, "前端 iri 与证据 element_id 必须完全一致");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 版本管理（ontology_ttl_versions + active_revision）
+    // ════════════════════════════════════════════════════════════════
+
+    const VIRI: &str = "https://example.org/ontology/test#TestOntology";
+
+    #[test]
+    fn version_publish_import_revert_lifecycle() {
+        let store = TtlStore::open_in_memory().unwrap();
+        store.import_ttl(sample_ttl(), false).unwrap();
+        // 未发布：active=NULL
+        assert_eq!(store.get_active_revision(VIRI).unwrap(), None);
+
+        // 发布 v1
+        let rev1 = store.publish_version(VIRI, "v1.0", "初始版本", "user", None).unwrap();
+        assert_eq!(rev1, 1);
+        assert_eq!(store.get_active_revision(VIRI).unwrap(), Some(1));
+        let versions = store.list_versions(VIRI).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].label, "v1.0");
+        assert_eq!(versions[0].author, "user");
+        assert!(versions[0].triple_count > 0, "triple_count 应来自 ontology_ttl");
+        // 首版无上一版本 → 修改点为空对象
+        assert_eq!(versions[0].diff_summary, "{}");
+        // 发布写 changelog，且 change_summary 带 published_version 映射
+        let changelog = store.list_changelog(VIRI).unwrap();
+        assert_eq!(changelog.len(), 1);
+        assert!(changelog[0].change_summary.contains("\"published_version\": 1"));
+
+        // 修改 → 置脏，保留生效指针
+        let modified = sample_ttl().replace("供应商", "供应商v2");
+        store.import_ttl(&modified, true).unwrap();
+        assert_eq!(store.get_active_revision(VIRI).unwrap(), Some(1));
+        assert!(store.get_workspace_dirty(VIRI).unwrap());
+        // import 不留新版本
+        assert_eq!(store.list_versions(VIRI).unwrap().len(), 1);
+
+        // 发布 v2
+        let rev2 = store.publish_version(VIRI, "v2.0", "改标签", "agent", None).unwrap();
+        assert_eq!(rev2, 2);
+        assert_eq!(store.list_versions(VIRI).unwrap().len(), 2);
+        // v2 的修改点已落库：Supplier 类 label 变（modified_classes）
+        let versions = store.list_versions(VIRI).unwrap();
+        let diff2: serde_json::Value =
+            serde_json::from_str(&versions[0].diff_summary).expect("diff_summary 应为合法 JSON");
+        assert_eq!(diff2["modified_classes"].as_array().map(|a| a.len()), Some(1));
+        assert_eq!(diff2["rev_a"], 1);
+        assert_eq!(diff2["rev_b"], 2);
+
+        // 回退到 v1：切指针不新建版本
+        store.revert_to_version(VIRI, 1, "user", None).unwrap();
+        assert_eq!(store.get_active_revision(VIRI).unwrap(), Some(1));
+        let ttl = store.export_ttl(VIRI).unwrap();
+        assert!(ttl.contains("供应商"));
+        assert!(!ttl.contains("供应商v2"), "回退后内容应为 v1");
+        assert_eq!(store.list_versions(VIRI).unwrap().len(), 2, "回退不新建版本");
+
+        // 回退后可逆：再启用 v2
+        store.revert_to_version(VIRI, 2, "user", None).unwrap();
+        let ttl = store.export_ttl(VIRI).unwrap();
+        assert!(ttl.contains("供应商v2"));
+
+        // 回退后原样再发布 → 内容相同的新版本（预期，发布=新里程碑）
+        let rev3 = store.publish_version(VIRI, "v3", "", "user", None).unwrap();
+        assert_eq!(rev3, 3);
+        // label 为空 → 默认三位数 v0.0.N（N=发布序号）；用户显式填则以其为准
+        let rev4 = store.publish_version(VIRI, "", "空标签自动生成", "user", None).unwrap();
+        assert_eq!(rev4, 4);
+        let versions = store.list_versions(VIRI).unwrap();
+        assert_eq!(versions[0].label, "v0.0.4");
+        assert_eq!(versions[0].description, "空标签自动生成");
+    }
+
+    #[test]
+    fn revoke_workspace_diff_item_add_modify_remove_property() {
+        use crate::ttl::WorkspaceDiffRevokeItem;
+        use crate::ttl_edit::TtlPropertyEdit;
+
+        let store = TtlStore::open_in_memory().unwrap();
+        store.import_ttl(sample_ttl(), false).unwrap();
+        store
+            .publish_version(VIRI, "v1", "初始", "user", None)
+            .unwrap();
+
+        // 新增属性 → 撤销 add → 属性消失且 dirty 清零
+        let new_prop = TtlPropertyEdit {
+            iri: "https://example.org/ontology/test#newProp".into(),
+            kind: "datatype".into(),
+            label: "新属性".into(),
+            comment: String::new(),
+            domain: "https://example.org/ontology/test#Supplier".into(),
+            range: "http://www.w3.org/2001/XMLSchema#string".into(),
+        };
+        store.add_ttl_property(VIRI, &new_prop).unwrap();
+        assert!(store.get_workspace_dirty(VIRI).unwrap());
+        store
+            .revoke_workspace_diff_item(
+                VIRI,
+                &WorkspaceDiffRevokeItem::Property {
+                    op: "add".into(),
+                    iri: new_prop.iri.clone(),
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .list_ttl_properties(VIRI)
+                .unwrap()
+                .iter()
+                .all(|p| p.iri != new_prop.iri)
+        );
+        assert!(
+            !store.get_workspace_dirty(VIRI).unwrap(),
+            "撤销后与生效版一致应清 dirty"
+        );
+
+        // 修改 label → 撤销 modify → 恢复中文名
+        let mut edit = store
+            .list_ttl_properties(VIRI)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.iri.ends_with("supplierId"))
+            .expect("supplierId");
+        edit.label = "编号改名".into();
+        store.edit_ttl_property(VIRI, &edit).unwrap();
+        store
+            .revoke_workspace_diff_item(
+                VIRI,
+                &WorkspaceDiffRevokeItem::Property {
+                    op: "modify".into(),
+                    iri: edit.iri.clone(),
+                },
+            )
+            .unwrap();
+        let restored = store
+            .list_ttl_properties(VIRI)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.iri.ends_with("supplierId"))
+            .unwrap();
+        assert_eq!(restored.label, "供应商编号");
+
+        // 删除属性 → 撤销 remove → 恢复
+        store
+            .delete_ttl_property(VIRI, &edit.iri)
+            .unwrap();
+        store
+            .revoke_workspace_diff_item(
+                VIRI,
+                &WorkspaceDiffRevokeItem::Property {
+                    op: "remove".into(),
+                    iri: edit.iri.clone(),
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .list_ttl_properties(VIRI)
+                .unwrap()
+                .iter()
+                .any(|p| p.iri.ends_with("supplierId"))
+        );
+    }
+
+    #[test]
+    fn version_diff_historical_and_current() {
+        let store = TtlStore::open_in_memory().unwrap();
+        store.import_ttl(sample_ttl(), false).unwrap();
+        store.publish_version(VIRI, "v1", "初始", "user", None).unwrap();
+        let modified = sample_ttl()
+            .replace("供应商", "供应商v2")
+            .replace("supplierId", "supplierCode");
+        store.import_ttl(&modified, true).unwrap();
+        store.publish_version(VIRI, "v2", "改类标签+属性改名", "agent", None).unwrap();
+
+        // 历史 vs 历史
+        let diff = store.diff_versions(VIRI, 1, 2).unwrap();
+        assert_eq!(diff.modified_classes.len(), 1, "Supplier 类 label 变了");
+        assert_eq!(diff.modified_classes[0].before.label, "供应商");
+        assert_eq!(diff.modified_classes[0].after.label, "供应商v2");
+        assert_eq!(diff.removed_properties.len(), 1, "supplierId 改名=旧 IRI 删除");
+        assert_eq!(diff.added_properties.len(), 1, "supplierCode 新增");
+        assert!(!diff.ontology_meta_changed, "本体头未变");
+
+        // 当前工作区 vs 历史（rev=0 哨兵）：当前=刚发布的 v2 内容
+        let diff2 = store.diff_versions(VIRI, 0, 1).unwrap();
+        assert_eq!(diff2.modified_classes.len(), 1);
+        assert_eq!(diff2.added_properties.len(), 1);
+    }
+
+    #[test]
+    fn version_diff_includes_subclass_of_edges() {
+        let store = TtlStore::open_in_memory().unwrap();
+        let with_hierarchy = format!(
+            "{}\n:Partner a owl:Class ;\n    rdfs:label \"合作方\"@zh ;\n    rdfs:subClassOf :Supplier .\n",
+            sample_ttl()
+        );
+        store.import_ttl(&with_hierarchy, true).unwrap();
+        store.publish_version(VIRI, "v1", "", "user", None).unwrap();
+
+        // 去掉 Partner⊑Supplier，改为 Partner⊑ 新父类（先加 Party 类）
+        let mutated = with_hierarchy
+            .replace(
+                "rdfs:subClassOf :Supplier .",
+                "rdfs:subClassOf :Party .",
+            )
+            .replace(
+                ":Partner a owl:Class ;",
+                ":Party a owl:Class ;\n    rdfs:label \"主体\"@zh .\n\n:Partner a owl:Class ;",
+            );
+        store.import_ttl(&mutated, true).unwrap();
+
+        let diff = store.diff_versions(VIRI, 1, 0).unwrap();
+        assert!(
+            diff.added_classes
+                .iter()
+                .any(|c| c.ends_with("#Party") || c.ends_with("Party")),
+            "新增 Party: {:?}",
+            diff.added_classes
+        );
+        assert_eq!(diff.removed_subclass_of.len(), 1, "{:?}", diff.removed_subclass_of);
+        assert!(
+            diff.removed_subclass_of[0].parent.ends_with("Supplier")
+                || diff.removed_subclass_of[0].parent.contains("Supplier")
+        );
+        assert_eq!(diff.added_subclass_of.len(), 1, "{:?}", diff.added_subclass_of);
+        assert!(
+            diff.added_subclass_of[0].parent.ends_with("Party")
+                || diff.added_subclass_of[0].parent.contains("Party")
+        );
+
+        // 旧 diff_summary JSON 缺 hierarchy 字段 → 反序列化默认空
+        let legacy: TtlVersionDiff = serde_json::from_str(
+            r#"{"rev_a":1,"rev_b":2,"added_classes":[],"removed_classes":[],"modified_classes":[],"added_properties":[],"removed_properties":[],"modified_properties":[],"ontology_meta_changed":false}"#,
+        )
+        .unwrap();
+        assert!(legacy.added_subclass_of.is_empty());
+        assert!(legacy.removed_subclass_of.is_empty());
+    }
+
+    #[test]
+    fn version_append_and_delete_marks_dirty() {
+        let store = TtlStore::open_in_memory().unwrap();
+        store.import_ttl(sample_ttl(), false).unwrap();
+        store.publish_version(VIRI, "v1", "", "user", None).unwrap();
+        assert_eq!(store.get_active_revision(VIRI).unwrap(), Some(1));
+        assert!(!store.get_workspace_dirty(VIRI).unwrap());
+
+        // append 追加 → 置脏，保留生效指针（delta 元素须带证据注解过闸门）
+        let delta = "\n@prefix owl: <http://www.w3.org/2002/07/owl#> .\n@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n@prefix skos: <http://www.w3.org/2004/02/skos/core#> .\n@prefix : <https://example.org/ontology/test#> .\n\n:extraProp a owl:DatatypeProperty ;\n    rdfs:label \"额外\"@zh ;\n    skos:editorialNote \"evidence: none | direct | 「测试豁免」\" .\n";
+        let r = store.append_ttl(VIRI, delta).unwrap();
+        assert!(r.errors.is_empty(), "append 应成功: {:?}", r.errors);
+        assert_eq!(store.get_active_revision(VIRI).unwrap(), Some(1));
+        assert!(store.get_workspace_dirty(VIRI).unwrap());
+        assert_eq!(store.list_versions(VIRI).unwrap().len(), 1, "append 不留版本");
+
+        // 删除本体 → versions 级联清（显式兜底）
+        store.delete_ontology(VIRI).unwrap();
+        assert_eq!(store.list_versions(VIRI).unwrap().len(), 0);
+        assert!(!store.exists(VIRI).unwrap());
+    }
+
+    #[test]
+    fn export_effective_ttl_dirty_unpublished_and_revert() {
+        let store = TtlStore::open_in_memory().unwrap();
+        store.import_ttl(sample_ttl(), false).unwrap();
+        // 从未发布 → 拒绝
+        let err = store.export_effective_ttl(VIRI).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Unpublished(_)),
+            "从未发布应 Unpublished: {err}"
+        );
+
+        store.publish_version(VIRI, "v1", "", "user", None).unwrap();
+        let v1 = store.export_effective_ttl(VIRI).unwrap();
+        assert!(v1.contains("供应商"));
+        assert!(!store.get_workspace_dirty(VIRI).unwrap());
+
+        // 脏导出仍为旧快照
+        let modified = sample_ttl().replace("供应商", "供应商v2");
+        store.import_ttl(&modified, true).unwrap();
+        assert!(store.get_workspace_dirty(VIRI).unwrap());
+        assert_eq!(store.get_active_revision(VIRI).unwrap(), Some(1));
+        let effective = store.export_effective_ttl(VIRI).unwrap();
+        assert!(effective.contains("供应商"));
+        assert!(!effective.contains("供应商v2"));
+        let draft = store.export_ttl(VIRI).unwrap();
+        assert!(draft.contains("供应商v2"));
+
+        store.publish_version(VIRI, "v2", "", "user", None).unwrap();
+        assert!(!store.get_workspace_dirty(VIRI).unwrap());
+        let v2 = store.export_effective_ttl(VIRI).unwrap();
+        assert!(v2.contains("供应商v2"));
+
+        // 切回非最新后再编辑：生效仍为切回目标
+        store.revert_to_version(VIRI, 1, "user", None).unwrap();
+        assert_eq!(store.get_active_revision(VIRI).unwrap(), Some(1));
+        assert!(!store.get_workspace_dirty(VIRI).unwrap());
+        let after_revert = sample_ttl().replace("供应商", "供应商draft");
+        store.import_ttl(&after_revert, true).unwrap();
+        assert!(store.get_workspace_dirty(VIRI).unwrap());
+        assert_eq!(store.get_active_revision(VIRI).unwrap(), Some(1));
+        let still_v1 = store.export_effective_ttl(VIRI).unwrap();
+        assert!(still_v1.contains("供应商"));
+        assert!(!still_v1.contains("供应商v2"));
+        assert!(!still_v1.contains("供应商draft"));
+    }
+
+    #[test]
+    fn version_fifo_trims_oldest_over_limit() {
+        let store = TtlStore::open_in_memory().unwrap();
+        store.set_version_limit(3).unwrap();
+        assert_eq!(store.get_version_limit().unwrap(), 3);
+        store.import_ttl(sample_ttl(), false).unwrap();
+        for i in 1..=5 {
+            store.publish_version(VIRI, &format!("v{i}"), "", "user", None).unwrap();
+        }
+        let revs: Vec<i64> = store
+            .list_versions(VIRI)
+            .unwrap()
+            .into_iter()
+            .map(|v| v.revision)
+            .collect();
+        assert_eq!(revs, vec![5, 4, 3], "超限删最旧（rev1/rev2 被删）");
+        assert_eq!(store.get_active_revision(VIRI).unwrap(), Some(5));
+    }
+
+    #[test]
+    fn version_fifo_skips_active_revision() {
+        let store = TtlStore::open_in_memory().unwrap();
+        store.import_ttl(sample_ttl(), false).unwrap();
+        for i in 1..=3 {
+            store.publish_version(VIRI, &format!("v{i}"), "", "user", None).unwrap();
+        }
+        // 手动构造"启用最旧版本"状态（回退到 rev1 后），直接触发清理：
+        // 若 FIFO 不跳过 active，rev1 被删 → 指针悬空
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE ontology_ttl SET active_revision=1 WHERE ontology_iri=?1",
+                rusqlite::params![VIRI],
+            )
+            .unwrap();
+            TtlStore::fifo_trim_conn(&conn, VIRI, 2).unwrap();
+        }
+        let revs: Vec<i64> = store
+            .list_versions(VIRI)
+            .unwrap()
+            .into_iter()
+            .map(|v| v.revision)
+            .collect();
+        assert_eq!(revs, vec![3, 1], "rev1（active）被跳过，删 rev2");
+        assert_eq!(store.get_active_revision(VIRI).unwrap(), Some(1), "指针不悬空");
+        // 被跳过的版本仍可回退
+        store.revert_to_version(VIRI, 1, "user", None).unwrap();
+        assert_eq!(store.get_active_revision(VIRI).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn version_delete_single_and_reject_active() {
+        let store = TtlStore::open_in_memory().unwrap();
+        store.import_ttl(sample_ttl(), false).unwrap();
+        store.publish_version(VIRI, "v1", "", "user", None).unwrap();
+        let modified = sample_ttl().replace("供应商", "供应商v2");
+        store.import_ttl(&modified, true).unwrap();
+        store.publish_version(VIRI, "v2", "", "user", None).unwrap();
+        store.import_ttl(sample_ttl(), true).unwrap();
+        store.publish_version(VIRI, "v3", "", "user", None).unwrap();
+
+        // active=rev3：删除 rev3 被拒
+        assert!(store.delete_version(VIRI, 3).is_err());
+        // 删除中间版本 rev2（非 active）→ OK，revision 空洞保留
+        store.delete_version(VIRI, 2).unwrap();
+        let revs: Vec<i64> = store
+            .list_versions(VIRI)
+            .unwrap()
+            .into_iter()
+            .map(|v| v.revision)
+            .collect();
+        assert_eq!(revs, vec![3, 1], "rev2 删除后空洞保留");
+        // 删除不存在的版本 → NotFound
+        assert!(store.delete_version(VIRI, 99).is_err());
+        // 删除不存在本体 → NotFound（行不存在）
+        assert!(store
+            .delete_version("https://nonexistent.example/ont", 1)
+            .is_err());
+        // 删除后仍可回退到剩余版本
+        store.revert_to_version(VIRI, 1, "user", None).unwrap();
+        assert_eq!(store.get_active_revision(VIRI).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn version_list_backfills_empty_diff_summary() {
+        // 模拟旧包发布的版本（diff_summary='{}'）→ list_versions 应惰性补算回填
+        let store = TtlStore::open_in_memory().unwrap();
+        store.import_ttl(sample_ttl(), false).unwrap();
+        store.publish_version(VIRI, "v1", "", "user", None).unwrap();
+        let modified = sample_ttl().replace("供应商", "供应商v2");
+        store.import_ttl(&modified, true).unwrap();
+        store.publish_version(VIRI, "v2", "", "user", None).unwrap();
+        // 手动清空 diff_summary（模拟旧库迁移后的存量行）
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE ontology_ttl_versions SET diff_summary='{}' WHERE ontology_iri=?1 AND revision=2",
+                rusqlite::params![VIRI],
+            )
+            .unwrap();
+        }
+        let versions = store.list_versions(VIRI).unwrap();
+        let v2 = versions.iter().find(|v| v.revision == 2).unwrap();
+        assert!(v2.diff_summary != "{}", "list_versions 应补算 v2 修改点");
+        let diff2: serde_json::Value =
+            serde_json::from_str(&v2.diff_summary).expect("补算后应为合法 JSON");
+        assert_eq!(diff2["modified_classes"].as_array().map(|a| a.len()), Some(1));
+        // 回填已落库（再次查询不再重算）
+        let versions = store.list_versions(VIRI).unwrap();
+        let v2 = versions.iter().find(|v| v.revision == 2).unwrap();
+        assert_ne!(v2.diff_summary, "{}");
+    }
+
+    #[test]
+    fn version_legacy_db_migration_adds_column_and_table() {
+        // 老库升级回归：手工建旧 schema（无 active_revision 列、无 versions 表）→
+        // init_ttl_schema 不 panic → 列已补 + 表已建 + 存量数据保留
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ontology_ttl (
+                ontology_iri  TEXT PRIMARY KEY NOT NULL,
+                ttl_content   TEXT NOT NULL,
+                version       TEXT NOT NULL DEFAULT '',
+                triple_count  INTEGER NOT NULL DEFAULT 0,
+                updated_at    INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE ontology_ttl_changelog (
+                id              TEXT PRIMARY KEY,
+                ontology_iri    TEXT NOT NULL,
+                revision        INTEGER NOT NULL,
+                title           TEXT NOT NULL,
+                body            TEXT NOT NULL DEFAULT '',
+                change_summary  TEXT NOT NULL DEFAULT '{}',
+                conversation_id TEXT,
+                author          TEXT NOT NULL DEFAULT 'agent',
+                created_at      INTEGER NOT NULL,
+                UNIQUE(ontology_iri, revision)
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ontology_ttl (ontology_iri, ttl_content, version, triple_count, updated_at) \
+             VALUES ('https://legacy.example/ont', 'legacy ttl', '', 3, 1)",
+            [],
+        )
+        .unwrap();
+        // 升级
+        init_ttl_schema(&conn).unwrap();
+        // 列已补
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(ontology_ttl)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(cols.iter().any(|c| c == "active_revision"), "老库应补 active_revision 列");
+        assert!(cols.iter().any(|c| c == "workspace_dirty"), "老库应补 workspace_dirty 列");
+        // versions 表已建
+        let tbls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='ontology_ttl_versions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tbls, 1, "老库应建 ontology_ttl_versions 表");
+        // 存量数据保留且未发布
+        let ttl: String = conn
+            .query_row(
+                "SELECT ttl_content FROM ontology_ttl WHERE ontology_iri='https://legacy.example/ont'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ttl, "legacy ttl");
+        let active: Option<i64> = conn
+            .query_row(
+                "SELECT active_revision FROM ontology_ttl WHERE ontology_iri='https://legacy.example/ont'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, None, "存量本体=未发布状态");
+        let dirty: i64 = conn
+            .query_row(
+                "SELECT workspace_dirty FROM ontology_ttl WHERE ontology_iri='https://legacy.example/ont'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dirty, 1, "存量默认 dirty");
+    }
+
+    #[test]
+    fn revoke_workspace_class_cascade_clears_added_class_package() {
+        let store = TtlStore::open_in_memory().unwrap();
+        store.import_ttl(sample_ttl(), false).unwrap();
+        store
+            .publish_version(VIRI, "v1", "初始", "user", None)
+            .unwrap();
+
+        let chat = "https://example.org/ontology/test#ChatRecord";
+        let with_pkg = format!(
+            "{}\n:ChatRecord a owl:Class ;\n    rdfs:label \"微信聊天记录\"@zh ;\n    rdfs:subClassOf :Supplier .\n\n:logTime a owl:DatatypeProperty ;\n    rdfs:domain :ChatRecord ;\n    rdfs:range xsd:string ;\n    rdfs:label \"记录时间\"@zh .\n\n:mentions a owl:ObjectProperty ;\n    rdfs:domain :Supplier ;\n    rdfs:range :ChatRecord ;\n    rdfs:label \"提及\"@zh .\n",
+            sample_ttl()
+        );
+        store.import_ttl(&with_pkg, true).unwrap();
+
+        // 单条撤类应因引用失败；级联应成功
+        let single = store.revoke_workspace_diff_item(
+            VIRI,
+            &crate::ttl::WorkspaceDiffRevokeItem::Class {
+                op: "add".into(),
+                iri: chat.into(),
+            },
+        );
+        assert!(single.is_err(), "仍被属性引用时单条撤类应失败");
+
+        store
+            .revoke_workspace_class_cascade(VIRI, chat, "add")
+            .unwrap();
+
+        let props = store.list_ttl_properties(VIRI).unwrap();
+        assert!(props.iter().all(|p| !p.iri.ends_with("logTime")));
+        assert!(props.iter().all(|p| !p.iri.ends_with("mentions")));
+        let metas = store.list_ttl_class_metas(VIRI).unwrap();
+        assert!(metas.iter().all(|c| !c.iri.ends_with("ChatRecord")));
+        assert!(
+            !store.get_workspace_dirty(VIRI).unwrap(),
+            "级联撤净后应清 dirty"
+        );
+
+        // 仅类无构件仍成功
+        let only_class = format!(
+            "{}\n:OnlyClass a owl:Class ;\n    rdfs:label \"仅类\"@zh .\n",
+            sample_ttl()
+        );
+        store.import_ttl(&only_class, true).unwrap();
+        store
+            .revoke_workspace_class_cascade(
+                VIRI,
+                "https://example.org/ontology/test#OnlyClass",
+                "add",
+            )
+            .unwrap();
+        assert!(
+            store
+                .list_ttl_class_metas(VIRI)
+                .unwrap()
+                .iter()
+                .all(|c| !c.iri.ends_with("OnlyClass"))
+        );
+
+        // 失败路径：类不在 diff → 整笔不写
+        let before = store.export_ttl(VIRI).unwrap();
+        let err = store.revoke_workspace_class_cascade(VIRI, chat, "add");
+        assert!(err.is_err());
+        assert_eq!(store.export_ttl(VIRI).unwrap(), before);
+    }
+
+    #[test]
+    fn revoke_workspace_class_cascade_restores_removed_class_package() {
+        let store = TtlStore::open_in_memory().unwrap();
+        let with_lead = format!(
+            "{}\n:LeadSource a owl:Class ;\n    rdfs:label \"线索来源\"@zh .\n\n:leadSourceName a owl:DatatypeProperty ;\n    rdfs:domain :LeadSource ;\n    rdfs:range xsd:string ;\n    rdfs:label \"来源名\"@zh .\n\n:sharedTag a owl:DatatypeProperty ;\n    rdfs:domain :LeadSource ;\n    rdfs:range xsd:string ;\n    rdfs:label \"共享标签\"@zh .\n",
+            sample_ttl()
+        );
+        store.import_ttl(&with_lead, true).unwrap();
+        store
+            .publish_version(VIRI, "v1", "含线索来源", "user", None)
+            .unwrap();
+
+        // 删除类包：属性先删、sharedTag 定义域改到 Supplier、再删类
+        store
+            .delete_ttl_property(
+                VIRI,
+                "https://example.org/ontology/test#leadSourceName",
+            )
+            .unwrap();
+        let mut shared = store
+            .list_ttl_properties(VIRI)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.iri.ends_with("sharedTag"))
+            .expect("sharedTag");
+        shared.domain = "https://example.org/ontology/test#Supplier".into();
+        store.edit_ttl_property(VIRI, &shared).unwrap();
+        store
+            .delete_ttl_class(VIRI, "https://example.org/ontology/test#LeadSource")
+            .unwrap();
+
+        let lead = "https://example.org/ontology/test#LeadSource";
+        store
+            .revoke_workspace_class_cascade(VIRI, lead, "remove")
+            .unwrap();
+
+        let metas = store.list_ttl_class_metas(VIRI).unwrap();
+        assert!(
+            metas.iter().any(|c| c.iri.ends_with("LeadSource")),
+            "类应恢复"
+        );
+        let props = store.list_ttl_properties(VIRI).unwrap();
+        assert!(
+            props.iter().any(|p| p.iri.ends_with("leadSourceName")),
+            "已删属性应恢复"
+        );
+        let shared_after = props
+            .into_iter()
+            .find(|p| p.iri.ends_with("sharedTag"))
+            .expect("sharedTag");
+        assert!(
+            shared_after.domain.ends_with("LeadSource"),
+            "定义域连带应回滚到 LeadSource，实际={}",
+            shared_after.domain
+        );
+        assert!(!store.get_workspace_dirty(VIRI).unwrap());
+    }
+
+    #[test]
+    fn revoke_workspace_class_cascade_restores_range_side_relation() {
+        let store = TtlStore::open_in_memory().unwrap();
+        let ttl = format!(
+            "{}\n:LeadSource a owl:Class ;\n    rdfs:label \"线索来源\"@zh .\n\n:Advisor a owl:Class ;\n    rdfs:label \"销售顾问\"@zh .\n\n:sourceChannel a owl:ObjectProperty ;\n    rdfs:domain :Advisor ;\n    rdfs:range :LeadSource ;\n    rdfs:label \"来源渠道\"@zh .\n",
+            sample_ttl()
+        );
+        store.import_ttl(&ttl, true).unwrap();
+        store
+            .publish_version(VIRI, "v1", "含值域关系", "user", None)
+            .unwrap();
+
+        store
+            .delete_ttl_property(
+                VIRI,
+                "https://example.org/ontology/test#sourceChannel",
+            )
+            .unwrap();
+        store
+            .delete_ttl_class(VIRI, "https://example.org/ontology/test#LeadSource")
+            .unwrap();
+
+        store
+            .revoke_workspace_class_cascade(
+                VIRI,
+                "https://example.org/ontology/test#LeadSource",
+                "remove",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .list_ttl_properties(VIRI)
+                .unwrap()
+                .iter()
+                .any(|p| p.iri.ends_with("sourceChannel")),
+            "值域落在已删类的关系应随类级联恢复"
+        );
+        assert!(!store.get_workspace_dirty(VIRI).unwrap());
+    }
+
+    /// 卡片硬删类（级联）：真 DB 落库 + 相对生效差异 + 失败不写。
+    #[test]
+    fn delete_ttl_class_cascades_and_reflects_in_workspace_diff() {
+        let store = TtlStore::open_in_memory().unwrap();
+        let ttl = format!(
+            "{}\n:Route a owl:Class ;\n    rdfs:label \"线路\"@zh .\n\n:Store a owl:Class ;\n    rdfs:label \"门店\"@zh .\n\n:name a owl:DatatypeProperty ;\n    rdfs:domain :Route ;\n    rdfs:range xsd:string ;\n    rdfs:label \"线路名\"@zh .\n\n:belongsTo a owl:ObjectProperty ;\n    rdfs:domain :Route ;\n    rdfs:range :Store ;\n    rdfs:label \"所属门店\"@zh .\n\n:note a owl:DatatypeProperty ;\n    rdfs:domain :Route ;\n    rdfs:domain :Store ;\n    rdfs:range xsd:string ;\n    rdfs:label \"备注\"@zh .\n\n:Express a owl:Class ;\n    rdfs:label \"快线\"@zh ;\n    rdfs:subClassOf :Route .\n",
+            sample_ttl()
+        );
+        store.import_ttl(&ttl, false).unwrap();
+        let active = store.publish_version(VIRI, "v1", "含线路", "user", None).unwrap();
+        let route = "https://example.org/ontology/test#Route";
+
+        store.delete_ttl_class(VIRI, route).unwrap();
+
+        // 1. 独占属性 / 关系 / 类本身已落库删除
+        let props = store.list_ttl_properties(VIRI).unwrap();
+        assert!(props.iter().all(|p| !p.iri.ends_with("#name")));
+        assert!(props.iter().all(|p| !p.iri.ends_with("#belongsTo")));
+        let metas = store.list_ttl_class_metas(VIRI).unwrap();
+        assert!(metas.iter().all(|c| !c.iri.ends_with("#Route")));
+        // 2. 共享多定义域属性保留，定义域只剩 Store
+        let note = props
+            .iter()
+            .find(|p| p.iri.ends_with("#note"))
+            .expect("共享属性应保留");
+        assert!(note.domain.ends_with("#Store"), "domain={}", note.domain);
+        // 3. 子类块仍合法可读（label 保留、父类只剩非 Route）
+        let express = metas
+            .iter()
+            .find(|c| c.iri.ends_with("#Express"))
+            .expect("子类应保留");
+        assert_eq!(express.label, "快线");
+
+        // 4. 相对生效差异反映删除
+        let diff = store.diff_versions(VIRI, active as i64, 0).unwrap();
+        assert!(
+            diff.removed_classes.iter().any(|c| c.ends_with("#Route")),
+            "diff 应记录类删除: {:?}",
+            diff.removed_classes
+        );
+        assert!(
+            diff.removed_properties.iter().any(|p| p.iri.ends_with("#name")),
+            "diff 应记录独占属性删除: {:?}",
+            diff.removed_properties
+        );
+        assert!(
+            diff.removed_properties
+                .iter()
+                .any(|p| p.iri.ends_with("#belongsTo")),
+            "diff 应记录关系删除"
+        );
+        assert!(
+            diff.modified_properties.iter().any(|p| p.after.iri.ends_with("#note")),
+            "共享属性定义域变化应记入 modified: {:?}",
+            diff.modified_properties
+        );
+        assert!(
+            diff.removed_subclass_of
+                .iter()
+                .any(|e| e.child.ends_with("#Express") && e.parent.ends_with("#Route")),
+            "diff 应记录继承边解除"
+        );
+    }
+
+    /// 非法路径：还有实例引用时整笔拒绝、工作区不变。
+    #[test]
+    fn delete_ttl_class_cascade_rejects_and_keeps_workspace_on_instance_refs() {
+        let store = TtlStore::open_in_memory().unwrap();
+        let ttl = format!(
+            "{}\n:Route a owl:Class ;\n    rdfs:label \"线路\"@zh .\n\n:route1 a :Route .\n",
+            sample_ttl()
+        );
+        store.import_ttl(&ttl, true).unwrap();
+        let before = store.export_ttl(VIRI).unwrap();
+
+        let err = store.delete_ttl_class(VIRI, "https://example.org/ontology/test#Route");
+        assert!(err.is_err(), "实例引用时应拒绝");
+        assert_eq!(store.export_ttl(VIRI).unwrap(), before, "失败不得部分写入");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 类级联恢复：对端存在性门禁（恢复后不得产生指向不存在类的公理）
+    // ════════════════════════════════════════════════════════════════
+
+    /// 线索(Lead) + 来源(LeadSource) + 独占数据属性 channel(Lead→xsd:string)
+    /// + 关系 sourcedFrom(Lead→LeadSource) + 自环关系 parentSource(LeadSource→LeadSource)
+    /// + 子类 LeadTag ⊑ Lead。
+    fn lead_pair_ttl() -> String {
+        format!(
+            "{}\n:Lead a owl:Class ;\n    rdfs:label \"线索\"@zh .\n\n:LeadSource a owl:Class ;\n    rdfs:label \"来源\"@zh .\n\n:channel a owl:DatatypeProperty ;\n    rdfs:domain :Lead ;\n    rdfs:range xsd:string ;\n    rdfs:label \"线索渠道\"@zh .\n\n:sourcedFrom a owl:ObjectProperty ;\n    rdfs:domain :Lead ;\n    rdfs:range :LeadSource ;\n    rdfs:label \"来源渠道\"@zh .\n\n:parentSource a owl:ObjectProperty ;\n    rdfs:domain :LeadSource ;\n    rdfs:range :LeadSource ;\n    rdfs:label \"上级来源\"@zh .\n\n:LeadTag a owl:Class ;\n    rdfs:label \"线索标签\"@zh ;\n    rdfs:subClassOf :Lead .\n",
+            sample_ttl()
+        )
+    }
+
+    fn has_prop_named(store: &TtlStore, suffix: &str) -> bool {
+        store
+            .list_ttl_properties(VIRI)
+            .unwrap()
+            .iter()
+            .any(|p| p.iri.ends_with(suffix))
+    }
+
+    fn has_class_named(store: &TtlStore, suffix: &str) -> bool {
+        store
+            .list_ttl_class_metas(VIRI)
+            .unwrap()
+            .iter()
+            .any(|c| c.iri.ends_with(suffix))
+    }
+
+    fn subclass_edges(store: &TtlStore) -> Vec<(String, String)> {
+        crate::ttl_edit::list_subclass_of_edges(&store.export_ttl(VIRI).unwrap())
+    }
+
+    /// 对端类仍为删除态的关系不随本类恢复；类自身与独占数据属性正常恢复。
+    #[test]
+    fn class_cascade_restore_skips_relation_while_other_end_deleted() {
+        let store = TtlStore::open_in_memory().unwrap();
+        store.import_ttl(&lead_pair_ttl(), true).unwrap();
+        store
+            .publish_version(VIRI, "v1", "含线索与来源", "user", None)
+            .unwrap();
+
+        let lead = "https://example.org/ontology/test#Lead";
+        let lead_source = "https://example.org/ontology/test#LeadSource";
+        store.delete_ttl_class(VIRI, lead).unwrap();
+        store.delete_ttl_class(VIRI, lead_source).unwrap();
+        assert!(!has_class_named(&store, "Lead"));
+        assert!(!has_prop_named(&store, "sourcedFrom"));
+
+        store
+            .revoke_workspace_class_cascade(VIRI, lead, "remove")
+            .unwrap();
+
+        assert!(has_class_named(&store, "Lead"), "类应恢复");
+        assert!(has_prop_named(&store, "channel"), "独占数据属性应恢复");
+        assert!(
+            !has_prop_named(&store, "sourcedFrom"),
+            "对端 LeadSource 仍删除，关系不得恢复（否则落库悬空公理）"
+        );
+        assert!(
+            !has_class_named(&store, "LeadSource"),
+            "不得连带恢复对端类"
+        );
+        assert!(
+            subclass_edges(&store)
+                .iter()
+                .any(|(c, p)| c.ends_with("LeadTag") && p.ends_with("Lead")),
+            "对端（父类）正在恢复，继承边应随级联带回"
+        );
+    }
+
+    /// 随后恢复对端类时，被跳过的关系随该类的级联自动带回（顺序无关性·路径 A）。
+    #[test]
+    fn class_cascade_restore_brings_back_relation_after_other_end_restored() {
+        let store = TtlStore::open_in_memory().unwrap();
+        store.import_ttl(&lead_pair_ttl(), true).unwrap();
+        store
+            .publish_version(VIRI, "v1", "含线索与来源", "user", None)
+            .unwrap();
+
+        let lead = "https://example.org/ontology/test#Lead";
+        let lead_source = "https://example.org/ontology/test#LeadSource";
+        store.delete_ttl_class(VIRI, lead).unwrap();
+        store.delete_ttl_class(VIRI, lead_source).unwrap();
+
+        store
+            .revoke_workspace_class_cascade(VIRI, lead, "remove")
+            .unwrap();
+        store
+            .revoke_workspace_class_cascade(VIRI, lead_source, "remove")
+            .unwrap();
+
+        assert!(has_prop_named(&store, "sourcedFrom"), "两端齐备后关系应带回");
+        assert!(
+            has_prop_named(&store, "parentSource"),
+            "自环关系 domain=range=C 应随 C 恢复"
+        );
+    }
+
+    /// 先恢复 LeadSource 再恢复 Lead，终态一致（顺序无关性·路径 B）。
+    #[test]
+    fn class_cascade_restore_is_order_independent() {
+        let store = TtlStore::open_in_memory().unwrap();
+        store.import_ttl(&lead_pair_ttl(), true).unwrap();
+        store
+            .publish_version(VIRI, "v1", "含线索与来源", "user", None)
+            .unwrap();
+
+        let lead = "https://example.org/ontology/test#Lead";
+        let lead_source = "https://example.org/ontology/test#LeadSource";
+        store.delete_ttl_class(VIRI, lead).unwrap();
+        store.delete_ttl_class(VIRI, lead_source).unwrap();
+
+        store
+            .revoke_workspace_class_cascade(VIRI, lead_source, "remove")
+            .unwrap();
+        assert!(
+            !has_prop_named(&store, "sourcedFrom"),
+            "反向：Lead 仍删除时关系不得恢复"
+        );
+        store
+            .revoke_workspace_class_cascade(VIRI, lead, "remove")
+            .unwrap();
+
+        assert!(has_prop_named(&store, "sourcedFrom"), "终态应与路径 A 一致");
+        assert!(has_prop_named(&store, "parentSource"));
+        assert!(has_prop_named(&store, "channel"));
+        assert!(has_class_named(&store, "Lead"));
+        assert!(has_class_named(&store, "LeadSource"));
+    }
+
+    /// 继承边的另一端类仍删除时，该边不随本类恢复。
+    #[test]
+    fn class_cascade_restore_skips_subclass_edge_while_parent_deleted() {
+        let store = TtlStore::open_in_memory().unwrap();
+        store.import_ttl(&lead_pair_ttl(), true).unwrap();
+        store
+            .publish_version(VIRI, "v1", "含子类", "user", None)
+            .unwrap();
+
+        let lead = "https://example.org/ontology/test#Lead";
+        let lead_tag = "https://example.org/ontology/test#LeadTag";
+        store.delete_ttl_class(VIRI, lead_tag).unwrap();
+        store.delete_ttl_class(VIRI, lead).unwrap();
+
+        store
+            .revoke_workspace_class_cascade(VIRI, lead_tag, "remove")
+            .unwrap();
+
+        assert!(has_class_named(&store, "LeadTag"), "子类本身应恢复");
+        assert!(
+            !subclass_edges(&store)
+                .iter()
+                .any(|(c, p)| c.ends_with("LeadTag") && p.ends_with("Lead")),
+            "父类 Lead 仍删除，继承边不得恢复"
+        );
+    }
+
+    /// 级联计划（纯函数）：~ 连带回滚按「回滚后的目标定义」判端点存在性。
+    #[test]
+    fn build_class_cascade_steps_skips_modify_rollback_with_missing_end() {
+        let ns = "https://example.org/ontology/test#";
+        let mk = |iri: &str, domain: &str, range: &str| crate::ttl_edit::TtlPropertyEdit {
+            iri: iri.into(),
+            kind: "object".into(),
+            domain: domain.into(),
+            range: range.into(),
+            ..Default::default()
+        };
+        // 生效版 Gamma → Beta；工作区因 Gamma 被删而把定义域改到 Alpha（值域 Beta 也已删除）
+        let diff = TtlVersionDiff {
+            rev_a: 1,
+            rev_b: 0,
+            added_classes: vec![],
+            removed_classes: vec![format!("{ns}Gamma"), format!("{ns}Beta")],
+            modified_classes: vec![],
+            added_properties: vec![],
+            removed_properties: vec![],
+            modified_properties: vec![PropertyChange {
+                iri: format!("{ns}rel"),
+                before: mk(&format!("{ns}rel"), &format!("{ns}Gamma"), &format!("{ns}Beta")),
+                after: mk(&format!("{ns}rel"), &format!("{ns}Alpha"), &format!("{ns}Beta")),
+            }],
+            added_subclass_of: vec![],
+            removed_subclass_of: vec![],
+            ontology_meta_changed: false,
+        };
+        let base = sample_ttl();
+        let effective = format!(
+            "{base}\n:Alpha a owl:Class ;\n    rdfs:label \"甲\"@zh .\n\n:Beta a owl:Class ;\n    rdfs:label \"乙\"@zh .\n\n:Gamma a owl:Class ;\n    rdfs:label \"丙\"@zh .\n"
+        );
+        let without_beta =
+            format!("{base}\n:Alpha a owl:Class ;\n    rdfs:label \"甲\"@zh .\n");
+        let with_beta = format!(
+            "{base}\n:Alpha a owl:Class ;\n    rdfs:label \"甲\"@zh .\n\n:Beta a owl:Class ;\n    rdfs:label \"乙\"@zh .\n"
+        );
+
+        // 恢复 Gamma：回滚后的定义指向仍不存在的 Beta → 该 ~ 不进级联
+        let plan = crate::ttl::crud::build_class_cascade_steps(
+            &diff,
+            &format!("{ns}Gamma"),
+            "remove",
+            &without_beta,
+            &effective,
+        );
+        assert_eq!(plan.skipped.len(), 1, "应跳过 1 项连带回滚");
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|s| matches!(s, WorkspaceDiffRevokeItem::Property { op, .. } if op == "modify")),
+            "跳过项不得进入步骤"
+        );
+
+        // 同一条 ~，值域 Beta 已在工作区 → 正常回滚
+        let plan_ok = crate::ttl::crud::build_class_cascade_steps(
+            &diff,
+            &format!("{ns}Gamma"),
+            "remove",
+            &with_beta,
+            &effective,
+        );
+        assert!(plan_ok.skipped.is_empty());
+        assert!(plan_ok
+            .steps
+            .iter()
+            .any(|s| matches!(s, WorkspaceDiffRevokeItem::Property { op, .. } if op == "modify")));
+    }
+
+    /// 级联计划（纯函数）：自环关系 domain=range=C 随 C 恢复。
+    #[test]
+    fn build_class_cascade_steps_restores_self_loop() {
+        let ns = "https://example.org/ontology/test#";
+        let diff = TtlVersionDiff {
+            rev_a: 1,
+            rev_b: 0,
+            added_classes: vec![],
+            removed_classes: vec![format!("{ns}Beta")],
+            modified_classes: vec![],
+            added_properties: vec![],
+            removed_properties: vec![crate::ttl_edit::TtlPropertyEdit {
+                iri: format!("{ns}selfRel"),
+                kind: "object".into(),
+                domain: format!("{ns}Beta"),
+                range: format!("{ns}Beta"),
+                ..Default::default()
+            }],
+            modified_properties: vec![],
+            added_subclass_of: vec![],
+            removed_subclass_of: vec![],
+            ontology_meta_changed: false,
+        };
+        let workspace = sample_ttl();
+        let effective = format!("{workspace}\n:Beta a owl:Class ;\n    rdfs:label \"乙\"@zh .\n");
+
+        let plan = crate::ttl::crud::build_class_cascade_steps(
+            &diff,
+            &format!("{ns}Beta"),
+            "remove",
+            &workspace,
+            &effective,
+        );
+        assert!(plan.skipped.is_empty(), "自环两端同为正在恢复的 C → 不跳过");
+        assert!(plan
+            .steps
+            .iter()
+            .any(|s| matches!(s, WorkspaceDiffRevokeItem::Property { op, iri } if op == "remove" && iri.ends_with("selfRel"))));
     }

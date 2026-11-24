@@ -53,6 +53,7 @@ export function NavRail() {
   const toggleNavRail = useUiStore((s) => s.toggleNavRail);
   const setModelSettingsOpen = useUiStore((s) => s.setModelSettingsOpen);
   const setMcpSettingsOpen = useUiStore((s) => s.setMcpSettingsOpen);
+  const setOntologySettingsOpen = useUiStore((s) => s.setOntologySettingsOpen);
   const theme = useUiStore((s) => s.theme);
   const setTheme = useUiStore((s) => s.setTheme);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -123,6 +124,7 @@ export function NavRail() {
               <div className="absolute bottom-0 left-[calc(100%+8px)] z-50 w-48 overflow-hidden rounded-lg border border-border bg-bg-elevated py-1 shadow-lg">
                 <MenuEntry icon={Cpu} label="模型设置" onClick={() => { setMenuOpen(false); setModelSettingsOpen(true); }} />
                 <MenuEntry icon={Server} label="工具服务器 (MCP)" onClick={() => { setMenuOpen(false); setMcpSettingsOpen(true); }} />
+                <MenuEntry icon={Boxes} label="本体设置" onClick={() => { setMenuOpen(false); setOntologySettingsOpen(true); }} />
                 <div className="my-1 border-t border-border" />
                 <MenuEntry
                   icon={theme === "light" ? Sun : theme === "dark" ? Moon : MonitorCog}

@@ -38,8 +38,8 @@ pub struct OntologySummary {
 /// 与 changelog（变化点）分离：changelog 记每次变更随历史增长，charter 记业务
 /// 本质说明不随历史变化。由独立命令 `set_ontology_charter` 写入，不进 import 流程。
 ///
-/// - `business_scenario`：业务场景（服务于什么业务目标、谁用、解决什么问题）
-/// - `business_essence`：业务本质（核心业务对象/状态/关系/动态行为的一句话本质概括）
+/// - `business_scenario`：业务场景（定义本体建模的使用范围以及对象）
+/// - `business_essence`：业务目标（定义本体建模的使用目标；字段名历史兼容）
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type, PartialEq, Default)]
 pub struct OntologyCharter {
     #[serde(default)]
@@ -61,7 +61,7 @@ pub struct OntologyCharter {
 /// 供 agent 第一跳拿到 OT 概览，需要详情时调 `describe_object_type` drill-in。
 ///
 /// 附带 `charter`（本体设计宪章，不变点）——agent 拿 OT 目录时同步拿到业务
-/// 场景/本质/意图/补充说明，建立结构化业务认知后再钻取 OT 细节。
+/// 场景与业务目标，建立结构化业务认知后再钻取 OT 细节。
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type, PartialEq)]
 pub struct OntologySummaryFull {
     pub api_name: String,
@@ -147,6 +147,9 @@ pub struct ObjectTypeFullMetadata {
     /// 作用于本 OT 的 action api_name 列表。
     #[serde(default)]
     pub actions: Vec<String>,
+    /// 类级物理绑定（决策 25）：该对象类型映射到的来源表；未映射时不出现。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing: Option<crate::mapping::MappingRef>,
 }
 
 // ── LinkType 只读 drill-in（对齐 Gaia list_link_types / describe_link_type）──
@@ -317,6 +320,11 @@ pub struct PropertyReadView {
     pub nullable: bool,
     pub filterable: bool,
     pub sortable: bool,
+    /// 物理绑定（决策 25）：有映射才有该字段，未映射时**不出现**（而非空对象）。
+    ///
+    /// 由装配层在组装 DTO 时注入（`to_read_view` 保持纯函数，不访问 DB）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backing: Option<crate::mapping::MappingRef>,
 }
 
 impl PropertyDef {
@@ -340,7 +348,16 @@ impl PropertyDef {
             nullable: true,
             filterable: self.searchable || is_pk,
             sortable: !UNSORTABLE.contains(&self.data_type.to_uppercase().as_str()),
+            backing: None,
         }
+    }
+}
+
+impl PropertyReadView {
+    /// 注入物理绑定（链式；未映射传 `None`，字段整体不出现）。
+    pub fn with_backing(mut self, backing: Option<crate::mapping::MappingRef>) -> Self {
+        self.backing = backing;
+        self
     }
 }
 

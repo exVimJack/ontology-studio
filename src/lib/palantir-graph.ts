@@ -45,18 +45,15 @@ const DATATYPE_PREFIX = "dt:";
 
 /**
  * cardinality → 紧凑标注（边标签用）。
- * 语义：source 侧基数 : target 侧基数。
+ * 语义：Gaia 只有 ONE/MANY 两值，MANY 不区分 1:N 与 N:1（方向由边本身表达），
+ * 所以 MANY 标注为「多」而非伪造 N:1。
  */
 export function cardinalityBadge(cardinality: string): string {
     switch (cardinality) {
-        case "ONE_TO_ONE":
+        case "ONE":
             return "1:1";
-        case "ONE_TO_MANY":
+        case "MANY":
             return "1:N";
-        case "MANY_TO_ONE":
-            return "N:1";
-        case "MANY_TO_MANY":
-            return "N:N";
         default:
             return cardinality;
     }

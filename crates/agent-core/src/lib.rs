@@ -22,6 +22,7 @@ pub mod document_tools;
 pub mod validation_llm;
 pub mod error;
 pub mod federation_tools;
+pub mod mapping_tools;
 pub mod mcp;
 pub mod memory_bridge;
 pub mod ontology_tools;

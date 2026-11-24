@@ -89,20 +89,27 @@ pub struct TtlOntologySummary {
     /// 最后更新时间（unix ms）
     #[specta(type = specta_typescript::Number)]
     pub updated_at: i64,
+    /// 生效发布版本（NULL=从未发布）；编辑不清空
+    #[serde(default)]
+    #[specta(type = specta_typescript::Number)]
+    pub active_revision: Option<i64>,
+    /// 工作区相对生效快照是否有未发布修改
+    #[serde(default)]
+    pub workspace_dirty: bool,
 }
 
 /// 本体设计宪章（不变点，对齐 Palantir `OntologyCharter`）。
 ///
 /// 字段语义与 Palantir `OntologyCharter` 完全一致，仅主键改为 `ontology_iri`。
-/// charter 记录业务本质说明（不随历史变化），与 changelog（变化点）分离。
+/// charter 记录业务场景与业务目标（不随历史变化），与 changelog（变化点）分离。
 /// 额外设计：charter 的四字段可同步以 W3C 原生词汇（`dcterms:` + `skos:note`）
 /// 写入 .ttl 文本，本表是可查询的结构化索引。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type, PartialEq, Default)]
 pub struct TtlCharter {
-    /// 业务场景（服务于什么业务目标、谁用、解决什么问题）
+    /// 业务场景（定义本体建模的使用范围以及对象）
     #[serde(default)]
     pub business_scenario: String,
-    /// 业务本质（核心业务对象/状态/关系/动态行为的一句话本质概括）
+    /// 业务目标（定义本体建模的使用目标；字段名 business_essence 历史兼容）
     #[serde(default)]
     pub business_essence: String,
     /// "agent" | "user"
@@ -163,7 +170,12 @@ mod crud;
 #[cfg(test)]
 mod tests;
 mod validate;
+mod versions;
 
+pub use versions::{
+    PropertyChange, SubclassOfEdge, TtlVersionDiff, TtlVersionSummary,
+    WorkspaceDiffRevokeItem, VERSION_LIMIT_DEFAULT,
+};
 pub use charter::extract_charter_predicates;
 // agent-core 的 TTL 工具组跨 crate 引用 extract_ontology_meta（ontology_ttl_tools.rs）；
 // src-tauri 的 coverage 命令跨 crate 引用 parse_ttl_to_memory（src-tauri/src/commands/validation.rs）。
@@ -220,7 +232,14 @@ fn init_ttl_schema(conn: &Connection) -> StoreResult<()> {
             ttl_content   TEXT NOT NULL,
             version       TEXT NOT NULL DEFAULT '',
             triple_count  INTEGER NOT NULL DEFAULT 0,
-            updated_at    INTEGER NOT NULL DEFAULT 0
+            updated_at    INTEGER NOT NULL DEFAULT 0,
+            active_revision INTEGER DEFAULT NULL,
+            -- 工作区相对生效快照是否有未发布修改；编辑置 1，发布/切回置 0（不清除 active_revision）
+            workspace_dirty INTEGER NOT NULL DEFAULT 1,
+            -- 用户在「新建本体」向导填写的名称（业务名）。
+            -- 独立成列而非只存 TTL 头部 rdfs:label：agent 全量导入时提交的 TTL
+            -- 未必带 rdfs:label，会把这个名字抹掉（导出概览页随即显示成 IRI）。
+            display_name  TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_ontology_ttl_updated
             ON ontology_ttl(updated_at);
@@ -230,7 +249,7 @@ fn init_ttl_schema(conn: &Connection) -> StoreResult<()> {
         -- 主键用 ontology_iri（非 Palantir 的 api_name）——W3C 本体以 IRI 为身份。
         -- charter 由 set_ontology_ttl_charter 工具独立写入，不进 import_ttl 流程
         -- （import 不覆盖 charter，charter 也不从 .ttl 读取）。
-        -- 设计动机与 Palantir 一致：charter 记「业务本质说明」不随历史变化，
+        -- 设计动机与 Palantir 一致：charter 记业务场景与业务目标，不随历史变化，
         -- 与 changelog（变化点）物理/语义/写入路径三重分离。
         CREATE TABLE IF NOT EXISTS ontology_ttl_charter (
             ontology_iri      TEXT PRIMARY KEY,
@@ -259,6 +278,37 @@ fn init_ttl_schema(conn: &Connection) -> StoreResult<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_ttl_changelog_ont
             ON ontology_ttl_changelog(ontology_iri, revision DESC);
+
+        -- ═══ 本体版本快照（显式发布才写；回退切指针不新建版本）═══
+        -- 与 changelog（每次变更一条，轻量文本）分离：versions 只在用户/agent
+        -- 显式「发布版本」时写完整 TTL 快照。revision 每本体从 1 递增
+        -- （与 changelog 的 revision 是两套独立序列，发布时 change_summary
+        -- 塞 {published_version: N} 建立映射）。
+        -- active_revision：生效发布版本指针（编辑不清空；NULL=从未发布）。
+        -- workspace_dirty：工作区相对生效快照是否有未发布修改。
+        -- 回退=覆盖工作区+切指针+清 dirty，不新建版本。
+        CREATE TABLE IF NOT EXISTS ontology_ttl_versions (
+            id              TEXT PRIMARY KEY,
+            ontology_iri    TEXT NOT NULL,
+            revision        INTEGER NOT NULL,
+            ttl_content     TEXT NOT NULL,
+            triple_count    INTEGER NOT NULL DEFAULT 0,
+            label           TEXT NOT NULL DEFAULT '',
+            description     TEXT NOT NULL DEFAULT '',
+            diff_summary    TEXT NOT NULL DEFAULT '{}',  -- 发布时刻 vs 上一版本的修改点 JSON（TtlVersionDiff 序列化；首版为空对象）
+            created_at      INTEGER NOT NULL,
+            author          TEXT NOT NULL DEFAULT 'agent',
+            UNIQUE(ontology_iri, revision),
+            FOREIGN KEY (ontology_iri) REFERENCES ontology_ttl(ontology_iri) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_ttl_versions_ont
+            ON ontology_ttl_versions(ontology_iri, revision DESC);
+
+        -- ═══ 版本管理配置（key-value）═══
+        CREATE TABLE IF NOT EXISTS ttl_settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
 
         -- ═══ 证据链源登记（docs/EVIDENCE-CHAIN.md L1）═══
         -- 与 Palantir `init_schema` 中同表同构：生产环境两个 store 装配层共用同一 db 文件，
@@ -335,11 +385,28 @@ fn init_ttl_schema(conn: &Connection) -> StoreResult<()> {
             step_ms_b     INTEGER NOT NULL DEFAULT 0,
             step_ms_a     INTEGER NOT NULL DEFAULT 0,
             step_ms_re    INTEGER NOT NULL DEFAULT 0,
+            outcome_reason TEXT NOT NULL DEFAULT 'unknown', -- 结束归因：verdict_capped|step_failed|interrupted|manual_escalation|write_back_conflict|unknown
+            outcome_detail TEXT NOT NULL DEFAULT '',        -- 失败实际错误文本（仅日志与 tooltip，不直接面向用户）
+            base_ttl       TEXT NOT NULL DEFAULT '',        -- 评审启动时的草稿全文基线（写回前判冲突）
             status        TEXT NOT NULL DEFAULT 'in_progress',
             created_at    INTEGER NOT NULL,
             updated_at    INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_vr_ont ON validation_reviews(ontology_iri);",
+        CREATE INDEX IF NOT EXISTS idx_vr_ont ON validation_reviews(ontology_iri);
+
+        CREATE TABLE IF NOT EXISTS review_rounds (
+            id             TEXT PRIMARY KEY,
+            review_id      TEXT NOT NULL,
+            round          INTEGER NOT NULL,
+            snapshot_json  TEXT NOT NULL,
+            found_count    INTEGER NOT NULL DEFAULT 0,
+            accepted_count INTEGER NOT NULL DEFAULT 0,
+            disputed_count INTEGER NOT NULL DEFAULT 0,
+            verdict        TEXT,
+            created_at     INTEGER NOT NULL,
+            updated_at     INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rr_review ON review_rounds(review_id);",
     )?;
     // 幂等迁移（统一发现池 v0.7，与 schema.rs migrate_validation_unified_pool 同构）：
     // 旧库（含 schema.rs 建的表）补 source/a_action/b_verdict/step_ms 列。
@@ -366,6 +433,42 @@ fn init_ttl_schema(conn: &Connection) -> StoreResult<()> {
             ("step_ms_re", "INTEGER NOT NULL DEFAULT 0"),
         ],
     )?;
+
+    // 评审生命周期（v0.12）：结束归因 + 写回基线。历史行归因不可追溯，统一 'unknown'。
+    crate::schema::ensure_columns(
+        conn,
+        "validation_reviews",
+        &[
+            ("outcome_reason", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("outcome_detail", "TEXT NOT NULL DEFAULT ''"),
+            ("base_ttl", "TEXT NOT NULL DEFAULT ''"),
+        ],
+    )?;
+    // 版本管理迁移（v0.9）：老库补 active_revision 列（存量本体全部=未发布状态，
+    // 首次发布建立基线版本，changelog 历史不会自动变版本快照）。
+    crate::schema::ensure_columns(
+        conn,
+        "ontology_ttl",
+        &[("active_revision", "INTEGER DEFAULT NULL")],
+    )?;
+    // v0.10：老库补 diff_summary 列（发布时记录"本次 vs 上一版本"的修改点）
+    crate::schema::ensure_columns(
+        conn,
+        "ontology_ttl_versions",
+        &[("diff_summary", "TEXT NOT NULL DEFAULT '{}'")],
+    )?;
+    // v0.11：工作区脏标记——编辑不再清空 active_revision；消费面读生效快照。
+    // 存量：有生效指针则保守标 dirty=1（避免误判已对齐）；无指针则 dirty=1（从未发布）。
+    crate::schema::ensure_columns(
+        conn,
+        "ontology_ttl",
+        &[("workspace_dirty", "INTEGER NOT NULL DEFAULT 1")],
+    )?;
+    // 映射绑定层（决策 25）：与 Palantir store 共用同一 db 文件，任一侧先打开
+    // 都要建出空表——建表函数集中在 `mapping.rs`，此处只调用不复制。
+    crate::mapping::init_element_mapping_schema(conn)?;
+    // 兼容旧库：display_name 是后加的列，用幂等 ADD COLUMN 补上（不重建表）。
+    crate::schema::ensure_columns(conn, "ontology_ttl", &[("display_name", "TEXT NOT NULL DEFAULT ''")])?;
     Ok(())
 }
 

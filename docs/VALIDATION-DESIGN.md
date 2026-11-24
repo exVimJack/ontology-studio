@@ -1,7 +1,8 @@
 # Onto-Studio 本体建模结果校验方案（三阶段流程 + 多轮协同对抗）
 
-> **版本**: v0.7（答辩归阶段① + 统一发现池） | **日期**: 2026-09-23
-> **v0.7 变更**：① **warning 答辩从阶段②移入阶段①**——规则检查产出 warning 即可逐条反驳（提论据 → 机械匹配 → B 机器裁决），不再等语义评审先行；阶段①的「零 LLM」精确为「**检测零 LLM**」（检测引擎确定性，答辩裁决走 B）；② **统一发现池**：`validation_issues` 加 `source` 列（`rules`|`review`），B 语义评审的建议转写为 issue 行与规则发现同池同生命周期，A 修订说明逐条回填 `a_action`，**A rejected 的发现自动转 disputed 进仲裁队列**；③ 评审状态机补 `b_verdict`（B 复核原始输出落库）与 `step_ms_*`（环节耗时）；④ 同步实现现实：`resolve_dispute_llm`（B 机器裁决）与 §2.4 出口检查点均已实现，§5 schema/SQL 对齐代码。
+> **版本**: v0.8（答辩并入语义评审 + 轮次清单） | **日期**: 2026-10-15
+> **v0.8 变更**：① **独立答辩通道退役，异议并入语义评审的 A 修订环节**——v0.7 时规则 warning 走独立答辩链（`run_auto_dispute` → `dispute_issue` 机械匹配 → `resolve_dispute_llm` B 机器裁决），现已移除；规则 warning/suggestion 与 B 评审发现**同池**进入阶段② 多轮语义评审，A 修订时逐条表态（接受即改 / 带证据异议），B 复核统一裁决（`dispute_rulings`）。合并依据：两条链机制同构（都是 A 对 issue 表态、分歧升级），合并后流程更短、状态机不增复杂度。**三条底线保留**：机械匹配闸门（规则类异议必须引用已登记证据源 + 逐字摘录）、B 独立裁决、error 仍 A 单方修复。命令层删 `dispute_issue` / `resolve_dispute_llm` / `dispute_and_judge` / `run_auto_dispute` / `get_auto_dispute_result`；`resolve_dispute` 保留供人工仲裁。② **新增轮次清单**：`review_rounds` 表按轮记录 issue 快照与统计（发现/已修改/异议），前端阶段② 可查看每轮"改了哪些、哪些没改、哪些带裁决"。③ 阶段① 不再有 B 介入点（检测零 LLM + 无答辩裁决），B 的介入点收敛为阶段② 语义评审与阶段③ 仲裁。
+> **v0.7 变更**：① **warning 答辩从阶段②移入阶段①**——规则检查产出 warning 即可逐条反驳（提论据 → 机械匹配 → B 机器裁决），不再等语义评审先行；阶段①的「零 LLM」精确为「**检测零 LLM**」（检测引擎确定性，答辩裁决走 B）；② **统一发现池**：`validation_issues` 加 `source` 列（`rules`|`review`），B 语义评审的建议转写为 issue 行与规则发现同池同生命周期，A 修订说明逐条回填 `a_action`，**A rejected 的发现自动转 disputed 进仲裁队列**；③ 评审状态机补 `b_verdict`（B 复核原始输出落库）与 `step_ms_*`（环节耗时）；④ 同步实现现实：`resolve_dispute_llm`（B 机器裁决）与 §2.4 出口检查点均已实现，§5 schema/SQL 对齐代码。（**注**：本版中的"答辩"机制已于 v0.8 退役并并入语义评审 —— 保留此变更记录仅作演进追溯。）
 > **v0.6 变更**：① 全文去掉 L0–L4 层级编号——非业界通用概念且各处范围不一，改用检查项本名（layer 字段仅作实现层标记保留在报告 schema）；② 阶段①只保留已实现内容（语法/结构/逻辑/覆盖矩阵/纠错循环），数据可落地性、CQ 反测、不变量编译均为**未实现的规划项**，移入「四、扩展校验维度」；方法论合规检查经取舍裁定不单独成层（标注完备性/SWRL 已随结构规范实现，tentative 并入覆盖矩阵，启发式三项由语义评审覆盖，检查项不单独成层）；③ 模型独立性独立成「三、模型独立性约束」章；④「不变量核验」明确不是独立流程环节——编译是一次性准备，产物随规则检查执行。
 > **v0.5 变更**：「一、总体设计」重组（总览提为 §1.1、现状移 §6、缺口压缩为设计目标引言）；「二」按全流程阶段展开。
 > **定位**: AI 辅助本体建模（W3C Turtle）生成结果的质量闸门设计——如何结合**输入（29 句话 / 宪章）**、**建模原则（skill 方法论）**、**数据源（datasets/data_sources）**对产出做机器可执行 + 语义级的校验，并以**多轮协同对抗**方式闭环迭代。
@@ -28,7 +29,7 @@
 - 对齐原方案图「本体建模（生成）⇄ 本体结果校验（验证）」的对抗语义，不引入 GAN 判别器等额外命名
 - 两者是**编排流程中的对抗角色**（模型 + 独立 prompt + 构造输入），不是常驻的独立智能体
 - A/B 必须跨供应商或至少跨模型家族（硬化约束见 §3.1）
-- **规则检查（检测引擎）既不是 A 也不是 B**——是确定性代码（规则引擎），检测环节零 LLM；A 触发并按结果修复，B 不重跑（同样代码结果必然相同），B 通过评审 prompt 注入规则报告获取上下文；B 的介入点有二——①a warning 答辩裁决（阶段①内）与②多轮语义评审（阶段②）。两类发现进**统一发现池**（`source=rules|review`，§5.2）共享 issue 生命周期；真正的二次把关在出口检查点（§2.4）由系统内联重跑
+- **规则检查（检测引擎）既不是 A 也不是 B**——是确定性代码（规则引擎），检测环节零 LLM；A 触发并按结果修复，B 不重跑（同样代码结果必然相同），B 通过评审 prompt 注入规则报告获取上下文；**B 的介入点收敛为② 多轮语义评审（阶段②）与③ 仲裁（阶段③）**——v0.8 后阶段① 无 B 参与（答辩已并入阶段②，见 §2.1.5）。规则发现与 B 评审发现进**统一发现池**（`source=rules|review`，§5.2）共享 issue 生命周期；真正的二次把关在出口检查点（§2.4）由系统内联重跑
 
 ---
 
@@ -44,16 +45,16 @@
          │
          ▼
 ┌─────────────────────────────────────────────┐
-│ 第一阶段：规则检查 + warning 答辩              │
-│  ① 「运行校验」显式触发（检测零 LLM，毫秒级）    │
+│ 第一阶段：规则检查（检测零 LLM，无 B 参与）       │
+│  ① 「运行校验」显式触发（确定性，毫秒级）        │
 │     ├─ 语法解析 + 结构规范十项 lint             │
 │     ├─ 逻辑一致（无环/主体类型/悬空引用）    │
 │     ├─ issue 快照落库（error/warning/suggestion）│
 │     └─ 覆盖矩阵随 ① 一并计算（§2.1.3）         │
 │  ①b error 纠错循环（A 单方，≤3 轮，§2.1.4）    │
-│  ①c warning 答辩（对规则 warning 逐条反驳，     │
-│     issue 级单轮：论据 + 反证来源 + 原文引用      │
-│     → 机械匹配 → B 机器裁决，§2.1.5）           │
+│     error = 确定性违反，无辩空间，B 不参与        │
+│  （warning/suggestion 不再在此处理——v0.8 起      │
+│   与 B 评审发现同池，进阶段② A 修订环节，§2.1.5） │
 └─────────────────────────────────────────────┘
          │
          ▼
@@ -62,21 +63,25 @@
 │                                             │
 │  ② 多轮语义评审（本体级，后端驱动自动轮转）      │
 │     B 评审（八维度，注入真实宪章 + 规则报告上下文，│
-│     走 B 独立 ChatService）→ A 修订（接受/拒绝，│
-│     理由对 B 不可见）→ B 复核（只看修订后 Turtle，│
-│     防 A 说服 B）→ 收敛或轮次封顶              │
+│     走 B 独立 ChatService）→ 转写统一发现池      │
+│     → A 修订（对发现池逐条表态：接受即改 / 带证据  │
+│     异议；理由对 B 不可见）→ B 复核（只看修订后   │
+│     Turtle + 异议清单，裁决 dispute_rulings，    │
+│     防 A 说服 B）→ 收敛或轮次封顶               │
 │                                             │
-│  B 的评审发现转写入统一发现池（source=review）   │
-│  A rejected 的发现自动 disputed → 升级仲裁（③） │
+│  统一发现池 = B 评审发现（source=review）        │
+│              + 规则 warning/suggestion（rules） │
+│  A 异议（disputed）→ B 复核裁决；裁决不了的升级③ │
+│  每轮落 review_rounds 快照（发现/已修改/异议）   │
 └─────────────────────────────────────────────┘
          │ 只升两样东西上来
          ▼
 ┌─────────────────────────────────────────────┐
 │ 第三阶段：人工仲裁（殿后，只收机器解决不了的）   │
 │  ├─ 对抗轮次封顶仍未收敛的分歧                 │
-│  ├─ B 复核判不定的争议（含答辩 uncertain）      │
-│  争议项两源并列：规则/答辩来源 + 评审来源        │
-│  两步裁决（§2.3）：先判"该不该驳回"再定         │
+│  ├─ A 异议未决（B 判 uncertain，保持 disputed）  │
+│  争议项两源并列：规则来源 + 评审来源            │
+│  两步裁决（§2.3）：先读双方论据再定             │
 │  accepted/overruled；裁决权在 B，人工执行       │
 └─────────────────────────────────────────────┘
          │
@@ -91,10 +96,10 @@
 
 | 阶段 | 子流程 | 设计章节 | 实现载体 |
 |------|--------|---------|---------|
-| 一 规则检查 + 答辩 | 语法解析 + 结构规范 + 逻辑一致性 | §2.1.1–2.1.2 | `ttl/validate.rs` |
+| 一 规则检查 | 语法解析 + 结构规范 + 逻辑一致性 | §2.1.1–2.1.2 | `ttl/validate.rs` |
 | | 覆盖矩阵（含增量） | §2.1.3 | `ttl_coverage.rs` |
-| | error 纠错循环（≤3 轮） | §2.1.4 | validate → A 修订 → 重跑 |
-| | warning 答辩（issue 级单轮，B 机器裁决） | §2.1.5 | `dispute_issue` + `resolve_dispute_llm` |
+| | error 纠错循环（≤3 轮，A 单方） | §2.1.4 | validate → A 修订 → 重跑 |
+| | warning/suggestion 汇入统一发现池（v0.8 并入阶段②） | §2.1.5 | `save_b_report` 转写 + `a_revise` 表态 |
 | 二 对抗验证 | ② 多轮语义评审 + 统一发现池 | §2.2 | `validation_llm.rs` + ReviewPanel |
 | 三 人工仲裁 | 两步裁决（只收升级项，两源争议并列） | §2.3 | ArbitrationPanel + resolve_dispute |
 | 出口检查点 | import 闸门 | §2.4 | validation_gate（ttl/validate.rs） |
@@ -119,8 +124,8 @@
         ▼
 ┌─────────────────────────────────────────────┐
 │ 阶段② 对抗验证  多轮语义评审（B 机器裁决）      │ ← 统一发现池
+│                （含规则 warning/suggestion 异议）│
 │ 阶段① 规则检查  语法/结构/逻辑/覆盖矩阵/纠错    │ ← error 阻断
-│                + warning 答辩（B 机器裁决）    │
 │ （扩展规划）    数据落地性 + CQ 反测 + 不变量编译│ ← 未实现，§4
 └─────────────────────────────────────────────┘
         │
@@ -141,9 +146,9 @@
 
 按 §1.1 全流程的阶段展开。每个阶段小节内按执行顺序排列子流程。**只收录已实现（或已接入流程）的环节**；未实现的规划维度统一放 §4 扩展章，实现后按性质归位。
 
-### 2.1 阶段①：规则检查 + warning 答辩（检测零 LLM，显式触发）
+### 2.1 阶段①：规则检查（检测零 LLM，显式触发）
 
-> 检测环节全部确定性代码，毫秒级；「运行校验」一次带出本阶段全部检查。产出结构化 issue 快照落库（error/warning/suggestion 三级），落库时打 `source='rules'` 标记进统一发现池。答辩（§2.1.5）是阶段①内唯一的 B 介入点——对规则 warning 逐条裁决，不依赖语义评审先行（语义评审在阶段②做本体级大清洗，两者并行不互锁）。检测引擎既不是 A 也不是 B——见「角色命名」末条。
+> 检测环节全部确定性代码，毫秒级；「运行校验」一次带出本阶段全部检查。产出结构化 issue 快照落库（error/warning/suggestion 三级），落库时打 `source='rules'` 标记进统一发现池。**阶段① 无 B 参与**：error 走 A 单方纠错循环（§2.1.4）；warning/suggestion 不在本阶段处理，而是与 B 评审发现同池进入阶段② 语义评审的 A 修订环节（§2.1.5）。检测引擎既不是 A 也不是 B——见「角色命名」末条。
 
 #### 2.1.1 语法解析与结构规范（已实现）
 
@@ -193,63 +198,41 @@ validate error → 构造修订 prompt（引用 principle.ref 逐条修订）→
 - A 单方修正，B 不参与（确定性问题的修复没有对抗价值）
 - 回喂闭环的完整数据流见 §5.3
 
-#### 2.1.5 warning 答辩（issue 级，单轮定胜负，已实现）
+#### 2.1.5 warning/suggestion 异议处理（v0.8 已并入阶段②语义评审）
 
-规则检查产出的 warning 级 issue 由 **A（建模者）**引用输入证据进行**反驳**，构成「规则级对抗」（error 级是确定性违反，不可辩）——**答辩的发起方是 A，不是人**：被指控的是 A 的建模产物，翻案权自然在 A；裁决权在 B；人只在阶段③ 仲裁 B 判不定的残留。v0.7 起答辩归阶段①——规则 warning 一产出即可逐条反驳，不必等语义评审先行；语义评审（阶段②）关注本体级问题，两者并行不互锁。
+规则检查产出的 warning/suggestion **不再走独立答辩通道**（v0.8 合并方案）——异议在阶段② 多轮语义评审的 **A 修订环节**统一处理：A 对统一发现池逐条表态（接受即改 / 带证据异议），B 复核裁决（§2.2.1）。error 级仍是确定性违反，A 单方纠错（§2.1.4），无辩空间。
 
-**A 自动答辩链（`run_auto_dispute`，后端一次跑完）**：对本体的 rules 来源 open warning——
+**规则告警的异议约束**（保留答辩链的机械匹配闸门）：
+- 必须引用已登记 `evidence_source` + **逐字摘录** quote（≤200 字，系统做字面机械匹配，复用 `match_quote`）
+- 无证据 / 摘录对不上源 → 按接受收敛（告警成立），不进入裁决
+- B 复核裁决：`overruled` 撤销 / `accepted` 升级 error / `uncertain` 进人工仲裁
 
+**历史（v0.7 及以前）**：独立答辩链 `run_auto_dispute`（A 决策 → `dispute_issue` 机械匹配 → `resolve_dispute_llm` B 机器裁决）已移除——答辩是规则级对抗，与评审的 A 修订异议机制**同构**（都是 A 对 issue 表态、分歧升级），合并后流程更短、状态机不增复杂度。`resolve_dispute` 命令保留（人工仲裁用）。
+
+```mermaid
+flowchart LR
+    R[规则检查产出 warning/suggestion] --> A2[阶段② A 修订：逐条表态]
+    A2 -->|接受| ACC[accepted 按建议修订]
+    A2 -->|异议·带证据| MQ[机械匹配把关]
+    MQ -->|通过| DIS[disputed 待裁决]
+    MQ -->|失败/无证据| ACC
+    DIS --> B2[B 复核裁决]
+    B2 -->|overruled| OV[撤销告警]
+    B2 -->|accepted| UP[升级 error]
+    B2 -->|uncertain| ARB[人工仲裁 阶段③]
 ```
-环节 1  A 决策（run_a_dispute）：逐条决定 dispute / accept
-        输入 = warning 清单 + 证据源全文（id+标题+内容）
-        dispute 必须选源 + 逐字摘录 quote（≤200 字）+ argument
-        无证据支撑的 warning → accept（不硬编——编造会被环节 2 当场驳回）
-环节 2  提交（dispute_issue）：机械匹配把关，摘录对不上源 → 驳回维持 open
-环节 3  B 裁决（resolve_dispute_llm）：overruled 撤销 / accepted 升级 error /
-        uncertain 保持 disputed 进人工仲裁
-```
-
-- A 漏答的条目按 accept 保守处理（不落 disputed）
-- DisputeModal 保留为**人工精修入口**（替 A 补答辩/复核个别条目），默认路径是 A 自动答辩
-- UI：阶段①答辩区「交 A 答辩（N warning）」按钮一键触发，结果折叠展示（撤销/驳回/待人工/接受/摘录未匹配 逐条列明）
-
-```
-规则触发 warning
-     │
-     ├─ A 无异议 → 更新（常规修正）
-     │
-     └─ A 有异议 → 提交 dispute（含 argument + counterEvidence）
-           │
-           ▼
-     裁决分两步（缺一不可）：
-     ① counterEvidence 机械匹配（代码层，快）
-        —— 必须引用已登记的 evidence_source ID + quote 通过三级匹配
-        —— 匹配失败 = 该证据不成立，dispute 直接驳回（不进入②）
-     ② argument 可信度判定（LLM 层，B 机器裁决）
-        —— 机械匹配通过后，A 的辩护理由是否成立由 B 判定（resolve_dispute_llm）
-        —— B 确认 → overruled（撤销）；B 不认可 → accepted（升级 error）
-        —— B 判不定（uncertain）→ 保持 disputed，进人工仲裁（阶段③）
-```
-
-**实现逻辑**：
-- `ValidationIssue.status` 初始为 `open`
-- 答辩提交 `dispute_issue(id, argument, counter_source_id, counter_quote)`：A 自动链（环节 2）或人工精修（DisputeModal）都走此口，状态置 `disputed` 后自动触发 B 机器裁决
-- **裁决归属**：`resolve_dispute` 不是一步代码判断——它先由 Rust 层做 counterEvidence 的机械匹配（复用 `match_quote` 三级匹配，对齐 EVIDENCE-CHAIN.md），匹配通过后再由 B（`resolve_dispute_llm`，走校验者独立 ChatService）判定 argument 的自然语言可信度。**argument 不是机器可判的，裁决权在 B，不在代码，更不在 A 自己**——否则 A（同一个 LLM）等于自己给自己翻案
-- 被 `overruled` 的 issue 不进入最终报告，但记入审计日志供回溯
-- 本机制只对 **rules 来源的 warning 级**开放——error 级是阻断性问题，不可辩（语法不通过、逻辑不成立，不存在辩护空间）；review 来源的 B 评审发现不适用本通道（A 对 B 评审建议的异议走 §2.2 的修订说明 rejected → 仲裁，设计如此：评审分歧是 A/B 对抗，不是 A 对规则引擎的翻案）
-- 降级模式（单 provider，见 §3.2）下 B 与 A 同模型，答辩独立性打折，需在报告中标注「降级裁决」
 
 ---
 
 ### 2.2 阶段②：对抗验证（多轮语义评审，B 裁决机器能解决的分歧）
 
-> 阶段② = 多轮语义评审（本体级大清洗）。warning 答辩已前移至阶段①（§2.1.5），与本阶段并行不互锁。B 的评审发现不再只留在 `b_report` JSON 里——每条转写为 issue 行进**统一发现池**，与规则发现同池同生命周期；A 修订时逐条表态（accepted/rejected），rejected 的发现自动升级人工仲裁（§2.3）。
+> 阶段② = 多轮语义评审（本体级大清洗）。v0.8 起规则 warning 异议并入本阶段 A 修订环节（§2.1.5），不再有独立答辩通道。B 的评审发现转写为 issue 行进**统一发现池**，与规则发现同池同生命周期；A 修订时逐条表态（accepted/rejected 带证据），rejected 的发现由 B 复核裁决，裁决不了才升级人工仲裁（§2.3）。
 
 #### 2.2.1 ② 多轮语义评审（本体级）+ 统一发现池
 
 > 这是原方案中「多轮对抗迭代」的核心落地层，区别于单次审计。角色：B = `Verifier`（校验者）、A = `Generator`（建模者）。
 
-- **输入**：charter + 29 句话 + Turtle + 规则检查报告 + 覆盖矩阵 + 答辩记录（dispute 状态）+ 已登记的 evidence 源上下文
+- **输入**：charter + 29 句话 + Turtle + 规则检查报告（含 warning/suggestion）+ 覆盖矩阵 + 已登记的 evidence 源上下文
 - **任务**：评审规则查不出的语义问题——概念混淆、粒度不当（类该拆该并）、业务贴合度、建模最优性
 - **输出**：结构化建议清单（定位到实体 IRI + 问题类型 + 修改建议 + 证据引用），**不阻断落库**——且每条建议同步转写为 `source='review'` 的 issue 行（统一发现池，见下）
 - **多轮对抗流程**：
@@ -259,20 +242,22 @@ validate error → 构造修订 prompt（引用 principle.ref 逐条修订）→
   └─ 输出建议清单（每条含 id + evidence，引用 charter/29句/输入证据）
   └─ save_b_report 同步转写为统一发现池 issue 行（id="{review_id}:{B条目id}"）
 
-第二轮：A 修订（基于 B 建议）
-  └─ 输出 Turtle V2 + 修订说明（逐条注明接受/拒绝及理由，issue_id 回显 B 的 id）
+第二轮：A 修订（基于统一发现池：B 建议 + 规则 warning/suggestion）
+  └─ 输出 Turtle V2 + 修订说明（逐条注明接受/异议及理由，issue_id 回显 B 编号 / R 编号）
   └─ a_revise 把修订说明逐条回填 issue.a_action；
-     rejected 条目 → status=disputed → 自动进人工仲裁队列
+     接受 → status=accepted；异议 → disputed（规则类异议须带证据引用，过机械匹配闸门）
+  └─ 同时落该轮 review_rounds 快照（该轮 issue 清单 + 统计：发现/已修改/异议）
 
 第三轮：B 复核（≤2 轮封顶）
-  └─ B 看到 A 的修订内容（不含修订思考过程）
-  └─ 确认 → 通过 | 追问 → 分歧点 → 人工仲裁
+  └─ B 看到：修订后产物（V2/V3）+ 自己上一轮的建议清单（核查基准）；看不到 A 的修订说明与辩护词
+  └─ 判定只按产物：产物里没改就是没改，不因 A 给了理由而松动（路线 B：异议裁决归人工）
+  └─ 确认 → 通过 | 追问 → 进下一轮 | 封顶未收敛 → 人工仲裁
   └─ b_verdict（B 复核原始输出 JSON）+ step_ms_*（各环节耗时）落库
 
 约束：
-- B 的 prompt **包含**第一轮的 evidence 引用（校验方比被校验方信息更多，这是对抗的关键逆直觉——审计者拥有企业文档/数据库等额外证据源）
+- B 的 prompt **包含** evidence 引用与 29 句话/覆盖矩阵（校验方比被校验方信息更多，这是对抗的关键逆直觉——审计者拥有企业文档/数据库等额外证据源）。编排层必须真正注入这两段：`build_b_review_inputs` 是为此而存在，缺项时写显式缺失声明而非留空
 - B **不包含** A 的建模方法论 prompt（§3.1 硬性约束）
-- 第三轮 B 复核时 **能看到 A 的输出**但看不到 A 的修订说明/辩护词——防止 B 被 A 的逻辑同化
+- 第三轮 B 复核时 **能看到 A 的修订产物 + 自己的上一轮建议清单（核查基准）**，但看不到 A 的修订说明/辩护词——前者是"裁判必须记得自己出过什么题"，后者是防止 B 被 A 的逻辑同化。二者不冲突：独立性约束的是不看解题思路，不是让裁判失忆
 - 编排为后端 tokio 任务（run_review_loop）：切页面/最小化不中断，前端轮询恢复进度
 ```
 
@@ -286,11 +271,11 @@ validate error → 构造修订 prompt（引用 principle.ref 逐条修订）→
 | `source` 列 | `validation_issues.source` = `'rules'`（阶段①规则检查）\| `'review'`（② B 语义评审） |
 | 转写（B 报告 → issue 行） | `save_b_report` 时把 B 建议清单逐条 INSERT：id=`{review_id}:{B条目id}`、layer=`L4`、rule=`review:{dimension}`、severity 由 B 声明（未知值降 suggestion）、evidence_ref 存 principle_source='review' |
 | 按源分域替换 | 重跑规则检查只清 `source='rules'` 的行——review 域的生命周期由评审状态机管理，规则重跑不冲掉 |
-| A 逐条表态（a_action） | A 修订说明 JSON 逐条回填：accepted → issue.status=accepted；**rejected → status=disputed，自动进仲裁队列**（A 的异议不是翻案通道，是升级仲裁的证据） |
+| A 逐条表态（a_action） | A 修订说明 JSON 逐条回填：accepted → issue.status=accepted；rejected（异议）→ status=disputed。规则类异议须带证据引用（过机械匹配闸门，不过按 accepted 收敛），review 类异议直接转 disputed；**disputed 条目由阶段③人工仲裁裁决（路线 B：B 复核不产出 dispute_rulings）** |
 | id 匹配容错 | A 回显的 issue_id 与 B 的 bid 做归一化双向包含匹配（实测 A 会自造编号），最长 bid 优先 |
-| 展示 | ReviewPanel 渲染「B 建议 → A 裁决」成对卡片（接受绿/拒绝红 + 理由）；ArbitrationPanel 队列中 review 来源条目标 `评审·{bid}`，与规则/答辩来源的争议并列 |
+| 展示 | ReviewPanel 渲染「发现 → A 表态 → 人工裁决」成对卡片（接受绿/异议红 + 理由）；阶段② 另有「轮次清单」按轮展示 issue 快照与统计（发现/已修改/异议），复核卡显示**核查基准**（B 上一轮建议条数）。ArbitrationPanel 队列中 review 来源条目标 `评审·{bid}`，与规则来源的争议并列 |
 
-> 设计取舍（2026-09-23 用户裁定）：**答辩该合的是"发现池"不是"检测引擎"**——阶段①的检测引擎保持零 LLM（import 闸门/成本/确定性三理由），但两类发现的**生命周期**统一：都能被 A 表态、都能进仲裁、都在同一张表流转。检测与对抗是流水线上的两段，发现的归宿是同一个池。
+> 设计取舍（2026-09-23 用户裁定，v0.8 延续）：**该合的是"发现池"不是"检测引擎"**——阶段①的检测引擎保持零 LLM（import 闸门/成本/确定性三理由），但两类发现的**生命周期**统一：都能被 A 表态、都能进仲裁、都在同一张表流转。检测与对抗是流水线上的两段，发现的归宿是同一个池。v0.8 进一步把"异议处置"也统一——规则告警的异议不再走独立答辩链，与评审异议同在 A 修订环节表态；**异议的裁决统一归人工仲裁（路线 B，见 §2.3）**。
 
 **B 评审 prompt 规格（review_ontology 的输入规范，承接原方案审计模板）**：
 
@@ -300,7 +285,7 @@ validate error → 构造修订 prompt（引用 principle.ref 逐条修订）→
   1. charter（business_scenario/business_essence）
   2. 29 句话（7 类逐条）
   3. Turtle 本体
-  4. 规则检查报告 + 覆盖矩阵 + 答辩记录（dispute 状态）
+  4. 规则检查报告（含 warning/suggestion）+ 覆盖矩阵
   5. 已登记的 evidence 源上下文（企业文档/DB schema 摘录）
 【审计维度】（对齐原模板八维度，逐条过）
   ① 事实忠实度：每个断言是否有企业证据支持？（Prefer Counterexamples——
@@ -331,11 +316,11 @@ validate error → 构造修订 prompt（引用 principle.ref 逐条修订）→
 
 > **人只出现在最后**——人工注意力是最稀缺资源，A/B 机器交互能达成一致的不到人。
 
-**三个升级入口**（仲裁队列中三源并列，标签区分来源）：
+**三个升级入口**（仲裁队列中按来源标签区分）：
 
 1. **对抗轮次封顶**：② 多轮评审超上限（B 复核 >2 轮）仍未收敛的分歧——评审任务整体 escalated，B 复核原始输出 `b_verdict`（含 remaining_issues）供仲裁时查看
-2. **A 拒绝评审建议**：统一发现池中 review 来源 issue 被 A rejected → status=disputed，标签 `评审·{bid}`（v0.7 新增——A 的拒绝不是翻案，是把分歧升级给人）
-3. **答辩 B 判不定**：①c 答辩中 B 机器裁决返回 uncertain 的争议 issue（标签 `答辩·{id}`），保持 disputed 等人工
+2. **A 异议未决**：统一发现池中 issue 被 A 提异议（rejected）→ status=disputed，**保持 disputed 等人工**（路线 B：B 复核不裁决异议）——标签区分来源（规则类 `规则·{id}` / 评审类 `评审·{bid}`）。A 的异议不是翻案，是把分歧升级给人
+3. **error 升级**：A 的异议经人工仲裁判 `accepted`（异议不成立）→ 该 issue 升级为 error 阻断；若 A 反复修复不成功（纠错 ≤3 轮）→ escalate
 
 **两步裁决（缺一不可）**：
 
@@ -344,12 +329,16 @@ validate error → 构造修订 prompt（引用 principle.ref 逐条修订）→
 ② 裁决 accepted / overruled
 ```
 
-**裁决归属**：机械匹配在 `dispute_issue` 提交时完成（§2.1.5 步骤①），裁决阶段由 B（`resolve_dispute_llm`，独立 ChatService）判定 argument 的可信度。**argument 不是机器可判的，裁决权在 B，不在代码，更不在 A 自己**——否则 A（同一个 LLM）等于自己给自己翻案。人工执行的是 B 已给出的裁决方向（B 判 uncertain 的保持 disputed 等人）。
+**裁决归属（路线 B，2026-11-03 用户裁定）**：机械匹配在 A 修订提交异议时完成（§2.1.5，Rust 层 `match_quote` 三级匹配，规则类异议不过即按接受收敛）；**匹配通过的异议一律保持 `disputed`，由人工仲裁裁决——B 复核不再裁决异议**。
+
+为什么这样切：B 独立性原则要求它"只看产物、不看 A 的辩护词"，而裁决异议恰恰需要读 A 的论据——两件事在同一次复核里做，要么破坏独立性、要么让 B 对它看不见的东西下判决（此前实现正是后者：prompt 要求产出 `dispute_rulings`，编排层却从未把异议清单交给它）。
+
+代价与边界：仲裁队列会变大，但闸门仍在——无证据支撑的异议在机械匹配阶段就按接受收敛，进队列的是"有证据的分歧"。人工注意力仍是稀缺资源，只是不再假手 B 消化。
 
 **对抗的核心原则**：
 
 1. **证据对抗，不是观点对抗**——每次交锋必须带证据（规则引用/原文摘录/反例），不带证据的意见不进入下一轮
-2. **轮次有限，防死循环**——error 纠错 ≤3 轮、语义评审复核 ≤2 轮、答辩 1 次（失败升级），超出即转人工，保护用户主权（决策 23）
+2. **轮次有限，防死循环**——error 纠错 ≤3 轮、语义评审复核 ≤2 轮，异议一次性提交（B 复核裁决不了即升级），超出即转人工，保护用户主权（决策 23）
 3. **仲裁兜底**——模型间无法达成一致时，分歧点以结构化形式（issue + 双方主张 + 证据）提交，专家可一键裁决
 
 #### 2.3.1 状态机流转（issue 生命周期）
@@ -361,31 +350,33 @@ validation_issues[]（统一发现池，source=rules|review）
     │
     ├─ rules · severity=error ──→ blocking，不入 dispute（直接进 A 修订 prompt，§2.1.4）
     │
-    ├─ rules · severity=warning ──→ A 可选调用 dispute_issue(id, argument, counter_evidence)
-    │     │                        ↓
-    │     │                 resolve_dispute（两步裁决，见 §2.1.5）：
-    │     │                   ① counterEvidence 机械匹配（match_quote 三级匹配）
-    │     │                      匹配失败 → 直接驳回（不进入②）
-    │     │                   ② argument 可信度由 B 机器裁决（resolve_dispute_llm）
-    │     │                      B 认可 → status=overruled（撤销）
-    │     │                      B 不认可 → status=accepted（升级 error 阻断）
-    │     │                      B 判不定 → 保持 disputed → 人工仲裁（阶段③）
-    │     │
-    │     └── A 不 dispute → 常规修正（status=accepted）
+    ├─ rules · severity=warning|suggestion ──→ 汇入阶段② 统一发现池
+    │     │                        ↓（A 修订时逐条表态，§2.1.5）
+    │     ├─ A 接受 → status=accepted（按建议修订）
+    │     └─ A 异议（rejected）：
+    │          ① 机械匹配（match_quote，规则类异议必带 evidence 引用 + 逐字摘录）
+    │             匹配失败 / 无证据 → 按 accepted 收敛（告警成立，不进入裁决）
+    │          ② 通过 → status=disputed → B 复核裁决（b_recheck，见 round=3）
+    │             B 认可 → status=overruled（撤销）
+    │             B 不认可 → status=accepted（升级 error 阻断）
+    │             B 判不定 → 保持 disputed → 人工仲裁（阶段③）
     │
     └─ review · severity=任意 ──→ B 语义评审（ValidationReview 多轮状态机）转写产生
                │
                │  round=1: B 评审（prompt_text + evidence 上下文）
                │      ↓ 输出 b_report → 同步转写 issue 行（source=review）
-               │  round=2: A 修订（a_revise）
+               │  round=2: A 修订（a_revise，输入=B 建议 + 规则 warning/suggestion）
                │      ↓ 输出 a_revision（Turtle V2）+ a_reasoning
                │      ↓ 修订说明逐条回填 a_action：
                │         accepted → status=accepted
-               │         rejected → status=disputed → 仲裁队列（标签 评审·{bid}）
+               │         rejected → status=disputed（规则类异议须过机械匹配）
+               │      ↓ 同时落该轮 review_rounds 快照（发现/已修改/异议）
                │  round=3: B 复核（b_recheck）
-               │      ↓ 只看修订输出，不看 reasoning；b_verdict + step_ms 落库
+               │      ↓ 只看修订输出 + 异议清单，不看 reasoning；
+               │      ↓ 逐条裁决 dispute_rulings（overruled/accepted/uncertain）
+               │      ↓ b_verdict + step_ms 落库
                │    ┌─ 确认 → status=resolved → import 落库
-               │    └─ 追问 → status=escalated → 分歧点入队列 → 人工仲裁
+               │    └─ 追问 → 进下一轮 | 封顶未收敛 → escalated → 人工仲裁
                │
                └── 任意轮超限 → escalate
 ```
@@ -404,7 +395,7 @@ validation_issues[]（统一发现池，source=rules|review）
 
 ---
 
-## 三、模型独立性约束（贯穿 LLM 环节：①c 答辩裁决 + ② 语义评审 + ③ 仲裁）
+## 三、模型独立性约束（贯穿 LLM 环节：② 语义评审 + ③ 仲裁）
 
 ### 3.1 硬性约束
 
@@ -415,12 +406,12 @@ validation_issues[]（统一发现池，source=rules|review）
 3. **B 不看 A 的中间产物**：B 的输入只有「charter + 29 句话 + Turtle + 规则检查报告」，不携带 A 的生成过程说明/辩护词，避免锚定效应
 4. **回喂单向**：A 修订时可以看到 B 的报告，B 审计时看不到 A 的历史修订理由，保持审计方信息劣势（审计者应比被审计者信息更少，而非更多）
 
-> 确定性层（阶段①检测引擎）由 Rust 代码执行，天然满足独立性；本约束仅针对 LLM 环节（② 语义评审与 ①c 答辩裁决）。
+> 确定性层（阶段①检测引擎）由 Rust 代码执行，天然满足独立性；本约束仅针对 LLM 环节（② 语义评审与 ③ 仲裁）。
 
 **输入约束的轮次区分（消除与 §2.2 的表述冲突）**：
 - **第一轮（初始评审）**：B 输入只有「charter + 29 句话 + Turtle + 规则检查报告」，不携带 A 的任何生成过程说明（§3.1 第 3 条）
 - **复核轮（对抗迭代）**：B 额外看到 A 的**修订输出**（Turtle V2），但仍**不看到** A 的修订说明/辩护词/思考过程——这保证对抗是「产物对产物」的客观博弈，而非「解释对解释」的修辞博弈
-- 证据优势：B 在第一轮就拥有 evidence 引用（企业文档/数据库证据），信息上强于 A；A 靠 counterEvidence 答辩才能反转——这正是「校验方举证、建模方反证」的对抗结构，与 §3.1 第 4 条「审计方信息劣势」的旧表述不同（旧表述只适用于**第一轮**，修订为上述轮次区分后更精确）
+- 证据优势：B 在第一轮就拥有 evidence 引用（企业文档/数据库证据），信息上强于 A；A 靠带证据的异议（引用已登记源 + 逐字摘录）才能反转——这正是「校验方举证、建模方反证」的对抗结构（对齐 §3.1 第 4 条的轮次区分表述）。
 
 ### 3.2 单 provider 降级路径（现实约束）
 
@@ -436,7 +427,7 @@ validation_issues[]（统一发现池，source=rules|review）
 - B 的输入构造与 A 完全隔离：全新会话、无 A 的上下文、无 A 的中间产物——只给「charter + 29 句话 + Turtle + 报告」
 - B 的审计 prompt 与 A 的建模 prompt 完全独立（§3.1 第 2 条仍生效）
 - **降级运行必须在报告中标注风险等级**，语义评审 结论降权为「建议」（兜底档下 B 的语义评审仅作参考，人工终审权重上调）
-- 连锁影响：warning 答辩的 argument 裁决（§2.1.5 步骤②）在兜底档也由同模型判定，答辩独立性打折——同步标注「降级裁决」
+- 连锁影响：规则告警异议的裁决与评审异议裁决共用 B 复核通道，兜底档（单 provider）由同模型判定，裁决独立性打折——同步标注「降级裁决」
 - 产品层：设置页提示「配置第二个 provider 可获得完整对抗验证」；升级到完整档后历史降级报告保留标注不回溯
 
 > 降级不是设计妥协的遮羞布，而是「无独立性宁可明示降权」——用户主权（决策 23）优先于自动化完成度。
@@ -485,7 +476,7 @@ validation_issues[]（统一发现池，source=rules|review）
 
 - charter `invariants` 是自由文本，**建模时人工把每条不变量确认为可执行的 SHACL/SPARQL 约束**（一次性成本），之后每次生成自动执行
 - 存储：charter 表扩展 `compiled_constraints` 字段（或附属 JSON），与 charter 同生命周期，AI 不可写（对齐决策 23）
-- **写路径（补强）**：用户在前端 CharterPanel 保存宪章时，同时展示 invariants 列表 → 每条可选「生成编译约束」→ 由编译动作（前端调 `compile_invariant(iri, invariant_text)` 命令 → 后端 LLM 生成 SHACL/SPARQL + 人工确认）产出 `compiled_constraints`。编译是人确认后落库，AI 只提草稿不直接写（对齐决策 23）；UI 落点见 §6.3 答辩面板同层级的「不变量编译」入口
+- **写路径（补强）**：用户在前端 CharterPanel 保存宪章时，同时展示 invariants 列表 → 每条可选「生成编译约束」→ 由编译动作（前端调 `compile_invariant(iri, invariant_text)` 命令 → 后端 LLM 生成 SHACL/SPARQL + 人工确认）产出 `compiled_constraints`。编译是人确认后落库，AI 只提草稿不直接写（对齐决策 23）；UI 落点见 §6.3 同层级的「不变量编译」入口
 
 ---
 
@@ -504,7 +495,7 @@ type ValidationIssue = {
   target?: string;               // 涉及实体 IRI / 行号
   evidence?: {                   // 证据引用（对应 evidence_sources 表）
     source_id: string;           // FK → evidence_sources（register_source 返回值）
-    quote: string;               // 原文逐字摘录（≤200 字符；答辩机械匹配用）
+    quote: string;               // 原文逐字摘录（≤200 字符；异议机械匹配用）
   };
   principle?: {                  // 溯源：违反了哪条输入/原则（review 来源为 source='review'）
     source: "skill" | "charter" | "input" | "w3c" | "review";
@@ -599,6 +590,24 @@ CREATE TABLE IF NOT EXISTS validation_reviews (
 > **存量库迁移**：`migrate_validation_unified_pool`（schema.rs，ttl/mod.rs 同步一份）对旧库补列（source/a_action/b_verdict/step_ms_*）并回填 `source='rules'`。
 > **实现坑**：`ttl/mod.rs` 的 `init_ttl_schema` 有一份同构 DDL 副本（in-memory 测试路径），**改表两处必须同步**。
 
+```sql
+-- 轮次清单（v0.8 合并方案）：每轮 issue 快照 + 统计，前端可按轮次查看
+CREATE TABLE IF NOT EXISTS review_rounds (
+    id             TEXT PRIMARY KEY,            -- rr-{uuid simple}
+    review_id      TEXT NOT NULL,               -- 归属评审（FK→validation_reviews.id）
+    round          INTEGER NOT NULL,            -- 轮次：1=首轮 B 评审，2/3=修订复核轮
+    snapshot_json  TEXT NOT NULL,               -- 该轮结束时 issue 清单快照 [{id,severity,rule,status,a_action}]
+    found_count    INTEGER NOT NULL DEFAULT 0,  -- 该轮累计发现数
+    accepted_count INTEGER NOT NULL DEFAULT 0,  -- A 接受（已修改）
+    disputed_count INTEGER NOT NULL DEFAULT 0,  -- A 异议（待裁决）
+    verdict        TEXT,                        -- 该轮后 review 状态：in_progress|resolved|escalated
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL
+);
+-- 写入时机：a_revise（A 表态后落该轮快照）/ b_recheck（更新 verdict + 裁决异议）
+-- 只存状态清单不存 b_report/a_revision 原文（轻量、可查看）
+```
+
 ### 5.3 回喂闭环（对抗式，非纯单向）
 
 ```
@@ -608,7 +617,7 @@ CREATE TABLE IF NOT EXISTS validation_reviews (
 error 级：构造修订 prompt：「以下 N 条违反 <principle.ref>，逐条修订后重新输出完整 Turtle」
         │
         ▼
-warning 级：进入 warning 答辩（§2.1.5，阶段①内）——A 可 dispute（引输入证据反驳）或直接修订
+warning/suggestion 级：汇入阶段② 统一发现池（§2.1.5）——A 修订时表态（接受即改 / 带证据异议）
         │
         ▼
 大模型 A 修订 → 重新 validate → 循环（上限 3 轮，超出转人工）
@@ -617,7 +626,7 @@ warning 级：进入 warning 答辩（§2.1.5，阶段①内）——A 可 dispu
 多轮语义评审 → 建议清单（不阻断）→ 用户确认 → A 修订 → B 复核（≤2 轮）
 ```
 
-对齐 modeling-workflow.md 的「逻辑博弈」环节：确定性规则检查的 error 直接作为 A 的修订输入；rules 来源 warning 开放答辩（§2.1.5）；LLM 语义博弈（§2.2）不限定严重级——B 评审发现的 severity 由 B 声明，A rejected 的分歧进仲裁。
+对齐 modeling-workflow.md 的「逻辑博弈」环节：确定性规则检查的 error 直接作为 A 的修订输入；rules 来源 warning/suggestion 汇入统一发现池（§2.1.5）；LLM 语义博弈（§2.2）不限定严重级——B 评审发现的 severity 由 B 声明，A 异议（rejected）经 B 复核裁决，裁决不了才进仲裁。
 
 ---
 
@@ -630,14 +639,12 @@ warning 级：进入 warning 答辩（§2.1.5，阶段①内）——A 可 dispu
 | 能力 | 职责 | 所属环节 |
 |---|---|---|
 | `validate_ttl(content)` | 确定性规则检查（已有，扩展 issues 字段；快照带 source='rules'） | 阶段① |
-| `run_auto_dispute(iri)` | A 自动答辩链：A 决策 → dispute_issue → B 裁决，对全部 rules 来源 open warning 后端一次跑完 | 阶段①（§2.1.5） |
-| `dispute_issue(id, argument, counter_source_id, counter_quote)` | 答辩提交口（自动链环节 2 / 人工精修同款）：先机械匹配（Rust 内联，失败即驳回），通过置 disputed | 阶段①（§2.1.5） |
-| `resolve_dispute(id, verdict, resolved_by)` | 落裁决（verifier/human）；**不作为 A 的工具暴露**——A 只有 `dispute_issue`，裁决权在 B/人工，防自我翻案 | 阶段①/③ |
-| `resolve_dispute_llm(id, model_b)` | B 机器裁决：overruled/accepted 落库，uncertain 保持 disputed 进仲裁 | 阶段①（§2.1.5） |
+| `resolve_dispute(id, verdict, resolved_by)` | 人工仲裁落裁决（human）；**不作为 A 的工具暴露**——防自我翻案。v0.8 后 B 机器裁决已并入 `b_recheck` | 阶段③ |
 | `review_ontology(iri)` | 启动 B（Verifier）语义评审，创建 ValidationReview | 阶段② |
-| `run_review_loop(iri, ttl, charter, issues)` | 后端 tokio 任务一次跑完 B评审→A修订→B复核，每步落库；切页不中断，前端轮询 | 阶段② |
-| `a_revise(review_id, ttl, reasoning)` | A 提交修订（Turtle V2 + 说明）；a_reasoning 逐条回填 a_action，rejected→disputed | 阶段② |
-| `b_recheck(review_id, confirm, verdict)` | B 复核（只看修订输出，不看 reasoning）；b_verdict + step_ms_re 落库 | 阶段② |
+| `run_review_loop(iri, ttl, charter, issues)` | 后端 tokio 任务一次跑完 B评审→A修订→B复核，每步落库；切页不中断，前端轮询。A 修订输入含规则 warning/suggestion（R 编号） | 阶段② |
+| `a_revise(review_id, ttl, reasoning)` | A 提交修订（Turtle V2 + 说明）：对统一发现池逐条表态，accepted→status=accepted；rejected（异议）→disputed（规则类须过机械匹配）；同时落 review_rounds 快照 | 阶段② |
+| `b_recheck(review_id, confirm, verdict)` | B 复核（只看修订输出 + 异议清单，不看 reasoning）：逐条裁决 dispute_rulings + b_verdict + step_ms_re 落库 | 阶段② |
+| `list_review_rounds(review_id)` | 轮次清单：按轮返回 issue 快照与统计（发现/已修改/异议） | 阶段② |
 | `escalate(review_id)` | 分歧转人工仲裁，进入仲裁队列 | 阶段②→③ |
 
 > import 校验门禁的完整规则见 §2.4 出口检查点——`import_ontology_ttl_tool`（DynamicTool）内联检查；前端 Tauri 命令路径待补（§8 P2′）。
@@ -655,10 +662,10 @@ warning 级：进入 warning 答辩（§2.1.5，阶段①内）——A 可 dispu
 
 | 位置 | 内容 |
 |---|---|
-| 校验任务·阶段① | 「运行校验」→ issue 快照卡片 → 覆盖矩阵内嵌 → **答辩区**（warning 卡片带「答辩」入口，DisputeModal 提交后 B 自动裁决）——检测与答辩同页（v0.7） |
-| 校验任务·阶段② | ReviewPanel：三环节自动轮转进度（环节耗时展示）+「B 建议 → A 裁决」成对卡片（接受绿/拒绝红 + 理由） |
-| 校验任务·阶段③ | ArbitrationPanel：仲裁队列三源并列（轮次封顶 / 评审·{bid} / 答辩·{id}），双方论据并排 + B 复核 verdict 折叠 |
-| 验证报告抽屉 | 三栏统计（规则+答辩 / 对抗验证 / 覆盖）+ 对抗轨迹 + issue 明细 + 复制 Markdown |
+| 校验任务·阶段① | 「运行校验」→ issue 快照卡片 → 覆盖矩阵内嵌 → **规则处理区**（error 走「交 A 修复」纠错循环；warning/suggestion 列出待阶段② 处理）——v0.8 已删答辩区 |
+| 校验任务·阶段② | ReviewPanel：三环节自动轮转进度（环节耗时展示）+「发现 → A 表态 → B 裁决」成对卡片（接受绿/异议红 + 理由）+ **轮次清单**（每轮 发现/已修改/异议/裁决可查看） |
+| 校验任务·阶段③ | ArbitrationPanel：仲裁队列按来源标签（轮次封顶 / 规则·{id} / 评审·{bid}），双方论据并排 + B 复核 verdict 折叠 |
+| 验证报告抽屉 | 三栏统计（规则 / 对抗验证 / 覆盖）+ 对抗轨迹 + issue 明细 + 复制 Markdown |
 | 历史抽屉 | 每次校验的报告存档（与 changelog 关联），含对抗状态变化轨迹 |
 
 ---
@@ -711,16 +718,16 @@ AI 生成 TTL（skill：ontology-modeling-w3c）
 | 优先级 | 内容 | 载体 | 状态 |
 |---|---|---|---|
 | P0 | 报告结构化 + 结构规范十项 + 逻辑一致性（5条）+ import 校验门禁 | Rust `check_*` + `validation_gate` | ✅ 已实现 |
-| P1 | warning 答辩（dispute/resolve + B 机器裁决 resolve_dispute_llm）+ 覆盖矩阵 | 新表 + 前端卡片 | ✅ 已实现（v0.7 归阶段①） |
+| P1 | warning 异议（v0.8 并入语义评审的 A 修订环节 + B 复核裁决）+ 覆盖矩阵 | 新表 + 前端卡片 | ✅ 已实现（v0.8 合并） |
 | P2 | 多轮语义评审状态机（后端驱动 run_review_loop）+ 统一发现池（source/a_action/b_verdict/step_ms） | `validation_reviews` 表 + ReviewPanel 重写 | ✅ 已实现（v0.7） |
 | P2′ | 前端 import 命令补校验闸门（UI 落库路径不过 gate 的缺口，§2.4） | `commands/ontology.rs` | ⬜ 待办 |
 | P2″ | 多轮重试分支（round<max_rounds，当前固定单轮 B→A→B） | run_review_loop | ⬜ 待办 |
 | P2‴ | 覆盖矩阵增量 diff 接 changelog change_summary（前端仍写死占位） | CoverageView | ⬜ 待办 |
 | P3 | 数据可落地性 + CQ 反测（§4）+ 降级档标注进报告 + 不变量 SHACL 编译 | datasets 比对 + charter 扩展 | ⬜ 规划 |
 
-**成本预算（语义评审全流程）**：一次完整对抗验证 = 3~5 次 LLM 全文调用（B 评审 + A 修订 + B 复核，每次携带 TTL + 证据上下文；另有阶段①答辩按 warning 条数各 1 次 B 裁决调用）。以典型 10K token 本体估算：单次调用 ~20-40K token 输入，全流程 ~60-160K token，时延增加 1-3 分钟。这是质量闸门的固定成本，P2 落地时需在设置页展示预估消耗与「跳过语义评审（仅规则校验）」选项。
+**成本预算（语义评审全流程）**：一次完整对抗验证 = 3~5 次 LLM 全文调用（B 评审 + A 修订 + B 复核，每次携带 TTL + 证据上下文；异议裁决已并入 B 复核，不再按 warning 条数额外调用）。以典型 10K token 本体估算：单次调用 ~20-40K token 输入，全流程 ~60-160K token，时延增加 1-3 分钟。这是质量闸门的固定成本，P2 落地时需在设置页展示预估消耗与「跳过语义评审（仅规则校验）」选项。
 
-**验收口径**：P0 落地后，`validate_ttl` 测试（`ttl.rs` 内嵌测试）扩展覆盖新增规则，且 import 对未闭环 error/review 拒绝；P1 落地后，warning 级 issue 可在 UI 发起答辩并持久化状态，裁决走两步归属；P2 落地后，概览页可看到 29 句话覆盖矩阵（增量模式折叠），语义评审可多轮对抗闭环，数据可落地性/CQ 反测给出数据与业务维度的反例；P3 落地后，分歧点可结构化提交专家仲裁，invariants 可编译为约束。
+**验收口径**：P0 落地后，`validate_ttl` 测试（`ttl.rs` 内嵌测试）扩展覆盖新增规则，且 import 对未闭环 error/review 拒绝；P1 落地后，warning/suggestion 与 B 评审发现同池进入语义评审，A 修订逐条表态（接受/带证据异议）并持久化状态，B 复核裁决；P2 落地后，概览页可看到 29 句话覆盖矩阵（增量模式折叠），语义评审可多轮对抗闭环，数据可落地性/CQ 反测给出数据与业务维度的反例；P3 落地后，分歧点可结构化提交专家仲裁，invariants 可编译为约束。
 
 ---
 
@@ -730,7 +737,7 @@ AI 生成 TTL（skill：ontology-modeling-w3c）
 |---|---|
 | `validate_ttl`（ttl/validate.rs） | 语法与结构即其现状，本方案是其扩展路线；`validation_gate` 亦在此 |
 | modeling-workflow.md 双模型校验 | 本方案把 B 审计中可规则化的部分下沉为确定性规则，B 专注语义评审；模型独立性硬化约束见 §3.1 |
-| EVIDENCE-CHAIN.md（决策 24） | warning 答辩的 counterEvidence（机械匹配在 dispute_issue 提交时）与 B 评审的 evidence_ref 都走其三级匹配机制，`evidence_sources`/`element_evidence` 表复用 |
+| EVIDENCE-CHAIN.md（决策 24） | 规则告警异议的证据引用（机械匹配在 A 修订提交异议时）与 B 评审的 evidence_ref 都走其三级匹配机制，`evidence_sources`/`element_evidence` 表复用 |
 | charter（决策 22/23） | 语义评审的验收基准来源；invariants 编译约束遵循「AI 永不写宪章」 |
 | 29 句话范式（material-to-turtle.md） | 覆盖矩阵 正向覆盖矩阵的输入 |
 | 双 # IRI 合法化、IRI 命名（iri-naming.md） | 已在 结构规范，不动 |

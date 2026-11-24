@@ -17,7 +17,8 @@ use tauri::State;
 use ontology_store::{
     ImportRequest, OntologyChangelog, OntologyCharter, OntologyStore, OntologySummary,
     TtlChangelog, TtlCharter, TtlImportResult, TtlOntologySummary, TtlPropertyEdit, TtlStore,
-    TtlValidation,
+    TtlValidation, TtlVersionDiff, TtlVersionSummary, WorkspaceDiffRevokeItem,
+    VERSION_LIMIT_DEFAULT,
 };
 
 use crate::commands::error::{AppError, AppResult};
@@ -208,9 +209,9 @@ pub async fn list_ontology_changelog(
     Ok(store.list_changelog(&ontology_api_name)?)
 }
 
-/// 读取本体设计宪章（不变点：业务场景 / 本质 / 设计意图 / 补充说明）。
+/// 读取本体设计宪章（不变点：业务场景 / 业务目标）。
 ///
-/// charter 不随历史变化——它记录本体的业务本质说明，不随实体增删改而变更。
+/// charter 不随历史变化——它记录本体的业务场景与业务目标，不随实体增删改而变更。
 /// 由独立命令写入，不进 import 流程。前端详情页头部常驻展示。
 #[tauri::command]
 #[specta::specta]
@@ -252,7 +253,8 @@ pub async fn list_ontology_ttl(state: State<'_, AppState>) -> AppResult<Vec<TtlO
     Ok(store.list_ontologies()?)
 }
 
-/// 导出指定本体 IRI 的 Turtle 文本。
+/// 导出指定本体的**生效发布** Turtle（文件导出 / 消费面）。
+/// 从未发布时返回错误（前端映射为「请先发布」）。
 #[tauri::command]
 #[specta::specta]
 pub async fn export_ontology_ttl(
@@ -260,7 +262,29 @@ pub async fn export_ontology_ttl(
     state: State<'_, AppState>,
 ) -> AppResult<String> {
     let store = get_ttl_store(&state)?;
+    Ok(store.export_effective_ttl(&ontology_iri)?)
+}
+
+/// 导出工作区草稿 Turtle（编辑态源码 / 概念图谱 / Agent full 编辑环）。
+#[tauri::command]
+#[specta::specta]
+pub async fn export_ontology_ttl_workspace(
+    ontology_iri: String,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    let store = get_ttl_store(&state)?;
     Ok(store.export_ttl(&ontology_iri)?)
+}
+
+/// 工作区相对生效快照是否有未发布修改。
+#[tauri::command]
+#[specta::specta]
+pub async fn get_ontology_workspace_dirty(
+    ontology_iri: String,
+    state: State<'_, AppState>,
+) -> AppResult<bool> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.get_workspace_dirty(&ontology_iri)?)
 }
 
 /// 校验 Turtle（dry-run，不写库）。返回 TtlValidation（errors 非空则禁止 import）。
@@ -284,6 +308,41 @@ pub async fn import_ontology_ttl(
 ) -> AppResult<TtlImportResult> {
     let store = get_ttl_store(&state)?;
     Ok(store.import_ttl(&ttl_content, overwrite)?)
+}
+
+/// 类元数据列表（label/comment，概念图谱编辑表单回显用）。
+#[tauri::command]
+#[specta::specta]
+pub async fn list_ontology_ttl_class_metas(
+    ontology_iri: String,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<ontology_store::ttl_edit::TtlClassMeta>> {
+    let store = get_ttl_store(&state)?;
+    store.list_ttl_class_metas(&ontology_iri).map_err(AppError::from)
+}
+
+/// 编辑类声明块（label/comment/subClassOf 受管重写）。
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_ontology_ttl_class(
+    ontology_iri: String,
+    edit: ontology_store::ttl_edit::TtlClassEdit,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    let store = get_ttl_store(&state)?;
+    store.edit_ttl_class(&ontology_iri, &edit).map_err(AppError::from)
+}
+
+/// 删除类（级联：独占数据属性删除、多定义域摘除、触及关系整删、继承清理后删类）。
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_ontology_ttl_class(
+    ontology_iri: String,
+    class_iri: String,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    let store = get_ttl_store(&state)?;
+    store.delete_ttl_class(&ontology_iri, &class_iri).map_err(AppError::from)
 }
 
 /// 删除指定本体 IRI（幂等，级联清 charter/changelog）。
@@ -483,4 +542,157 @@ pub async fn delete_ontology_ttl_property(
 ) -> AppResult<String> {
     let store = get_ttl_store(&state)?;
     Ok(store.delete_ttl_property(&ontology_iri, &property_iri)?)
+}
+
+/// 变更清单逐条撤销：相对生效快照对工作区做逆向补丁。返回手术后 TTL。
+#[tauri::command]
+#[specta::specta]
+pub async fn revoke_ontology_workspace_diff_item(
+    ontology_iri: String,
+    item: WorkspaceDiffRevokeItem,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.revoke_workspace_diff_item(&ontology_iri, &item)?)
+}
+
+/// 类行级联撤销：服务端按当前 diff 重算强依赖并原子写回。
+/// `op`: `add` = 撤销新增类；`remove` = 恢复已删除类。
+#[tauri::command]
+#[specta::specta]
+pub async fn revoke_ontology_workspace_class_cascade(
+    ontology_iri: String,
+    class_iri: String,
+    op: String,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.revoke_workspace_class_cascade(&ontology_iri, &class_iri, &op)?)
+}
+
+// ════════════════════════════════════════════════════════════════
+// W3C Turtle 本体版本管理 IPC（显式发布才留快照；回退切指针不新建版本）
+//
+// 语义：versions 表只在发布时写完整 TTL 快照；ontology_ttl.active_revision
+// 指向当前启用版本（NULL=未发布/已修改）。回退=覆盖内容+切指针，不新建版本。
+// diff 接口 rev=0 = 当前工作区内容（可能未发布）。
+// ════════════════════════════════════════════════════════════════
+
+/// 发布当前内容为新版本（版本 = 里程碑）。返回新分配的 revision 号。
+/// 发布写 changelog（change_summary 塞 {"published_version": N} 建立映射）。
+#[tauri::command]
+#[specta::specta]
+pub async fn publish_ontology_version(
+    ontology_iri: String,
+    label: String,
+    description: String,
+    author: String,
+    state: State<'_, AppState>,
+) -> AppResult<u32> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.publish_version(
+        &ontology_iri,
+        &label,
+        &description,
+        &author,
+        None,
+    )?)
+}
+
+/// 列出某本体版本历史（revision 降序；active_revision 对应的那条前端标"已启用"）。
+#[tauri::command]
+#[specta::specta]
+pub async fn list_ontology_versions(
+    ontology_iri: String,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<TtlVersionSummary>> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.list_versions(&ontology_iri)?)
+}
+
+/// 取某版本完整 TTL（回退/对比用；正数 = versions 表 revision）。
+#[tauri::command]
+#[specta::specta]
+pub async fn get_ontology_version_ttl(
+    ontology_iri: String,
+    revision: i32,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.get_version_ttl(&ontology_iri, revision as i64)?)
+}
+
+/// 回退到指定版本（切指针覆盖当前内容，不新建版本、revision 不递增）。
+#[tauri::command]
+#[specta::specta]
+pub async fn revert_ontology_version(
+    ontology_iri: String,
+    revision: i32,
+    author: String,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let store = get_ttl_store(&state)?;
+    store.revert_to_version(&ontology_iri, revision as i64, &author, None)?;
+    Ok(())
+}
+
+/// 取当前生效发布版本（NULL = 从未发布；编辑不清空）。
+#[tauri::command]
+#[specta::specta]
+pub async fn get_ontology_active_revision(
+    ontology_iri: String,
+    state: State<'_, AppState>,
+) -> AppResult<Option<i32>> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.get_active_revision(&ontology_iri)?.map(|v| v as i32))
+}
+
+/// 删除单个版本快照（当前启用的版本拒绝删除；changelog 记录保留）。
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_ontology_version(
+    ontology_iri: String,
+    revision: i32,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let store = get_ttl_store(&state)?;
+    store.delete_version(&ontology_iri, revision as i64)?;
+    Ok(())
+}
+
+/// 两版本结构化 diff（rev=0 = 当前工作区内容；正数 = versions 表 revision）。
+/// 输出新增/删除/修改的类与属性 + 本体头变化提示。
+#[tauri::command]
+#[specta::specta]
+pub async fn diff_ontology_versions(
+    ontology_iri: String,
+    rev_a: i32,
+    rev_b: i32,
+    state: State<'_, AppState>,
+) -> AppResult<TtlVersionDiff> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.diff_versions(&ontology_iri, rev_a as i64, rev_b as i64)?)
+}
+
+/// 版本上限（默认 20，可配置，存 ttl_settings）。
+#[tauri::command]
+#[specta::specta]
+pub async fn get_version_limit(state: State<'_, AppState>) -> AppResult<u32> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.get_version_limit()?)
+}
+
+/// 设置版本上限（0 回退默认 20）。返回生效值。
+#[tauri::command]
+#[specta::specta]
+pub async fn set_version_limit(limit: u32, state: State<'_, AppState>) -> AppResult<u32> {
+    let store = get_ttl_store(&state)?;
+    Ok(store.set_version_limit(limit)?)
+}
+
+/// 版本上限默认值（前端展示用）。
+#[tauri::command]
+#[specta::specta]
+pub async fn version_limit_default() -> AppResult<u32> {
+    Ok(VERSION_LIMIT_DEFAULT)
 }

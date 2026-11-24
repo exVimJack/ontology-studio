@@ -94,6 +94,21 @@ impl FederationService {
         crate::schema::browse_schema(&self.ctx, catalog).await
     }
 
+    /// 已缓存的数据源 schema 快照（内存，不额外连库）。
+    ///
+    /// 供装配层构造映射校验用的物理结构快照（决策 25 D5：可信度最高的一档）。
+    /// 未连接成功的数据源不在缓存里——调用方据此降级为"不校验"而非"校验失败"
+    /// （design D13：连接失败不算结构差异）。
+    pub fn cached_snapshots(&self) -> Vec<(String, crate::source::SchemaSnapshot)> {
+        match self.snapshots.read() {
+            Ok(m) => m
+                .iter()
+                .map(|(name, snap)| (name.clone(), (**snap).clone()))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     // ── 数据源持久化 CRUD（落 memory SQLite，data_sources 表） ──────
 
     /// 初始化 data_sources 表（幂等）。

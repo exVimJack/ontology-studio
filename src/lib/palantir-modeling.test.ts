@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
     DATA_TYPES,
+    CARDINALITIES,
+    CARDINALITY_HELP,
+    CARDINALITY_HINTS,
     isValidObjectTypeName,
     isValidPropertyApiName,
     isValidDataType,
@@ -49,7 +52,7 @@ function makePayload(): OntologyPayload {
                         api_name: "worksIn",
                         display_name: "就职于",
                         target_object_type_api_name: "Department",
-                        cardinality: "MANY_TO_ONE",
+                        cardinality: "MANY",
                     },
                 ],
             },
@@ -96,9 +99,38 @@ describe("命名规范预检（对齐 naming.rs）", () => {
         expect(DATA_TYPES.length).toBe(20);
     });
 
+    it("t只有 ONE/MANY 两值（对齐 Gaia LinkTypeDefCreate，非四元组）", () => {
+        expect(CARDINALITIES).toEqual(["ONE", "MANY"]);
+    });
+
+    it("旧四元组值全部非法（曾误当合法枚举，已纠正）", () => {
+        for (const old of [
+            "ONE_TO_ONE",
+            "ONE_TO_MANY",
+            "MANY_TO_ONE",
+            "MANY_TO_MANY",
+        ]) {
+            expect(isValidCardinality(old)).toBe(false);
+        }
+    });
+
+    it("下拉文案覆盖全部合法值，且解释 MANY 与多对多（用户可读提示不缺失）", () => {
+        for (const c of CARDINALITIES) {
+            expect(CARDINALITY_HINTS[c]).toBeTruthy();
+        }
+        expect(CARDINALITY_HINTS.ONE).toContain("1:1");
+        expect(CARDINALITY_HINTS.MANY).toContain("MANY");
+        expect(CARDINALITY_HELP).toContain("ONE");
+        expect(CARDINALITY_HELP).toContain("MANY");
+        expect(CARDINALITY_HELP).toContain("1:N");
+        expect(CARDINALITY_HELP).toContain("N:1");
+        expect(CARDINALITY_HELP).toContain("中间对象类型");
+    });
+
     it("cardinality 枚举", () => {
-        expect(isValidCardinality("MANY_TO_ONE")).toBe(true);
-        expect(isValidCardinality("many_to_one")).toBe(false);
+        expect(isValidCardinality("ONE")).toBe(true);
+        expect(isValidCardinality("MANY")).toBe(true);
+        expect(isValidCardinality("many")).toBe(false);
         expect(isValidCardinality("")).toBe(false);
     });
 });
@@ -201,7 +233,7 @@ describe("关系草稿预检", () => {
         displayName: "属于",
         description: "",
         targetObjectTypeName: "Department",
-        cardinality: "MANY_TO_ONE",
+        cardinality: "MANY",
     };
     const opts = { isNew: true, existingApiNames: [], objectTypeNames: ["Employee", "Department"] };
 
@@ -225,6 +257,17 @@ describe("关系草稿预检", () => {
         expect(
             validateLinkDraft({ ...base, cardinality: "N_TO_N" }, opts),
         ).toContain("枚举");
+    });
+
+    it("旧四元组值报错，且错误信息解释 MANY 与多对多", () => {
+        const msg = validateLinkDraft({ ...base, cardinality: "MANY_TO_ONE" }, opts);
+        expect(msg).toContain("ONE / MANY");
+        expect(msg).toContain("MANY");
+        expect(msg).toContain("中间对象类型");
+    });
+
+    it("ONE（严格 1:1）通过", () => {
+        expect(validateLinkDraft({ ...base, cardinality: "ONE" }, opts)).toBeNull();
     });
 });
 
@@ -290,7 +333,7 @@ describe("payload 变换：关系", () => {
             api_name: "hasHead",
             display_name: "主管",
             target_object_type_api_name: "Employee",
-            cardinality: "ONE_TO_ONE",
+            cardinality: "ONE",
         }, true);
         expect(next.object_types[1].links).toHaveLength(1);
         expect(next.object_types[1].links[0].api_name).toBe("hasHead");
@@ -304,7 +347,7 @@ describe("payload 变换：关系", () => {
             api_name: "worksIn",
             display_name: "任职于",
             target_object_type_api_name: "Department",
-            cardinality: "MANY_TO_ONE",
+            cardinality: "MANY",
         }, false);
         const l = next.object_types[0].links.find((x) => x.api_name === "worksIn");
         expect(l!.display_name).toBe("任职于");
@@ -315,7 +358,7 @@ describe("payload 变换：关系", () => {
         expect(() =>
             upsertLink(p0, "Employee", {
                 api_name: "ghost", display_name: "x",
-                target_object_type_api_name: "Department", cardinality: "MANY_TO_ONE",
+                target_object_type_api_name: "Department", cardinality: "MANY",
             }, false),
         ).toThrow("不存在");
     });

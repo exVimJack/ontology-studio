@@ -7186,6 +7186,7 @@ dependencies = [
  "oxigraph",
  "regex",
  "rusqlite",
+ "rust_xlsxwriter",
  "serde",
  "serde_json",
  "specta",
@@ -8988,6 +8989,15 @@ checksum = "e46a2036019fdb888131db7a4c847a1063a7493f971ed94ea82c67eada63ca54"
 dependencies = [
  "serde",
  "serde_derive",
+]
+
+[[package]]
+name = "rust_xlsxwriter"
+version = "0.102.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ca3d0e879a578c1313c2800ab0c6c029d38eed18098675e50341a30d32372ed"
+dependencies = [
+ "zip 9.0.1",
 ]
 
 [[package]]

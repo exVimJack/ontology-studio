@@ -35,3 +35,22 @@ export async function saveTextFile(
   await writeTextFile(filePath, content)
   return filePath
 }
+
+/**
+ * 弹出原生保存对话框，只返回用户选定的路径（由调用方负责写入）。
+ *
+ * 二进制产物（如 xlsx 工作簿）不适合经 IPC 把 `number[]` 传回前端：
+ * 大文件序列化开销高且内存翻倍。改为前端选路径、后端 `fs::write` 落盘。
+ *
+ * @param defaultPath 默认文件名（可含目录）
+ * @param filters    文件类型过滤
+ * @returns 用户选定的路径；取消返回 null
+ */
+export async function pickSavePath(
+  defaultPath: string,
+  filters: SaveFileFilter[],
+): Promise<string | null> {
+  const { save } = await import("@tauri-apps/plugin-dialog")
+  const filePath = await save({ defaultPath, filters })
+  return filePath ?? null
+}

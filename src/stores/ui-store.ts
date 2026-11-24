@@ -14,6 +14,11 @@ import { persist } from "zustand/middleware";
 // 一期 dev 阶段先用内存态 + persist（dev 期 web 模式无 Tauri），Tauri 集成后切 store。
 // TODO: 接入 @tauri-store/zustand 替换 persist（见 ARCHITECTURE.md §18）
 
+import {
+  DEFAULT_ONTOLOGY_IRI_PREFIX,
+  normalizeOntologyIriPrefix,
+} from "@/lib/ontology-iri";
+
 export type Theme = "light" | "dark" | "system";
 
 // 左侧导航栏（NavRail）当前激活的功能视图。
@@ -41,6 +46,10 @@ interface UiState {
     modelSettingsOpen: boolean;
     // MCP 工具服务器弹窗（设置重构 ③：与模型设置同形态，⌘⇧M / NavRail 左下角菜单）
     mcpSettingsOpen: boolean;
+    // 本体设置弹窗（W3C IRI 前缀等）
+    ontologySettingsOpen: boolean;
+    /** W3C 新建本体 IRI 前缀（业务只填编码，系统拼 `{前缀}{编码}#`）。 */
+    ontologyIriPrefix: string;
     // Library 上传时的目标文件夹（临时态，不持久化）。
     // LibraryView 选中文件夹时同步写入；FileDropZone 上传时读取。
     // null = 根目录散文件。会话页上传时忽略此值（仍落 /Inbox）。
@@ -56,6 +65,8 @@ interface UiState {
     setCommandPaletteOpen: (open: boolean) => void;
     setModelSettingsOpen: (open: boolean) => void;
     setMcpSettingsOpen: (open: boolean) => void;
+    setOntologySettingsOpen: (open: boolean) => void;
+    setOntologyIriPrefix: (prefix: string) => void;
     setLibraryUploadFolder: (folder: string | null) => void;
     setLibraryViewActive: (active: boolean) => void;
 }
@@ -72,6 +83,8 @@ export const useUiStore = create<UiState>()(
             commandPaletteOpen: false,
             modelSettingsOpen: false,
             mcpSettingsOpen: false,
+            ontologySettingsOpen: false,
+            ontologyIriPrefix: DEFAULT_ONTOLOGY_IRI_PREFIX,
             libraryUploadFolder: null,
             libraryViewActive: false,
 
@@ -88,6 +101,12 @@ export const useUiStore = create<UiState>()(
                 set({ commandPaletteOpen }),
             setModelSettingsOpen: (modelSettingsOpen) => set({ modelSettingsOpen }),
             setMcpSettingsOpen: (mcpSettingsOpen) => set({ mcpSettingsOpen }),
+            setOntologySettingsOpen: (ontologySettingsOpen) =>
+                set({ ontologySettingsOpen }),
+            setOntologyIriPrefix: (prefix) =>
+                set({
+                    ontologyIriPrefix: normalizeOntologyIriPrefix(prefix),
+                }),
             setLibraryUploadFolder: (libraryUploadFolder) =>
                 set({ libraryUploadFolder }),
             setLibraryViewActive: (libraryViewActive) =>
@@ -100,6 +119,7 @@ export const useUiStore = create<UiState>()(
                 theme: s.theme,
                 sidebarCollapsed: s.sidebarCollapsed,
                 navRailExpanded: s.navRailExpanded,
+                ontologyIriPrefix: s.ontologyIriPrefix,
             }),
         },
     ),

@@ -13,11 +13,10 @@ import type {
   BReviewOutput,
   AReviseResult,
   TtlValidation,
-  AutoDisputeItem,
 } from "@/lib/ipc/bindings";
 
 // 类型转发（§12.1：components 不得直接 import bindings，经 hooks 层取类型）
-export type { ValidationIssue, ValidationReview, BReviewOutput, AReviseResult, TtlValidation, AutoDisputeItem };
+export type { ValidationIssue, ValidationReview, BReviewOutput, AReviseResult, TtlValidation };
 
 const QK_ISSUES = (iri: string) => ["validation-issues", iri] as const;
 const QK_REVIEW = (iri: string) => ["validation-review", iri] as const;
@@ -92,30 +91,6 @@ export function useCoverageMatrix(
     queryKey: QK_COVERAGE(ontologyIri ?? ""),
     queryFn: () => ipc.coverageMatrix(ontologyIri!, diffEntities),
     enabled: !!ontologyIri && enabled,
-  });
-}
-
-/** A 对 warning issue 发起答辩（②b 子阶段）。 */
-export function useDisputeIssue() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: ({
-      issueId,
-      argument,
-      counterSourceId,
-      counterQuote,
-    }: {
-      issueId: string;
-      argument: string;
-      counterSourceId: string;
-      counterQuote: string;
-    }): Promise<string> =>
-      ipc.disputeIssue(issueId, argument, counterSourceId, counterQuote),
-    onSuccess: (_data, vars) => {
-      // 答辩后 issue 状态变化，刷新列表
-      qc.invalidateQueries({ queryKey: ["validation-issues"] });
-      void vars;
-    },
   });
 }
 
@@ -246,74 +221,6 @@ export function useBRecheck() {
   });
 }
 
-/** B 自动裁决答辩（LLM）：overruled/accepted 落库；uncertain 保持 disputed 升级人工。 */
-export function useResolveDisputeLlm() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: ({
-      ontologyIri: _ontologyIri,
-      issueId,
-      modelB,
-    }: {
-      ontologyIri: string;
-      issueId: string;
-      modelB: string;
-    }): Promise<string> => ipc.resolveDisputeLlm(issueId, modelB),
-    onSuccess: (_data, vars) => {
-      void qc.invalidateQueries({ queryKey: QK_ISSUES(vars.ontologyIri) });
-    },
-  });
-}
-
-/** A 自动答辩（§2.1.5）：后端 spawn 跑「A 决策→机械匹配→B 裁决」，立即返回。
- *  前端靠 useAutoDisputeResult 轮询（running=true 时 2s）恢复进度——切窗不丢状态。
- *  后端完成后写 running=false + 最终 items，并 issue 状态已逐条落库。 */
-export function useRunAutoDispute() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (ontologyIri: string): Promise<AutoDisputeItem[]> =>
-      ipc.runAutoDispute(ontologyIri),
-    onSuccess: (_data, ontologyIri) => {
-      // 触发 getAutoDisputeResult 重查 → running=true 启动轮询
-      void qc.invalidateQueries({ queryKey: ["auto-dispute-result", ontologyIri] });
-    },
-  });
-}
-
-/** 自动答辩状态（后端缓存，含 running 标志 + 逐条结果）——切页/切窗回来回显，
- *  不依赖组件存活。后端任务进行中（running=true）时 2s 轮询刷新逐条进度。 */
-export function useAutoDisputeResult(ontologyIri: string | null) {
-  const q = useQuery({
-    queryKey: ["auto-dispute-result", ontologyIri],
-    queryFn: () => ipc.getAutoDisputeResult(ontologyIri ?? ""),
-    enabled: !!ontologyIri,
-    refetchInterval: (query) => (query.state.data?.running ? 2000 : false),
-  });
-  return q;
-}
-
-/** 答辩提交 + B 自动机器裁决（一步到位）。裁决在 Rust 侧落库——提交后切窗/
- *  切页不影响结果；回来按 issue 状态回显。verdict: overruled/accepted/uncertain。 */
-export function useDisputeAndJudge() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (v: {
-      ontologyIri: string;
-      issueId: string;
-      argument: string;
-      counterSourceId: string;
-      counterQuote: string;
-      modelB: string;
-    }): Promise<string> => {
-      void v.ontologyIri; // 仅用于 onSuccess 的 queryKey
-      return ipc.disputeAndJudge(v.issueId, v.argument, v.counterSourceId, v.counterQuote, v.modelB);
-    },
-    onSuccess: (_data, vars) => {
-      void qc.invalidateQueries({ queryKey: QK_ISSUES(vars.ontologyIri) });
-    },
-  });
-}
-
 /** 转人工仲裁。 */
 export function useEscalateReview() {
   const qc = useQueryClient();
@@ -400,8 +307,16 @@ export function useRunAReviseLlm() {
 /** 运行 B 复核（LLM 编排）。 */
 export function useRunBRecheckLlm() {
   return useMutation({
-    mutationFn: ({ modelB, aRevision }: { modelB: string; aRevision: string }): Promise<string> =>
-      ipc.runBRecheckLlm(modelB, aRevision),
+    mutationFn: ({
+      modelB,
+      aRevision,
+      baselineSuggestions,
+    }: {
+      modelB: string;
+      aRevision: string;
+      baselineSuggestions: string;
+    }): Promise<string> =>
+      ipc.runBRecheckLlm(modelB, aRevision, baselineSuggestions),
   });
 }
 
@@ -416,4 +331,14 @@ export function layerLabel(layer: string | null | undefined): string {
   };
   if (!layer) return "";
   return map[layer] ?? layer;
+}
+
+/** 轮次清单（合并方案 v0.8）：按轮次返回该评审的 issue 快照 + 统计，
+ *  前端「轮次清单」可查看每轮 发现/已修改/异议/裁决。 */
+export function useReviewRounds(reviewId: string | null) {
+  return useQuery({
+    queryKey: ["review-rounds", reviewId],
+    queryFn: () => ipc.listReviewRounds(reviewId ?? ""),
+    enabled: !!reviewId,
+  });
 }

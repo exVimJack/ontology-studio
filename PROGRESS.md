@@ -1,7 +1,7 @@
 # 开发进展
 
 > 本文件记录 onto-studio 的开发进展，按阶段组织。以 `ARCHITECTURE.md` 的落地路线为准。
-> 最后更新：2026-10-10
+> 最后更新：2026-11-12
 
 ---
 
@@ -17,6 +17,40 @@
 - **MCP/工具**：`DynamicTool::new` 回调去 ToolContext 参（33 处），`add_dynamic_tool` 同步化，`get_tool_defs`→`tool_defs`（src-tauri）
 - **provider 构造**：OpenAI 形 vendor 收敛为 `OpenAIConfig::with_key(dialect,…)` + `.responses()/.chat()` 双路由；超时/headers 走自定义 reqwest → `ReqwestClient::from()` 传输注入
 - 全绿：workspace + src-tauri cargo check/test 通过；ADR（ARCHITECTURE.md 决策 1/14/16）与 AGENTS.md 决策表已同步
+
+---
+
+## 元素映射绑定层 — ✅ 落地（2026-11，决策 25）
+
+> 本体建模之后的第二跳：让每个类/属性/关系都能落回原始表的字段，把 schema 和数据实例接上。
+> 两套标准（Palantir / W3C）共用同一张表、同一套 IPC、同一套前端组件。
+
+### 后端
+
+- **存储**：新增 `element_mapping` 表（`crates/ontology-store/src/mapping.rs`），`standard ∈ {palantir, w3c}` + `ontology_key` + `element_type` + `element_id` + 8 段物理位置（source/target × catalog/schema/table/column）做复合唯一键。同元素可挂多列；整组替换语义（保存时未出现的旧行删除）。
+- **核对状态由系统判定**：`mapping_verify::verify_mapping` 比对物理结构快照得出 `verified`，调用方无法声明。有快照未命中 → 未核对 + 聚合告警；无快照 → 保留旧状态（新行默认未核对）。
+- **校验**：`preview_import` 的 P3 升级为全类型聚合告警（不再只对 VIRTUAL、不再靠裸字符串包含），且 warn_only——映射缺失/未核对**不阻断**导入（用户口径：明确的就写，抽象的就不写）。
+- **双向同步**：新表是真相源，`properties.backing_*` 降级为 payload 契约载体。双写只在 Palantir（`save_element_mappings` → `sync_property_backing`）；W3C 只写新表、不碰 `.ttl`。导入路径新增 `backfill_palantir_payload_mappings`（payload 带 `backing_mapping` 时补齐**该元素尚无任何映射**的情形，不覆盖已有多列绑定）；存量库用 `backfill_mappings_from_properties`（映射集合为空才执行，幂等）。
+- **建议纯确定性**：名称归一 + 类型兼容 + 同表先验打分，候选值必来自快照里真实存在的列；不走 LLM、不落库。
+- **导出**：`mapping_csv(standard, key, scope)` 扁平 CSV，`All`/`Gap` 共用渲染器；UTF-8 BOM + CRLF + RFC 4180 转义；关系行写连接条件，单端标不完整。界面只保留单一「导出映射」入口（固定 `All`）：一次导出全部类/属性/关系，未映射元素同样出行、物理来源字段留空。
+- **Agent 工具**（`crates/agent-core/src/mapping_tools.rs`，4 个）：`suggest_element_mappings` / `save_element_mappings` / `list_element_mappings` / `export_element_mapping`，每次调用现取快照（`Arc<dyn Fn() -> PhysicalSchemaSnapshot>`），已挂进 `stream_with_memory` 的工具装配。
+- **读视图**：`describe_object_type` 对已映射属性附 `backing`，未映射属性该键不出现（不产出空对象）。
+
+### 前端
+
+- **IPC**：`src-tauri/src/commands/mapping.rs` 11 个命令（列表/按元素列表/元素全集/覆盖率/完整性/保存/删除/清理孤儿/建议/导出/回填），已进 `command_names!`；`src/lib/ipc/commands.ts` 全部 `unwrap` 包装。
+- **数据层**：`src/hooks/useElementMapping.ts`（TanStack Query，缓存根键 `(standard, ontologyKey)`，变更后整根 invalidate）。
+- **展示层**：`src/lib/mapping-display.ts` 纯函数（三态视觉、定位串、覆盖率文案、缺口过滤、导出文件名/前置检查）+ 21 条 Vitest 单测。
+- **组件**：`src/components/ontology/ElementMappingPanel.tsx`（状态徽标、来源字段列、映射编辑器、覆盖率卡、完整性清单、缺口清单、单一导出按钮），两套标准共用。
+- **W3C 侧**（`OntologyTtlView.tsx`）：「来源字段」Tab（覆盖率 + 缺口清单 + 导出）、属性表「来源字段」列 + 三态点、属性查看/编辑卡的「数据来源」分区、类卡的「来源表」分区、「只看未映射」筛选。
+- **Palantir 侧**（`OntologyView.tsx`）：「来源字段」Tab、属性表「来源字段」列、对象类型卡「来源表」分区、关系行两端定位、属性/关系编辑弹层的「数据来源」分区、概览覆盖率卡（点击下钻缺口清单）。
+
+### 验证
+
+- `cargo test -p ontology-store --test test_element_mapping`：29 条全绿（存储/校验/覆盖率/完整性/导出/回填/双写/两端隔离）
+- `cargo test -p agent-core`：工具组单测全绿
+- `pnpm test`：`mapping-display` 21 条全绿
+- `tsc --noEmit` + `cargo check --manifest-path src-tauri/Cargo.toml`：零错误
 
 ---
 

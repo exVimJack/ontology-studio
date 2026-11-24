@@ -122,8 +122,9 @@ export function ArbitrationPanel({ ontologyIri, onResolved }: Props) {
   const pending: ValidationIssue[] = (issues.data ?? []).filter(
     (i: ValidationIssue) => i.status === "disputed",
   );
-  // escalated review 的 B 复核原始输出（评审升级项的补充上下文）
-  const bVerdict = reviewQ.data?.status === "escalated" ? reviewQ.data.b_verdict : "";
+  // B 复核原始输出（评审升级项的补充上下文）。路线 B 下"评审收敛 ≠ 分歧清零"：
+  // resolved 也可能带未决 disputed 条目，故不再限定 escalated——非空即取用。
+  const bVerdict = reviewQ.data?.b_verdict ?? "";
   const selected: ValidationIssue | null =
     pending.find((i: ValidationIssue) => i.id === selectedId) ?? pending[0] ?? null;
 
@@ -181,6 +182,7 @@ export function ArbitrationPanel({ ontologyIri, onResolved }: Props) {
     : postArbState.data?.elapsed_ms ?? 0;
   const reviseMsg = postArbState.data?.msg ?? "";
   const reviseKind = postArbState.data?.kind ?? "";
+  const reviseNotes = postArbState.data?.revise_notes ?? "";
 
   const runPostArbitrationRevise = () => {
     if (!ontologyIri) return;
@@ -225,6 +227,106 @@ export function ArbitrationPanel({ ontologyIri, onResolved }: Props) {
           <p className={`mb-2 text-xs ${reviseKind === "ok" ? "text-green-600" : "text-red-600"}`}>
             {reviseMsg}（⏱ {Math.floor(elapsedMs / 60000)} 分 {Math.round((elapsedMs % 60000) / 1000)} 秒）
           </p>
+        )}
+        {/* 交 A 修订后的结果：修订说明（A 改了什么）+ 变更记录位置提示 */}
+        {reviseKind === "ok" && reviseNotes && (
+          <details className={own.arbVerdictFold} open>
+            <summary>本次 A 修订说明（A 改了什么）</summary>
+            <pre className={own.arbVerdictPre}>{reviseNotes}</pre>
+          </details>
+        )}
+        {reviseKind === "ok" && (
+          <p className="mb-2 text-[11px] text-fg-subtle">
+            修订稿已落盘；修订记录已写入本体工作台「历史」Tab 的变更日志（标题「仲裁后 A 修订落盘」），可在那里查看。
+          </p>
+        )}
+        {/* 已裁决清单：点击展开裁决详情（verdict / 裁决者 / A 辩护理由 / 反证） */}
+        {adjudicated.length > 0 && (
+          <details className={own.arbVerdictFold} open={pending.length === 0}>
+            <summary className="cursor-pointer select-none py-1 text-xs font-medium" style={{ color: "var(--fg)" }}>
+              已裁决（{adjudicated.length}）——点击条目查看裁决内容
+            </summary>
+            <div className="mt-1 space-y-1">
+              {adjudicated.map((issue: ValidationIssue) => (
+                <details key={issue.id} className="rounded border border-border px-2 py-1">
+                  <summary className="cursor-pointer select-none text-xs">
+                    <span
+                      className={
+                        issue.status === "overruled" ? "text-green-600" : "text-red-600"
+                      }
+                    >
+                      {issue.status === "overruled" ? "采纳 A" : "采纳 B"}
+                    </span>
+                    <span className="ml-1 text-[10px] text-fg-subtle">
+                      {issue.status === "overruled" ? "（B 意见不成立·不用改）" : "（A 按 B 意见修改）"}
+                    </span>
+                    <span className="ml-1 text-fg-subtle">
+                      {issue.source === "review" ? "评审" : "答辩"}·
+                      {issue.id.split(":").slice(-1)[0]}
+                      {issue.dispute?.resolved_by === "human" ? " · 人工裁决" : " · 校验者 B 裁决"}
+                    </span>
+                    <span className="ml-1 truncate">{issue.message}</span>
+                  </summary>
+                  <div className="mt-1 space-y-1 pl-2 text-[11px] text-fg-subtle">
+                    {/* B（校验者）的意见 */}
+                    <div>
+                      <b>B（校验者）的意见：</b>
+                      {issue.message}
+                    </div>
+                    {issue.evidence?.quote && (
+                      <div>
+                        <b>B 引用证据：</b>
+                        <span className="font-mono">「{issue.evidence.quote}」</span>
+                        {issue.evidence.source_id && (
+                          <span className="ml-1">（{issue.evidence.source_id}）</span>
+                        )}
+                      </div>
+                    )}
+                    {issue.principle?.ref_ && (
+                      <div>
+                        <b>B 原则出处：</b>
+                        {issue.principle.source && `${issue.principle.source} · `}
+                        {issue.principle.ref_}
+                      </div>
+                    )}
+                    {issue.suggestion && (
+                      <div>
+                        <b>B 的修订建议：</b>
+                        {issue.suggestion}
+                      </div>
+                    )}
+                    {/* A（建模者）的意见 */}
+                    {issue.dispute?.argument && (
+                      <div>
+                        <b>A（建模者）的意见（辩护）：</b>
+                        {issue.dispute.argument}
+                      </div>
+                    )}
+                    {issue.dispute?.counter_evidence?.quote && (
+                      <div>
+                        <b>A 的反证：</b>
+                        <span className="font-mono">
+                          「{issue.dispute.counter_evidence.quote}」
+                        </span>
+                        {issue.dispute.counter_evidence.source_id && (
+                          <span className="ml-1">
+                            （{issue.dispute.counter_evidence.source_id}）
+                          </span>
+                        )}
+                      </div>
+                    )}
+                    {issue.a_action && (
+                      <div>
+                        <b>A 的处置：</b>
+                        {issue.a_action.action === "accepted" ? "接受（已修改）" : "拒绝"}
+                        {issue.a_action.reason && `——${issue.a_action.reason}`}
+                      </div>
+                    )}
+                  </div>
+                </details>
+              ))}
+            </div>
+          </details>
         )}
         {/* 左：仲裁队列 */}
         <div className={own.arbQueue}>

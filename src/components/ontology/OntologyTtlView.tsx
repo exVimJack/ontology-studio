@@ -31,6 +31,7 @@ import {
   Loader2,
   Table2,
   GitBranch,
+  GitCommitHorizontal,
   Terminal,
   FileCode2,
   Download,
@@ -51,16 +52,53 @@ import {
   ChevronRight,
   Sparkles,
   Check,
+  Database,
+  Copy,
 } from "lucide-react";
 import { ConceptGraph } from "@/components/ontology/ConceptGraph";
+import {
+  ElementMappingEditor,
+  MappingCoverageCard,
+  MappingExportButton,
+  MappingGapPanel,
+  MappingStateBadge,
+  SourceFieldCell,
+  useMappingRowsByElement,
+} from "@/components/ontology/ElementMappingPanel";
+import { endpointLocator, mappingStateOf } from "@/lib/mapping-display";
+import {
+  groupByDomain,
+  splitTtlProperties,
+} from "@/lib/ttl-property-filter";
+import { useMappingCoverage } from "@/hooks/useElementMapping";
 import { CreateOntologyWizard } from "@/components/ontology/CreateOntologyWizard";
+import { OntologyVersionsPanel, DiffView } from "@/components/ontology/OntologyVersionsPanel";
+import { PublishOntologyVersionDialog } from "@/components/ontology/PublishOntologyVersionDialog";
 import { rowsToGraphData } from "@/lib/ontology-graph";
+import {
+  applyEffectiveDiffToGraph,
+  countEffectiveDiff,
+  diffHasEntries,
+  filterDiffRelatedTo,
+  type GraphDiffFocus,
+} from "@/lib/ontology-effective-diff";
+import {
+  collectClassStrongDeps,
+  describeClassCascadeOutcome,
+  isLeafRestoreBlockedByDeletedClass,
+  summarizeClassStrongDeps,
+  toWorkspaceRevokeItem,
+} from "@/lib/ontology-diff-display";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { saveTextFile } from "@/lib/save-file";
 import {
   useOntologyTtls,
   useOntologyTtlContent,
+  useOntologyActiveRevision,
+  useOntologyWorkspaceDirty,
+  useOntologyVersionDiff,
   useValidateOntologyTtl,
+  useExportOntologyTtl,
   useImportOntologyTtl,
   useDeleteOntologyTtl,
   useQueryOntologySparql,
@@ -76,6 +114,8 @@ import {
   useEditOntologyTtlProperty,
   useAddOntologyTtlProperty,
   useDeleteOntologyTtlProperty,
+  useRevokeOntologyWorkspaceDiffItem,
+  useRevokeOntologyWorkspaceClassCascade,
   useTtlElementEvidence,
 } from "@/hooks/useOntologyTtl";
 import {
@@ -92,6 +132,7 @@ import {
   type CharterSuggestion,
 } from "@/lib/charter-suggest";
 import type {
+  ElementMapping,
   TtlOntologySummary,
   TtlValidation,
   TtlCharter,
@@ -129,6 +170,7 @@ const SPARQL_TEMPLATES: { label: string; sparql: string }[] = [
 export interface OntologyTtlViewHandle {
   refetch: () => void;
   openImport: () => void;
+  openCreate: () => void;
 }
 
 export const OntologyTtlView = forwardRef<OntologyTtlViewHandle>(
@@ -173,6 +215,7 @@ export const OntologyTtlView = forwardRef<OntologyTtlViewHandle>(
     useImperativeHandle(ref, () => ({
       refetch,
       openImport: () => setShowImport(true),
+      openCreate: () => setShowCreate(true),
     }));
 
     return (
@@ -186,27 +229,20 @@ export const OntologyTtlView = forwardRef<OntologyTtlViewHandle>(
             setSelectedIri(iri);
           }}
         />
-        <div className="flex h-full flex-col">
+        <div className="flex h-full min-h-0 flex-1 flex-col">
           <div className="flex min-h-0 flex-1">
             {/* 左栏：本体列表 */}
             <div
-              className={`flex flex-col border-r border-border ${
+              className={`flex min-h-0 flex-col border-r border-border ${
                 isMobile ? (mobileShowDetail ? "hidden" : "w-full") : "w-72"
               }`}
             >
               {isMobile && mobileShowDetail ? null : (
                 <>
-                  <div className="flex items-center justify-between px-3 py-2">
+                  <div className="px-3 py-2">
                     <span className="text-xs font-medium uppercase tracking-wide text-fg-subtle">
                       本体（W3C）
                     </span>
-                    <button
-                      onClick={() => setShowCreate(true)}
-                      className="flex items-center gap-1 rounded-md bg-accent/10 px-1.5 py-0.5 text-[11px] font-medium text-accent hover:bg-accent/20"
-                      title="先完成设计宪章，再创建本体（AI 建模以宪章为前提）"
-                    >
-                      <Plus size={12} /> 新建本体
-                    </button>
                   </div>
                   <div className="flex-1 overflow-y-auto px-1">
                     {isLoading ? (
@@ -256,7 +292,7 @@ export const OntologyTtlView = forwardRef<OntologyTtlViewHandle>(
 
             {/* 中栏：详情 */}
             <div
-              className={`flex min-w-0 flex-1 flex-col ${
+              className={`flex min-h-0 min-w-0 flex-1 flex-col ${
                 isMobile && !mobileShowDetail ? "hidden" : "flex"
               }`}
             >
@@ -354,9 +390,11 @@ type DetailTab =
   | "hierarchy"
   | "rules"
   | "properties"
+  | "mapping"
   | "source"
   | "sparql"
   | "charter"
+  | "version"
   | "history";
 
 function TtlDetail({
@@ -375,6 +413,10 @@ function TtlDetail({
   onDelete: () => void;
 }) {
   const { data: content } = useOntologyTtlContent(iri);
+  const { data: activeRev } = useOntologyActiveRevision(iri);
+  const { data: workspaceDirty } = useOntologyWorkspaceDirty(iri);
+  const exportTtl = useExportOntologyTtl();
+  const canExport = activeRev != null;
   const [tab, setTab] = useState<DetailTab>("overview");
   // 图谱→Turtle 联动：要聚焦的源码行号（1-based）
   const [sourceFocusLine, setSourceFocusLine] = useState<number | null>(null);
@@ -392,18 +434,22 @@ function TtlDetail({
   }, [tab]);
 
   async function handleExport() {
-    if (!content) return;
+    if (!canExport) {
+      await message("请先发布版本后再导出", { kind: "warning" });
+      return;
+    }
     try {
-      const saved = await saveTextFile(content, `${shortIri(iri)}.ttl`, [
+      // 消费面：导出生效快照（不含未发布修改）
+const ttl = await exportTtl.mutateAsync(iri);
+      const saved = await saveTextFile(ttl, `${shortIri(iri)}.ttl`, [
         { name: "Turtle", extensions: ["ttl"] },
       ]);
       if (saved) {
         // 导出成功，暂略 toast
       }
     } catch (e) {
-      await message(`导出失败：${e instanceof Error ? e.message : String(e)}`, {
-        kind: "error",
-      });
+      console.error("export ontology ttl", e);
+      await message("请先发布版本后再导出", { kind: "error" });
     }
   }
 
@@ -438,13 +484,15 @@ function TtlDetail({
     { key: "hierarchy", label: "类层级", icon: GitBranch },
     { key: "rules", label: "规则", icon: Workflow },
     { key: "properties", label: "属性", icon: Tags },
+    { key: "mapping", label: "来源字段", icon: Database },
     { key: "source", label: "Turtle", icon: FileCode2 },
     { key: "sparql", label: "SPARQL", icon: Terminal },
+    { key: "version", label: "版本", icon: GitCommitHorizontal },
     { key: "history", label: "历史", icon: GitBranch },
   ];
 
   return (
-    <div className="flex h-full flex-col overflow-hidden">
+    <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
       {/* 头部 */}
       <div className="shrink-0 border-b border-border px-4 py-3">
         <div className="flex items-start justify-between gap-3">
@@ -454,8 +502,15 @@ function TtlDetail({
           <div className="flex shrink-0 items-center gap-1">
             <button
               onClick={handleExport}
-              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-fg-subtle hover:bg-bg-hover hover:text-accent"
-              title="导出为 .ttl 文件"
+              disabled={!canExport}
+              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-fg-subtle hover:bg-bg-hover hover:text-accent disabled:cursor-not-allowed disabled:opacity-40"
+              title={
+                !canExport
+                  ? "请先发布版本后再导出"
+                  : workspaceDirty
+                    ? "导出生效已发布版本（不含未发布修改）"
+                    : "导出为 .ttl 文件"
+              }
             >
               <Download size={12} />
               导出
@@ -488,7 +543,7 @@ function TtlDetail({
             <span>更新于 {new Date(updatedAt).toLocaleString()}</span>
           )}
         </div>
-        {/* 本体设计宪章（不变点）：业务场景 / 业务本质（设计意图/补充说明不对业务呈现）。
+        {/* 本体设计宪章（不变点）：业务场景 / 业务目标（设计意图/补充说明不对业务呈现）。
                     已移入「概览」Tab 展示，让头部区更高可容纳更多 Tab 内容 */}
       </div>
 
@@ -510,10 +565,13 @@ function TtlDetail({
         ))}
       </div>
 
-      {/* Tab 内容：已访问的 Tab 保持挂载（CSS 隐藏），切回无需重建 */}
-      <div className="min-h-0 flex-1 overflow-hidden">
+      {/* Tab 内容：已访问的 Tab 保持挂载（CSS 隐藏），切回无需重建。
+          外层 flex-col，活动页用 flex-1（勿只靠 h-full，父高未定时会塌缩） */}
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {visited.has("overview") && (
-          <div className={`h-full ${tab === "overview" ? "" : "hidden"}`}>
+          <div
+            className={`min-h-0 flex-1 overflow-hidden ${tab === "overview" ? "" : "hidden"}`}
+          >
             <OverviewPanel
               iri={iri}
               tripleCount={tripleCount}
@@ -523,37 +581,65 @@ function TtlDetail({
           </div>
         )}
         {visited.has("graph") && (
-          <div className={`h-full ${tab === "graph" ? "" : "hidden"}`}>
+          <div
+            className={`flex min-h-0 flex-1 flex-col ${tab === "graph" ? "" : "hidden"}`}
+          >
             <GraphPanel iri={iri} onJumpToSource={handleJumpToSource} />
           </div>
         )}
         {visited.has("hierarchy") && (
-          <div className={`h-full ${tab === "hierarchy" ? "" : "hidden"}`}>
+          <div
+            className={`min-h-0 flex-1 overflow-hidden ${tab === "hierarchy" ? "" : "hidden"}`}
+          >
             <HierarchyPanel iri={iri} />
           </div>
         )}
         {visited.has("rules") && (
-          <div className={`h-full ${tab === "rules" ? "" : "hidden"}`}>
+          <div
+            className={`min-h-0 flex-1 overflow-hidden ${tab === "rules" ? "" : "hidden"}`}
+          >
             <RulesPanel iri={iri} />
           </div>
         )}
         {visited.has("properties") && (
-          <div className={`h-full ${tab === "properties" ? "" : "hidden"}`}>
+          <div
+            className={`min-h-0 flex-1 overflow-hidden ${tab === "properties" ? "" : "hidden"}`}
+          >
             <PropertiesPanel iri={iri} />
           </div>
         )}
+        {visited.has("mapping") && (
+          <div
+            className={`min-h-0 flex-1 overflow-auto ${tab === "mapping" ? "" : "hidden"}`}
+          >
+            <MappingTab iri={iri} />
+          </div>
+        )}
         {visited.has("source") && (
-          <div className={`h-full ${tab === "source" ? "" : "hidden"}`}>
+          <div
+            className={`min-h-0 flex-1 overflow-hidden ${tab === "source" ? "" : "hidden"}`}
+          >
             <SourcePanel content={content} focusLine={sourceFocusLine} />
           </div>
         )}
         {visited.has("sparql") && (
-          <div className={`h-full ${tab === "sparql" ? "" : "hidden"}`}>
+          <div
+            className={`min-h-0 flex-1 overflow-hidden ${tab === "sparql" ? "" : "hidden"}`}
+          >
             <SparqlPanel iri={iri} />
           </div>
         )}
+        {visited.has("version") && (
+          <div
+            className={`min-h-0 flex-1 overflow-hidden ${tab === "version" ? "" : "hidden"}`}
+          >
+            <OntologyVersionsPanel ontologyIri={iri} />
+          </div>
+        )}
         {visited.has("history") && (
-          <div className={`h-full ${tab === "history" ? "" : "hidden"}`}>
+          <div
+            className={`min-h-0 flex-1 overflow-hidden ${tab === "history" ? "" : "hidden"}`}
+          >
             <HistoryPanel iri={iri} />
           </div>
         )}
@@ -563,6 +649,31 @@ function TtlDetail({
 }
 
 // ── 概览面板 ──
+// ── 来源字段页（决策 25：映射绑定层）──
+// 概念定义与物理来源分离：本页只处理「本体元素 ↔ 数据源表字段」的绑定，
+// 不修改任何 TTL 概念三元组（映射保存在独立的绑定层里）。
+function MappingTab({ iri }: { iri: string }) {
+  const { data: coverage } = useMappingCoverage("w3c", iri);
+  return (
+    <div className="space-y-3 p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border px-3 py-2">
+        <div>
+          <div className="text-xs font-medium text-fg-muted">来源字段绑定</div>
+          <p className="mt-0.5 text-[10px] text-fg-subtle">
+            指定类与属性来自数据源的哪些表和字段；不改变概念本身
+          </p>
+        </div>
+        <MappingExportButton
+          standard="w3c"
+          ontologyKey={iri}
+          coverage={coverage}
+        />
+      </div>
+      <MappingGapPanel standard="w3c" ontologyKey={iri} />
+    </div>
+  );
+}
+
 function OverviewPanel({
   iri,
   tripleCount,
@@ -574,6 +685,7 @@ function OverviewPanel({
   content?: string;
   onJump: (tab: DetailTab) => void;
 }) {
+  const coverage = useMappingCoverage("w3c", iri);
   const stats = [
     {
       key: "graph" as DetailTab,
@@ -618,6 +730,13 @@ function OverviewPanel({
           </button>
         ))}
       </div>
+      {/* 来源字段覆盖率（点击下钻到来源字段页） */}
+      <div className="mt-3">
+        <MappingCoverageCard
+          coverage={coverage.data}
+          onDrilldown={() => onJump("mapping")}
+        />
+      </div>
       {/* 设计宪章：移入概览页，冷启动基线 */}
       <div className="mt-4">
         <CharterPanel iri={iri} />
@@ -629,7 +748,7 @@ function OverviewPanel({
 // ── 核心概念图谱（G6 v5 力导向/层级/径向多布局）──
 // 节点：owl:Class（圆）+ owl:DatatypeProperty（琥珀色方，domain 类挂属性）。
 // 边：rdfs:subClassOf（实线箭头）+ ObjectProperty（虚线带标签）+ DatatypeProperty（琥珀虚线）。
-// 布局：dagre 层级布局，可切换 6 种布局算法。
+// 脏且有生效版时默认叠加「相对生效」着色与幽灵删除。
 function GraphPanel({
   iri,
   onJumpToSource,
@@ -637,7 +756,6 @@ function GraphPanel({
   iri: string;
   onJumpToSource: (termIri: string) => void;
 }) {
-  // 查询所有类 + subClassOf + ObjectProperty domain→range
   const sparql = useMemo(
     () =>
       "SELECT ?s ?p ?o ?type WHERE { " +
@@ -650,15 +768,52 @@ function GraphPanel({
   );
   const { data, isPending, error } = useSparqlQuery(iri, sparql);
   const { data: labelMap } = useTtlLabelMap(iri);
+  const { data: activeRev } = useOntologyActiveRevision(iri);
+  const { data: dirty } = useOntologyWorkspaceDirty(iri);
+  const showDiff = !!dirty && activeRev != null;
+  const diffQ = useOntologyVersionDiff(
+    showDiff ? iri : null,
+    showDiff ? activeRev : null,
+    showDiff ? 0 : null,
+  );
+  const [listOpen, setListOpen] = useState(false);
+  const [listFilter, setListFilter] = useState<"all" | "added" | "modified" | "removed">("all");
+  const [listFocus, setListFocus] = useState<GraphDiffFocus | null>(null);
+  const [publishOpen, setPublishOpen] = useState(false);
+  const anchorClassLabel =
+    listFocus?.kind === "class"
+      ? labelMap?.get(listFocus.iri) ||
+        listFocus.iri.split(/[#/]/).pop() ||
+        listFocus.iri
+      : null;
 
-  const { nodes, edges } = useMemo(
+  const base = useMemo(
     () => rowsToGraphData(data ?? [], labelMap),
     [data, labelMap],
   );
 
+  const { nodes, edges } = useMemo(() => {
+    if (!showDiff || !diffQ.data) return base;
+    // 删除项以幽灵保留在图上；清单侧也会列出，不再提供「隐藏幽灵」开关
+    return applyEffectiveDiffToGraph(base.nodes, base.edges, diffQ.data);
+  }, [base, showDiff, diffQ.data]);
+
+  const counts = countEffectiveDiff(showDiff ? diffQ.data : null);
+
+  // 有选中且与所选无关时整段隐藏（含「变更清单」标题），避免「rev N vs 0：无差异」
+  const focusedDiff =
+    showDiff && diffQ.data
+      ? filterDiffRelatedTo(diffQ.data, listFocus)
+      : null;
+  const showChangeList =
+    listOpen &&
+    showDiff &&
+    !!diffQ.data &&
+    (!listFocus || diffHasEntries(focusedDiff));
+
   if (isPending) {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-3">
+      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3">
         <div className="graph-spinner" />
         <p className="text-[11px] text-fg-subtle/70">正在加载图谱…</p>
       </div>
@@ -666,7 +821,7 @@ function GraphPanel({
   }
   if (error) {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-2 p-4 text-center">
+      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 p-4 text-center">
         <AlertTriangle size={20} className="text-warning" />
         <p className="text-sm text-danger">图谱加载失败</p>
         <p className="text-[11px] text-fg-subtle">{error.message}</p>
@@ -676,9 +831,9 @@ function GraphPanel({
       </div>
     );
   }
-  if (nodes.length === 0) {
+  if (nodes.length === 0 && !showDiff) {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
+      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-center">
         <Network size={20} className="text-fg-subtle" />
         <p className="text-sm text-fg-subtle">
           本体无 owl:Class 定义，无可绘制的关系图。
@@ -689,14 +844,240 @@ function GraphPanel({
       </div>
     );
   }
+
   return (
-    <ConceptGraph
-      nodes={nodes}
-      edges={edges}
-      storageKey={iri}
-      onJumpToSource={onJumpToSource}
-      className="h-full"
-    />
+    <div className="relative flex min-h-0 flex-1 flex-col">
+      {showDiff && (
+        <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-3 py-1.5 text-[11px] text-fg-subtle">
+          <span className="font-medium text-fg">相对生效</span>
+          <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300">
+            +{counts.added}
+          </span>
+          <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-amber-800 dark:text-amber-200">
+            ~{counts.modified}
+          </span>
+          <span className="rounded bg-red-500/15 px-1.5 py-0.5 text-red-700 dark:text-red-300">
+            −{counts.removed}
+          </span>
+          {(counts.addedProps > 0 || counts.removedProps > 0) && (
+            <span
+              className="text-[10px] text-fg-subtle"
+              title="属性增删计入摘要 +/−；定义域类会标变更色。清单内仍用红绿黄区分类型。"
+            >
+              含属性 {counts.addedProps + counts.removedProps}{" "}
+              项（计入 +/−；定义域标变更色）
+            </span>
+          )}
+          <span className="text-[10px] text-fg-subtle">粉虚线=有变更</span>
+          <button
+            type="button"
+            className="rounded px-2 py-0.5 hover:bg-bg-hover hover:text-accent"
+            onClick={() => setListOpen((v) => !v)}
+          >
+            {listOpen ? "收起清单" : "变更清单"}
+          </button>
+          <button
+            type="button"
+            className="ml-auto rounded bg-accent px-2.5 py-0.5 text-white hover:opacity-90"
+            onClick={() => setPublishOpen(true)}
+          >
+            去发布
+          </button>
+        </div>
+      )}
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        <ConceptGraph
+          nodes={nodes}
+          edges={edges}
+          storageKey={iri}
+          onJumpToSource={onJumpToSource}
+          ontologyIri={iri}
+          className="min-h-0 flex-1"
+          onSelectionChange={setListFocus}
+          sidebarBottom={
+            showChangeList && diffQ.data ? (
+              <div className="flex min-h-0 flex-1 flex-col">
+                <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1.5 text-[11px]">
+                  <span className="font-medium">变更清单</span>
+                  {listFocus?.kind === "class" ? (
+                    <span
+                      className="ml-auto truncate text-[10px] text-accent"
+                      title={listFocus.iri}
+                    >
+                      当前类：{anchorClassLabel}
+                    </span>
+                  ) : listFocus ? (
+                    <span className="ml-auto text-[10px] text-accent">
+                      与所选相关
+                    </span>
+                  ) : (
+                    <select
+                      className="ml-auto rounded border border-border bg-bg px-1 py-0.5 text-[10px]"
+                      value={listFilter}
+                      onChange={(e) =>
+                        setListFilter(e.target.value as typeof listFilter)
+                      }
+                    >
+                      <option value="all">全部</option>
+                      <option value="added">仅新增</option>
+                      <option value="modified">仅修改</option>
+                      <option value="removed">仅删除</option>
+                    </select>
+                  )}
+                  <button
+                    type="button"
+                    className="rounded p-0.5 hover:bg-bg-hover"
+                    onClick={() => setListOpen(false)}
+                    title="关闭"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+                <div className="min-h-0 flex-1 overflow-y-auto p-2 text-[11px]">
+                  <GraphDiffList
+                    diff={diffQ.data}
+                    filter={listFocus ? "all" : listFilter}
+                    focus={listFocus}
+                    labelMap={labelMap}
+                    ontologyIri={iri}
+                  />
+                </div>
+              </div>
+            ) : null
+          }
+        />
+      </div>
+      <PublishOntologyVersionDialog
+        ontologyIri={iri}
+        open={publishOpen}
+        onClose={() => setPublishOpen(false)}
+        onPublished={() => setListOpen(false)}
+      />
+    </div>
+  );
+}
+
+function GraphDiffList({
+  diff,
+  filter,
+  focus,
+  labelMap,
+  ontologyIri,
+}: {
+  diff: import("@/lib/domain").TtlVersionDiff;
+  filter: "all" | "added" | "modified" | "removed";
+  focus?: GraphDiffFocus | null;
+  labelMap?: Map<string, string> | null;
+  ontologyIri?: string;
+}) {
+  const revoke = useRevokeOntologyWorkspaceDiffItem();
+  const cascade = useRevokeOntologyWorkspaceClassCascade();
+  const [revokeErr, setRevokeErr] = useState("");
+  const [revokeNote, setRevokeNote] = useState("");
+  const related = filterDiffRelatedTo(diff, focus ?? null);
+  const showA = filter === "all" || filter === "added";
+  const showM = filter === "all" || filter === "modified";
+  const showR = filter === "all" || filter === "removed";
+  const filtered = {
+    ...related,
+    added_classes: showA ? related.added_classes : [],
+    added_properties: showA ? related.added_properties : [],
+    added_subclass_of: showA ? (related.added_subclass_of ?? []) : [],
+    modified_classes: showM ? related.modified_classes : [],
+    modified_properties: showM ? related.modified_properties : [],
+    ontology_meta_changed: showM ? related.ontology_meta_changed : false,
+    removed_classes: showR ? related.removed_classes : [],
+    removed_properties: showR ? related.removed_properties : [],
+    removed_subclass_of: showR ? (related.removed_subclass_of ?? []) : [],
+  };
+  const revokePending = revoke.isPending || cascade.isPending;
+  return (
+    <div>
+      {revokeErr && (
+        <p className="mb-2 text-[10px] text-red-600">{revokeErr}</p>
+      )}
+      {revokeNote && (
+        <p className="mb-2 text-[10px] text-emerald-700 dark:text-emerald-400">
+          {revokeNote}
+        </p>
+      )}
+      <DiffView
+        diff={filtered}
+        showTitle={false}
+        labelMap={labelMap}
+        revokePending={revokePending}
+        getRevokeBlockReason={
+          ontologyIri
+            ? // 禁止序必须对照完整 diff：focus 过滤后可能丢掉 removed_classes
+              (target) => isLeafRestoreBlockedByDeletedClass(diff, target)
+            : undefined
+        }
+        onRevoke={
+          ontologyIri
+            ? (target) => {
+                void (async () => {
+                  setRevokeErr("");
+                  setRevokeNote("");
+                  const blocked = isLeafRestoreBlockedByDeletedClass(
+                    diff,
+                    target,
+                  );
+                  if (blocked) {
+                    setRevokeErr(blocked);
+                    return;
+                  }
+                  const onError = (e: unknown) =>
+                    setRevokeErr(
+                      (e as Error).message || "撤销失败，请重试",
+                    );
+
+                  if (
+                    target.kind === "class" &&
+                    (target.op === "add" || target.op === "remove")
+                  ) {
+                    const deps = collectClassStrongDeps(diff, target.iri);
+                    const lines = summarizeClassStrongDeps(deps);
+                    const short =
+                      labelMap?.get(target.iri)?.trim() ||
+                      termToShort(target.iri);
+                    const action =
+                      target.op === "add" ? "撤销新增类" : "恢复已删除类";
+                    const body =
+                      lines.length > 0
+                        ? `${action}「${short}」将同时处理：\n${lines.map((l) => `· ${l}`).join("\n")}\n\n确定继续？`
+                        : `${action}「${short}」？`;
+                    const ok = await confirm(body, { kind: "warning" });
+                    if (!ok) return;
+                    cascade.mutate(
+                      {
+                        iri: ontologyIri,
+                        classIri: target.iri,
+                        op: target.op,
+                      },
+                      {
+                        onError,
+                        onSuccess: () =>
+                          setRevokeNote(
+                            describeClassCascadeOutcome(deps, short),
+                          ),
+                      },
+                    );
+                    return;
+                  }
+
+                  revoke.mutate(
+                    {
+                      iri: ontologyIri,
+                      item: toWorkspaceRevokeItem(target),
+                    },
+                    { onError },
+                  );
+                })();
+              }
+            : undefined
+        }
+      />
+    </div>
   );
 }
 
@@ -979,6 +1360,7 @@ function ClassDetailPanel({
           </div>
         </div>
       )}
+      <ClassSourceSection iri={iri} classIri={classIri} />
       <DetailSection title="父类（subClassOf）" items={supers} />
       <DetailSection title="子类" items={subs} />
       <DetailSection
@@ -987,6 +1369,50 @@ function ClassDetailPanel({
           p.role === "domain" ? `${p.p} → ${p.other}` : `${p.p} ← ${p.other}`,
         )}
       />
+    </div>
+  );
+}
+
+/** 类卡上的来源表分区：未映射时不出现来源行（不占位、不提示缺失）。 */
+function ClassSourceSection({
+  iri,
+  classIri,
+}: {
+  iri: string;
+  classIri: string;
+}) {
+  const { byElement } = useMappingRowsByElement("w3c", iri);
+  const rows = byElement.get(`class\u0000${classIri}`) ?? [];
+  if (rows.length === 0) return null;
+  return (
+    <div>
+      <div className="mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-fg-subtle">
+        来源表
+        <MappingStateBadge state={mappingStateOf(rows)} count={rows.length} />
+      </div>
+      <div className="space-y-1">
+        {rows.map((r) => {
+          // 类映射只到表级（column 通常为空），定位串天然省略末尾段
+          const locator = endpointLocator(r.source)
+          return (
+          <div
+            key={r.id}
+            className="flex items-center justify-between gap-1 rounded bg-bg-hover px-2 py-1"
+          >
+            <span className="truncate font-mono text-[10px] text-fg-muted">
+              {locator || "（未指定）"}
+            </span>
+            <button
+              onClick={() => void navigator.clipboard?.writeText(locator)}
+              className="shrink-0 rounded p-0.5 text-fg-subtle hover:bg-bg-base hover:text-accent"
+              title="复制来源表"
+            >
+              <Copy size={10} />
+            </button>
+          </div>
+          )
+        })}
+      </div>
     </div>
   );
 }
@@ -1257,7 +1683,7 @@ function draftToEdit(d: PropertyDraft): TtlPropertyEdit {
   };
 }
 
-function PropertiesPanel({ iri }: { iri: string }) {
+export function PropertiesPanel({ iri }: { iri: string }) {
   const { data: properties, isLoading } = useOntologyTtlProperties(iri);
   // 元素级证据（W3C 侧三态展示，docs/EVIDENCE-CHAIN.md §6）
   const { data: evidenceRows = [] } = useTtlElementEvidence(iri);
@@ -1278,29 +1704,21 @@ function PropertiesPanel({ iri }: { iri: string }) {
   const [filter, setFilter] = useState("");
   const busy = editMut.isPending || addMut.isPending || deleteMut.isPending;
 
-  const filterFn = useMemo(() => {
-    const q = filter.trim().toLowerCase();
-    if (!q) return () => true;
-    return (p: TtlPropertyEdit) => {
-      const haystack = [
-        p.label ?? "",
-        p.comment ?? "",
-        shortIri(p.iri),
-        p.iri,
-        p.domain ?? "",
-        p.range ?? "",
-      ]
-        .join("\n")
-        .toLowerCase();
-      return haystack.includes(q);
-    };
-  }, [filter]);
+  // 来源字段（决策 25）：映射与概念分离，此处只读用于列表展示与筛选。
+  // 过滤逻辑在 `src/lib/ttl-property-filter.ts`（纯函数 + 单测）：
+  // 依赖通过参数显式传入，不在组件体内用闭包捕获后声明的 state，
+  // 从而避免渲染期立即执行命中 TDZ（"Cannot access ... before initialization"）。
+  const { byElement: mappingByElement } = useMappingRowsByElement("w3c", iri);
+  const [onlyUnmapped, setOnlyUnmapped] = useState(false);
 
-  const datatypeProps = (properties ?? []).filter(
-    (p) => p.kind === "datatype" && filterFn(p),
-  );
-  const objectProps = (properties ?? []).filter(
-    (p) => p.kind === "object" && filterFn(p),
+  const { datatypeProps, objectProps } = useMemo(
+    () =>
+      splitTtlProperties(properties ?? [], {
+        query: filter,
+        onlyUnmapped,
+        mappingByElement,
+      }),
+    [properties, filter, onlyUnmapped, mappingByElement],
   );
 
   // 子页签：关系 / 数据属性（搜索跨两页生效，页签显示过滤后计数）。
@@ -1311,23 +1729,10 @@ function PropertiesPanel({ iri }: { iri: string }) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
 
   // 按 domain 分组（保留类下拉顺序无关，按组名排序；无 domain 单列「未指定」）
-  const domainGroups = useMemo(() => {
-    const groups = new Map<string, TtlPropertyEdit[]>();
-    for (const p of datatypeProps) {
-      const key = p.domain ?? "";
-      const arr = groups.get(key);
-      if (arr) arr.push(p);
-      else groups.set(key, [p]);
-    }
-    // 排序：组名（中文 label 优先）字典序，未指定排最后
-    return [...groups.entries()].sort((a, b) => {
-      if (!a[0]) return 1; // 未指定垫底
-      if (!b[0]) return -1;
-      const na = labelMap?.get(a[0]) ?? shortIri(a[0]);
-      const nb = labelMap?.get(b[0]) ?? shortIri(b[0]);
-      return na.localeCompare(nb, "zh");
-    });
-  }, [datatypeProps, labelMap]);
+  const domainGroups = useMemo(
+    () => groupByDomain(datatypeProps, labelMap),
+    [datatypeProps, labelMap],
+  );
 
   function startEdit(p: TtlPropertyEdit) {
     setAdding(false);
@@ -1621,6 +2026,31 @@ function PropertiesPanel({ iri }: { iri: string }) {
               )}
             </div>
 
+            {/* 来源字段（与概念字段分区：保存映射不改变概念定义） */}
+            {!adding && (
+              <div className="border-t border-border pt-3">
+                <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-fg-subtle">
+                  数据来源
+                </div>
+                <ElementMappingEditor
+                  standard="w3c"
+                  ontologyKey={iri}
+                  elementType={
+                    draft.kind === "object"
+                      ? "object_property"
+                      : "datatype_property"
+                  }
+                  elementId={draft.iri}
+                  displayName={draft.label}
+                  dataType={draft.kind === "object" ? "" : draft.range}
+                  sameTableHint={draft.domain}
+                />
+                <p className="mt-1 text-[10px] text-fg-subtle">
+                  来源字段单独保存，不写进 Turtle 概念定义
+                </p>
+              </div>
+            )}
+
             {/* 错误 + 保存 */}
             {formErr && (
               <div className="rounded-md border border-danger/30 bg-danger-bg/50 px-3 py-2 text-xs text-danger">
@@ -1679,6 +2109,17 @@ function PropertiesPanel({ iri }: { iri: string }) {
             className="w-full rounded-md border border-border bg-bg-base py-1.5 pl-7 pr-2 text-xs"
           />
         </div>
+        <button
+          onClick={() => setOnlyUnmapped((v) => !v)}
+          className={`shrink-0 rounded-md border px-2 py-1 text-[11px] transition ${
+            onlyUnmapped
+              ? "border-accent bg-accent/10 text-accent"
+              : "border-border text-fg-subtle hover:bg-bg-hover"
+          }`}
+          title="只显示尚未指定来源字段的属性"
+        >
+          只看未映射
+        </button>
         <div className="shrink-0 text-xs text-fg-subtle">
           {filter.trim() ? `${shown}/${total} 匹配` : `共 ${total} 属性`}
         </div>
@@ -1731,6 +2172,7 @@ function PropertiesPanel({ iri }: { iri: string }) {
             list={objectProps}
             labelMap={labelMap}
             evidenceRows={evidenceRows}
+            mappingByElement={mappingByElement}
             busy={busy}
             onEdit={startEdit}
             onDelete={handleDelete}
@@ -1774,6 +2216,7 @@ function PropertiesPanel({ iri }: { iri: string }) {
                       list={list}
                       labelMap={labelMap}
                       evidenceRows={evidenceRows}
+                      mappingByElement={mappingByElement}
                       busy={busy}
                       onEdit={startEdit}
                       onDelete={handleDelete}
@@ -1794,6 +2237,7 @@ function PropertyTable({
   list,
   labelMap,
   evidenceRows,
+  mappingByElement,
   busy,
   onEdit,
   onDelete,
@@ -1802,10 +2246,17 @@ function PropertyTable({
   labelMap?: Map<string, string>;
   /** W3C 元素级证据行（element_id=属性 IRI） */
   evidenceRows: ElementEvidenceRow[];
+  /** 元素键 → 映射行（来源字段列展示用） */
+  mappingByElement: Map<string, ElementMapping[]>;
   busy: boolean;
   onEdit: (p: TtlPropertyEdit) => void;
   onDelete: (p: TtlPropertyEdit) => void;
 }) {
+  /** 属性对应的映射行（datatype/object 两种类型前缀都查一遍）。 */
+  const rowsOf = (p: TtlPropertyEdit): ElementMapping[] =>
+    mappingByElement.get(`datatype_property\u0000${p.iri}`) ??
+    mappingByElement.get(`object_property\u0000${p.iri}`) ??
+    [];
   const statusOf = (iri: string): EvidenceStatus => {
     const rows = evidenceRows.filter(
       (r) =>
@@ -1825,6 +2276,7 @@ function PropertyTable({
             <th className="px-3 py-1.5 text-left font-medium">
               domain → range
             </th>
+            <th className="px-3 py-1.5 text-left font-medium">来源字段</th>
             <th className="px-3 py-1.5 text-left font-medium">依据</th>
             <th className="px-3 py-1.5 text-right font-medium">操作</th>
           </tr>
@@ -1862,6 +2314,23 @@ function PropertyTable({
                 ) : (
                   <span className="text-fg-subtle">（未指定）</span>
                 )}
+              </td>
+              <td className="px-3 py-1.5">
+                {(() => {
+                  const rows = rowsOf(p);
+                  const st = mappingStateOf(rows);
+                  return (
+                    <span className="flex items-center gap-1.5">
+                      <MappingStateBadge state={st} count={rows.length} />
+                      <SourceFieldCell
+                        rows={rows}
+                        onCopy={(text) => {
+                          void navigator.clipboard?.writeText(text);
+                        }}
+                      />
+                    </span>
+                  );
+                })()}
               </td>
               <td className="px-3 py-1.5">
                 {(() => {
@@ -1923,6 +2392,17 @@ function SourcePanel({
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const codeRef = useRef<HTMLPreElement>(null);
+  // 联动聚焦：滚动到目标行并短暂高亮。
+  // Rules of Hooks：切换本体时 content 会先变 undefined（新 IRI 的 query 还没回），
+  // 若把本 effect 放在加载早退之后，同一实例的前后两次渲染 hook 数量不同，
+  // React 会抛 #310「Rendered fewer hooks than expected」。故所有 hook 必须在早退之前。
+  useEffect(() => {
+    if (!focusLine || !scrollRef.current) return;
+    const lineEl = scrollRef.current.querySelector(
+      `[data-line="${focusLine}"]`,
+    );
+    lineEl?.scrollIntoView({ block: "center" });
+  }, [focusLine, content]);
   if (!content) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -1931,14 +2411,6 @@ function SourcePanel({
     );
   }
   const lines = content.split("\n");
-  // 联动聚焦：滚动到目标行并短暂高亮
-  useEffect(() => {
-    if (!focusLine || !scrollRef.current) return;
-    const lineEl = scrollRef.current.querySelector(
-      `[data-line="${focusLine}"]`,
-    );
-    lineEl?.scrollIntoView({ block: "center" });
-  }, [focusLine]);
   return (
     <div ref={scrollRef} className="h-full overflow-auto bg-bg-base/50">
       <div className="flex min-h-full font-mono text-[11px] leading-relaxed">
@@ -2098,7 +2570,7 @@ type CharterFieldKey = "business_scenario" | "business_essence";
 
 const CHARTER_FIELDS: { key: CharterFieldKey; label: string }[] = [
   { key: "business_scenario", label: "业务场景" },
-  { key: "business_essence", label: "业务本质" },
+  { key: "business_essence", label: "业务目标" },
 ];
 
 function CharterAiSuggest({
@@ -2387,13 +2859,13 @@ function CharterPanel({ iri }: { iri: string }) {
           />
           <CharterFieldEditor
             label="业务场景"
-            hint="服务于什么业务目标、谁用、解决什么问题"
+            hint="定义本体建模的使用范围以及对象"
             value={draft.business_scenario}
             onChange={(v) => setDraft({ ...draft, business_scenario: v })}
           />
           <CharterFieldEditor
-            label="业务本质"
-            hint="核心业务对象/状态/关系/动态行为的一句话本质概括"
+            label="业务目标"
+            hint="定义本体建模的使用目标"
             value={draft.business_essence}
             onChange={(v) => setDraft({ ...draft, business_essence: v })}
           />
@@ -2439,7 +2911,7 @@ function CharterPanel({ iri }: { iri: string }) {
           {hasContent ? (
             <div className="space-y-2">
               <CharterFieldRead label="业务场景" value={c.business_scenario} />
-              <CharterFieldRead label="业务本质" value={c.business_essence} />
+              <CharterFieldRead label="业务目标" value={c.business_essence} />
             </div>
           ) : (
             <p className="text-[11px] text-fg-subtle">

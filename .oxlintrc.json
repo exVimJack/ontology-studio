@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["import"],
+  "plugins": ["import", "react"],
   "env": { "browser": true, "node": true },
   "ignorePatterns": [
     "dist/**",
@@ -12,7 +12,25 @@
     "src/routeTree.gen.ts"
   ],
   "rules": {
-    "no-unused-vars": "warn"
+    "no-unused-vars": "warn",
+    "react-hooks/rules-of-hooks": "error",
+    "react-hooks/exhaustive-deps": "off",
+    "react/purity": "off",
+    "react/refs": "off",
+    "react/set-state-in-effect": "off",
+    "no-restricted-properties": [
+      "error",
+      {
+        "object": "window",
+        "property": "confirm",
+        "message": "webview 内 window.confirm 被 tauri-plugin-dialog 注入脚本覆盖成返回 Promise 的异步函数，`!window.confirm(x)` 判定恒真（用户点取消也会执行）。破坏性操作请用 @tauri-apps/plugin-dialog 的 await confirm()。"
+      },
+      {
+        "object": "window",
+        "property": "alert",
+        "message": "webview 内 window.alert 同样被该脚本覆盖为 fire-and-forget（结果不可等待）。提示请用 @tauri-apps/plugin-dialog 的 await message()。"
+      }
+    ]
   },
   "overrides": [
     {

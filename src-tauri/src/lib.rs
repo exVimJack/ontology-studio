@@ -197,6 +197,12 @@ pub fn run() {
             // SQLite 多连接同文件在 WAL 模式下安全（两个 connection 独立 Mutex 串行化）。
             let ttl_store = std::sync::Arc::new(ontology_store::TtlStore::open(&ontology_db_path)?);
 
+            // 评审任务存活回收：上一次进程退出/崩溃时 spawn 的后台任务消失了，但库里的
+            // review 行还停在 in_progress——界面会永远显示"B 评审 进行中"（实测有行挂了
+            // 44.8 小时、三个 step_ms 全为 0）。启动时把无主的标为 interrupted，界面才能
+            // 给出"上次评审已中断，可重新发起"而不是假装有任务在跑。
+            commands::validation::reap_orphan_reviews(&ttl_store);
+
             // Skill 系统初始化（决策 20）：解析各 skill 目录路径，构造 SkillManager。
             // builtin_dir 缺失时用空目录（manager 降级为空列表，不阻断启动）。
             let builtin_skills_dir = skill::builtin_dir(app.handle())

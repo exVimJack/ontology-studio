@@ -372,9 +372,9 @@ export const commands = {
 	 */
 	listOntologyDataSources: (ontologyApiName: string) => typedError<string, AppError>(__TAURI_INVOKE("list_ontology_data_sources", { ontologyApiName })),
 	/**
-	 *  读取本体设计宪章（不变点：业务场景 / 本质 / 设计意图 / 补充说明）。
+	 *  读取本体设计宪章（不变点：业务场景 / 业务目标）。
 	 * 
-	 *  charter 不随历史变化——它记录本体的业务本质说明，不随实体增删改而变更。
+	 *  charter 不随历史变化——它记录本体的业务场景与业务目标，不随实体增删改而变更。
 	 *  由独立命令写入，不进 import 流程。前端详情页头部常驻展示。
 	 */
 	getOntologyCharter: (ontologyApiName: string) => typedError<OntologyCharter, AppError>(__TAURI_INVOKE("get_ontology_charter", { ontologyApiName })),
@@ -392,8 +392,15 @@ export const commands = {
 	createOntologyWithCharter: (apiName: string, displayName: string, description: string, charter: OntologyCharter) => typedError<null, AppError>(__TAURI_INVOKE("create_ontology_with_charter", { apiName, displayName, description, charter })),
 	/**  列出所有已存 W3C Turtle 本体（前端列表页用）。 */
 	listOntologyTtl: () => typedError<TtlOntologySummary[], AppError>(__TAURI_INVOKE("list_ontology_ttl")),
-	/**  导出指定本体 IRI 的 Turtle 文本。 */
+	/**
+	 *  导出指定本体的**生效发布** Turtle（文件导出 / 消费面）。
+	 *  从未发布时返回错误（前端映射为「请先发布」）。
+	 */
 	exportOntologyTtl: (ontologyIri: string) => typedError<string, AppError>(__TAURI_INVOKE("export_ontology_ttl", { ontologyIri })),
+	/**  导出工作区草稿 Turtle（编辑态源码 / 概念图谱 / Agent full 编辑环）。 */
+	exportOntologyTtlWorkspace: (ontologyIri: string) => typedError<string, AppError>(__TAURI_INVOKE("export_ontology_ttl_workspace", { ontologyIri })),
+	/**  工作区相对生效快照是否有未发布修改。 */
+	getOntologyWorkspaceDirty: (ontologyIri: string) => typedError<boolean, AppError>(__TAURI_INVOKE("get_ontology_workspace_dirty", { ontologyIri })),
 	/**  校验 Turtle（dry-run，不写库）。返回 TtlValidation（errors 非空则禁止 import）。 */
 	validateOntologyTtl: (ttlContent: string) => typedError<TtlValidation_Serialize, AppError>(__TAURI_INVOKE("validate_ontology_ttl", { ttlContent })),
 	/**  导入 Turtle 到存储（best-effort）。返回 TtlImportResult。 */
@@ -444,28 +451,83 @@ export const commands = {
 	 *  返回手术后的完整 TTL 文本。
 	 */
 	deleteOntologyTtlProperty: (ontologyIri: string, propertyIri: string) => typedError<string, AppError>(__TAURI_INVOKE("delete_ontology_ttl_property", { ontologyIri, propertyIri })),
+	/**  变更清单逐条撤销：相对生效快照对工作区做逆向补丁。返回手术后 TTL。 */
+	revokeOntologyWorkspaceDiffItem: (ontologyIri: string, item: WorkspaceDiffRevokeItem) => typedError<string, AppError>(__TAURI_INVOKE("revoke_ontology_workspace_diff_item", { ontologyIri, item })),
 	/**
-	 *  A 对 warning 级 issue 发起答辩。两步裁决第 ① 步（counterEvidence 机械匹配）
-	 *  在此完成——匹配失败直接返回错误，不进入 argument 判定。
+	 *  类行级联撤销：服务端按当前 diff 重算强依赖并原子写回。
+	 *  `op`: `add` = 撤销新增类；`remove` = 恢复已删除类。
 	 */
-	disputeIssue: (issueId: string, argument: string, counterSourceId: string, counterQuote: string) => typedError<string, AppError>(__TAURI_INVOKE("dispute_issue", { issueId, argument, counterSourceId, counterQuote })),
+	revokeOntologyWorkspaceClassCascade: (ontologyIri: string, classIri: string, op: string) => typedError<string, AppError>(__TAURI_INVOKE("revoke_ontology_workspace_class_cascade", { ontologyIri, classIri, op })),
+	/**  类元数据列表（label/comment，概念图谱编辑表单回显用）。 */
+	listOntologyTtlClassMetas: (ontologyIri: string) => typedError<TtlClassMeta[], AppError>(__TAURI_INVOKE("list_ontology_ttl_class_metas", { ontologyIri })),
+	/**  编辑类声明块（label/comment/subClassOf 受管重写）。 */
+	editOntologyTtlClass: (ontologyIri: string, edit: TtlClassEdit) => typedError<string, AppError>(__TAURI_INVOKE("edit_ontology_ttl_class", { ontologyIri, edit })),
+	/**  删除类（级联：独占数据属性删除、多定义域摘除、触及关系整删、继承清理后删类）。 */
+	deleteOntologyTtlClass: (ontologyIri: string, classIri: string) => typedError<string, AppError>(__TAURI_INVOKE("delete_ontology_ttl_class", { ontologyIri, classIri })),
 	/**
-	 *  裁决答辩（第 ② 步）。由 B 复核或人工调用——**不作为 A 的工具暴露**。
+	 *  发布当前内容为新版本（版本 = 里程碑）。返回新分配的 revision 号。
+	 *  发布写 changelog（change_summary 塞 {"published_version": N} 建立映射）。
+	 */
+	publishOntologyVersion: (ontologyIri: string, label: string, description: string, author: string) => typedError<number, AppError>(__TAURI_INVOKE("publish_ontology_version", { ontologyIri, label, description, author })),
+	/**  列出某本体版本历史（revision 降序；active_revision 对应的那条前端标"已启用"）。 */
+	listOntologyVersions: (ontologyIri: string) => typedError<TtlVersionSummary[], AppError>(__TAURI_INVOKE("list_ontology_versions", { ontologyIri })),
+	/**  取某版本完整 TTL（回退/对比用；正数 = versions 表 revision）。 */
+	getOntologyVersionTtl: (ontologyIri: string, revision: number) => typedError<string, AppError>(__TAURI_INVOKE("get_ontology_version_ttl", { ontologyIri, revision })),
+	/**  回退到指定版本（切指针覆盖当前内容，不新建版本、revision 不递增）。 */
+	revertOntologyVersion: (ontologyIri: string, revision: number, author: string) => typedError<null, AppError>(__TAURI_INVOKE("revert_ontology_version", { ontologyIri, revision, author })),
+	/**  取当前生效发布版本（NULL = 从未发布；编辑不清空）。 */
+	getOntologyActiveRevision: (ontologyIri: string) => typedError<number | null, AppError>(__TAURI_INVOKE("get_ontology_active_revision", { ontologyIri })),
+	/**  删除单个版本快照（当前启用的版本拒绝删除；changelog 记录保留）。 */
+	deleteOntologyVersion: (ontologyIri: string, revision: number) => typedError<null, AppError>(__TAURI_INVOKE("delete_ontology_version", { ontologyIri, revision })),
+	/**
+	 *  两版本结构化 diff（rev=0 = 当前工作区内容；正数 = versions 表 revision）。
+	 *  输出新增/删除/修改的类与属性 + 本体头变化提示。
+	 */
+	diffOntologyVersions: (ontologyIri: string, revA: number, revB: number) => typedError<TtlVersionDiff, AppError>(__TAURI_INVOKE("diff_ontology_versions", { ontologyIri, revA, revB })),
+	/**  版本上限（默认 20，可配置，存 ttl_settings）。 */
+	getVersionLimit: () => typedError<number, AppError>(__TAURI_INVOKE("get_version_limit")),
+	/**  设置版本上限（0 回退默认 20）。返回生效值。 */
+	setVersionLimit: (limit: number) => typedError<number, AppError>(__TAURI_INVOKE("set_version_limit", { limit })),
+	/**  版本上限默认值（前端展示用）。 */
+	versionLimitDefault: () => typedError<number, AppError>(__TAURI_INVOKE("version_limit_default")),
+	/**  列出某本体的全部映射。 */
+	listElementMappings: (standard: string, ontologyKey: string) => typedError<ElementMapping[], AppError>(__TAURI_INVOKE("list_element_mappings", { standard, ontologyKey })),
+	/**  某元素的映射列表（属性卡 / 关系卡渲染用）。 */
+	listElementMappingsFor: (standard: string, ontologyKey: string, elementType: string, elementId: string) => typedError<ElementMapping[], AppError>(__TAURI_INVOKE("list_element_mappings_for", { standard, ontologyKey, elementType, elementId })),
+	/**  本体元素全集（缺口清单 / 候选建议的输入；不含映射状态）。 */
+	listMappingElements: (standard: string, ontologyKey: string) => typedError<MappingElementRef[], AppError>(__TAURI_INVOKE("list_mapping_elements", { standard, ontologyKey })),
+	/**  覆盖率（类 / 属性 / 关系分别统计，互不推导）。 */
+	mappingCoverage: (standard: string, ontologyKey: string) => typedError<MappingCoverage, AppError>(__TAURI_INVOKE("mapping_coverage", { standard, ontologyKey })),
+	/**  完整性报告（孤儿 / 失效 / 未核对；均不自动删除、不阻断操作）。 */
+	mappingIntegrity: (standard: string, ontologyKey: string) => typedError<MappingIntegrityReport, AppError>(__TAURI_INVOKE("mapping_integrity", { standard, ontologyKey })),
+	/**  保存映射（按元素整组替换语义；空集合 = 清空该元素全部映射）。 */
+	saveElementMappings: (standard: string, ontologyKey: string, items: ElementMappingItem[]) => typedError<MappingWriteResult, AppError>(__TAURI_INVOKE("save_element_mappings", { standard, ontologyKey, items })),
+	/**  删除某元素的全部映射（等价于保存空集合）。 */
+	deleteElementMappings: (standard: string, ontologyKey: string, elementType: string, elementId: string) => typedError<number, AppError>(__TAURI_INVOKE("delete_element_mappings", { standard, ontologyKey, elementType, elementId })),
+	/**  清理孤儿映射（**仅在用户显式确认后调用**；不做后台自动删除）。 */
+	purgeOrphanMappings: (standard: string, ontologyKey: string) => typedError<number, AppError>(__TAURI_INVOKE("purge_orphan_mappings", { standard, ontologyKey })),
+	/**  候选建议（只读，不落库）。未提供 elements 时用本体元素全集。 */
+	suggestElementMappings: (standard: string, ontologyKey: string, elements: MappingElementRef[] | null) => typedError<MappingSuggestion[], AppError>(__TAURI_INVOKE("suggest_element_mappings", { standard, ontologyKey, elements })),
+	/**
+	 *  导出映射为多工作表工作簿并落盘到用户选定路径，返回实际写入路径。
+	 * 
+	 *  之所以由后端落盘而非把 `Vec<u8>` 传回前端：工作簿是二进制，走 IPC 需要
+	 *  整体序列化成 number 数组（大本体可达数 MB，specta/serde 开销与内存翻倍），
+	 *  且前端拿到后仍需经插件写文件。路径由前端 `save()` 对话框选定（用户显式授权），
+	 *  后端只写入该路径，不提供任意路径泛化。
+	 */
+	exportElementMapping: (standard: string, ontologyKey: string, scope: string, targetPath: string) => typedError<string, AppError>(__TAURI_INVOKE("export_element_mapping", { standard, ontologyKey, scope, targetPath })),
+	/**
+	 *  回填：把历史的属性级来源字段迁入映射表（幂等，仅在本体映射为空时执行）。
+	 * 
+	 *  供「升级后首次打开旧本体」与导入路径调用；已存在映射时不覆盖用户数据。
+	 */
+	backfillElementMappings: (ontologyKey: string) => typedError<number, AppError>(__TAURI_INVOKE("backfill_element_mappings", { ontologyKey })),
+	/**
+	 *  裁决答辩（第 ② 步）。由人工仲裁调用——**不作为 A 的工具暴露**。
 	 *  verdict: "overruled"（撤销）| "accepted"（升级 error）；resolved_by: "verifier"|"human"。
 	 */
 	resolveDispute: (issueId: string, verdict: string, resolvedBy: string) => typedError<string, AppError>(__TAURI_INVOKE("resolve_dispute", { issueId, verdict, resolvedBy })),
-	/**
-	 *  答辩提交 + B 自动机器裁决（一步到位）。
-	 * 
-	 *  前端提交后即可离开页面：裁决在 Rust 侧完成并落库，切窗/切页不影响结果，
-	 *  回来后按 issue 状态回显（overruled/accepted 已闭环，uncertain 在仲裁队列）。
-	 */
-	disputeAndJudge: (issueId: string, argument: string, counterSourceId: string, counterQuote: string, modelB: string) => typedError<string, AppError>(__TAURI_INVOKE("dispute_and_judge", { issueId, argument, counterSourceId, counterQuote, modelB })),
-	/**
-	 *  B 自动裁决答辩（②b 机器裁决）：LLM 判定 overruled/accepted；uncertain 保持
-	 *  disputed（进入人工仲裁队列）。**resolved_by 记 verifier**——裁决权在 B。
-	 */
-	resolveDisputeLlm: (issueId: string, modelB: string) => typedError<string, AppError>(__TAURI_INVOKE("resolve_dispute_llm", { issueId, modelB })),
 	/**  查询本体的全部 issue（对抗状态展示 + 报告）。 */
 	listValidationIssues: (ontologyIri: string) => typedError<ValidationIssue_Serialize[], AppError>(__TAURI_INVOKE("list_validation_issues", { ontologyIri })),
 	/**  持久化一次 validate 的 issue 快照（前端校验完成后调用）。 */
@@ -515,6 +577,14 @@ export const commands = {
 	created_at: number,
 	/**  unix ms */
 	updated_at: number,
+	/**
+	 *  结束归因：`verdict_capped` | `step_failed` | `interrupted` | `manual_escalation` |
+	 *  `write_back_conflict` | `unknown`（历史行不可追溯）。`in_progress` 期间为空串。
+	 *  界面文案 MUST 按此分支，MUST NOT 把所有 escalated 一律说成"复核未收敛"。
+	 */
+	outcome_reason?: string,
+	/**  失败时的实际错误文本：仅进日志与 tooltip，主界面不直接显示（不向用户堆实现细节）。 */
+	outcome_detail?: string,
 } | null, AppError>(__TAURI_INVOKE("latest_validation_review", { ontologyIri })),
 	/**
 	 *  运行 29 句话覆盖矩阵（全量或增量 diff）。
@@ -541,19 +611,10 @@ export const commands = {
 	 */
 	runReviewLoop: (ontologyIri: string, ttlContent: string, charterSummary: string, issuesJson: string) => typedError<string, AppError>(__TAURI_INVOKE("run_review_loop", { ontologyIri, ttlContent, charterSummary, issuesJson })),
 	/**
-	 *  A 自动答辩（§2.1.5 完整对抗语义——答辩的发起方是 A 建模者，不是人）：
-	 * 
-	 *  对本体全部 rules 来源 open warning，后端一次跑完
-	 *  「A 构造论据+反证 → dispute_issue（机械匹配把关）→ resolve_dispute_llm
-	 *  （B 裁决三态）」。人只在阶段③ 仲裁 B 判不定的残留项。
-	 * 
-	 *  - A 无证据反驳的 warning → accept（留给纠错/人工修订，不走裁决）
-	 *  - A 摘录的 quote 没过机械匹配 → 该条维持 open（outcome=rejected_match）
-	 *    ——不降级 A 的答辩资格，也不放水匹配，如实呈现
+	 *  轮次清单（合并方案 v0.8）：按轮次返回该评审的 issue 快照 + 统计，
+	 *  前端「轮次清单」可查看每轮 发现/已修改/异议/裁决。
 	 */
-	runAutoDispute: (ontologyIri: string) => typedError<AutoDisputeItem[], AppError>(__TAURI_INVOKE("run_auto_dispute", { ontologyIri })),
-	/**  读取缓存的自动答辩状态（切页/切窗回来回显用，含 running 标志）。 */
-	getAutoDisputeResult: (ontologyIri: string) => typedError<AutoDisputeState, AppError>(__TAURI_INVOKE("get_auto_dispute_result", { ontologyIri })),
+	listReviewRounds: (reviewId: string) => typedError<ReviewRound[], AppError>(__TAURI_INVOKE("list_review_rounds", { reviewId })),
 	/**
 	 *  仲裁完成后交 A 修订落盘（后端 spawn，立即返回；前端轮询 get_post_arbitration_state）。
 	 *  已裁决 issue（accepted 必须改、overruled 不用改）作为 B 建议喂 A，A 修订后
@@ -569,8 +630,14 @@ export const commands = {
 	runBReviewLlm: (modelB: string, inputs: string) => typedError<BReviewOutput_Serialize, AppError>(__TAURI_INVOKE("run_b_review_llm", { modelB, inputs })),
 	/**  运行 A 修订（LLM）。返回命名结构（修订后 Turtle, 修订说明）。 */
 	runAReviseLlm: (modelA: string, ttlV1: string, bSuggestions: string) => typedError<AReviseResult, AppError>(__TAURI_INVOKE("run_a_revise_llm", { modelA, ttlV1, bSuggestions })),
-	/**  运行 B 复核（LLM）。只传修订后 Turtle（a_revision），不传修订说明。 */
-	runBRecheckLlm: (modelB: string, aRevision: string) => typedError<string, AppError>(__TAURI_INVOKE("run_b_recheck_llm", { modelB, aRevision })),
+	/**
+	 *  运行 B 复核（LLM）。传修订后 Turtle（a_revision）+ 核查基准（上一轮建议清单），
+	 *  **不传修订说明**（a_reasoning 对 B 不可见）。
+	 * 
+	 *  遗留的单步命令：阶段② 已改为后端 `run_review_loop` 编排，UI 不再逐步驱动。
+	 *  保留它时也必须带上核查基准——否则这个入口会重演"B 失忆"缺陷。
+	 */
+	runBRecheckLlm: (modelB: string, aRevision: string, baselineSuggestions: string) => typedError<string, AppError>(__TAURI_INVOKE("run_b_recheck_llm", { modelB, aRevision, baselineSuggestions })),
 };
 
 /* Types */
@@ -605,32 +672,6 @@ export type ActiveScopeDto = {
 export type AppError = { kind: "Ingest"; message: string } | { kind: "Agent"; message: string } | { kind: "Memory"; message: string } | { kind: "Provider"; message: string } | { kind: "Federation"; message: string } | { kind: "Ontology"; message: string } | { kind: "Skill"; message: string } | { kind: "SkillScanTimeout"; message: string } | 
 /**  用户主动中断（§15 状态机 Cancelled）——前端静默处理 */
 { kind: "Cancelled" };
-
-/**  A 自动答辩的批量结果（run_auto_dispute 逐条汇总，前端进度展示）。 */
-export type AutoDisputeItem = {
-	/**  目标 warning 的 issue id */
-	issue_id: string,
-	/**
-	 *  "overruled"（B 撤销）| "accepted"（B 驳回升级 error）| "uncertain"
-	 *  （B 判不定进仲裁）| "accept"（A 接受不辩）| "rejected_match"（A 摘录
-	 *  未过机械匹配，维持 open）| "error"（该条处理失败）
-	 */
-	outcome: string,
-	/**  一句话说明（B 的 reason / 失败原因） */
-	detail?: string,
-};
-
-/**
- *  最近一次 run_auto_dispute 的状态缓存（按本体 IRI）——切页/切窗回来回显，
- *  不依赖前端组件存活。running=true 表示后端任务进行中（切窗不丢状态）。
- *  应用重启即清（issue 状态本身已落库）。
- */
-export type AutoDisputeState = {
-	/**  后端任务是否进行中（切窗回来据此恢复"进行中"展示，不依赖前端 mutation 状态） */
-	running: boolean,
-	/**  逐条结果（进行中已完成的条目 / 全部完成后的完整结果） */
-	items?: AutoDisputeItem[],
-};
 
 /**  B 评审输出（结构化建议清单，B prompt 规格 §4.3）。 */
 export type BReviewOutput = BReviewOutput_Serialize | BReviewOutput_Deserialize;
@@ -984,6 +1025,52 @@ export type DocumentSummaryDto = {
 	folder_path: string | null,
 };
 
+/**  一条映射记录（读视图）。 */
+export type ElementMapping = {
+	id: string,
+	standard: string,
+	ontology_key: string,
+	element_type: string,
+	element_id: string,
+	source?: MappingEndpoint,
+	target?: MappingEndpoint,
+	/**  系统判定的核对状态（写入时校验，调用方不可声明）。 */
+	verified: boolean,
+	/**  最近核对时刻（unix ms；0 = 从未核对）。 */
+	verified_at: number,
+	source_kind: string,
+	source_ref?: string,
+	note?: string,
+	/**  创建时刻（unix ms） */
+	created_at: number,
+	/**  最近更新时刻（unix ms） */
+	updated_at: number,
+};
+
+/**  写入一条映射的入参（不含核对状态——核对由系统判定，调用方无权声明）。 */
+export type ElementMappingInput = {
+	/**  来源端物理位置；属性/类只用这一端。 */
+	source: MappingEndpoint,
+	/**  目标端物理位置；仅关系（JOIN 条件）使用，其余留空。 */
+	target?: MappingEndpoint,
+	/**  来源类别：federation / evidence / manual（写错按 manual 处理）。 */
+	source_kind?: string,
+	/**  来源引用（数据源名 / evidence source_id / 空）。 */
+	source_ref?: string,
+	/**  自由备注（复合列说明、连接条件补充；导出到 CSV 备注列）。 */
+	note?: string,
+};
+
+/**  按元素整组替换的入参（对齐 `persist_element_evidence` 的替换语义）。 */
+export type ElementMappingItem = {
+	/**  object_type | property | link（palantir）/ class | datatype_property | object_property（w3c） */
+	element_type: string,
+	/**  palantir: api_name；w3c: 元素 IRI 原文形态 */
+	element_id: string,
+	/**  该元素的**全部**映射；空集合 = 删除该元素的全部映射。 */
+	mappings?: ElementMappingInput[],
+};
+
 /**  文件型连接配置（CSV/Excel）。 */
 export type FileConnection = {
 	/**  源文件绝对路径。CSV 可指向目录（注册目录下所有 .csv）。 */
@@ -1079,6 +1166,116 @@ export type IssueStatus =
 "accepted" | 
 /**  答辩成功，issue 撤销（warning 专属） */
 "overruled";
+
+/**  映射覆盖率（类 / 属性 / 关系分别统计，互不推导）。 */
+export type MappingCoverage = {
+	standard: string,
+	ontology_key: string,
+	classes?: MappingCoverageBucket,
+	properties?: MappingCoverageBucket,
+	relations?: MappingCoverageBucket,
+};
+
+/**  单个桶的覆盖率（已映射元素数 / 元素总数）。 */
+export type MappingCoverageBucket = {
+	/**  已映射元素数（有至少一条映射的元素）。注意是**元素**数，不是映射行数。 */
+	mapped: number,
+	/**  元素总数（来自本体内容，不是映射行数）。 */
+	total: number,
+};
+
+/**
+ *  元素（含其语义上下文）。
+ * 
+ *  前五个字段是候选建议的输入；`owner_*` / `target_*` / 端点属性 / 基数 / 描述
+ *  是为「多工作表映射导出」补的语义上下文（见
+ *  `openspec/changes/mapping-export-multisheet/design.md` D3）。
+ *  属性只填 `owner_*`，关系填 `owner_*` + `target_*` + 两端属性 + 基数，类全空。
+ */
+export type MappingElementRef = {
+	element_type: string,
+	element_id: string,
+	/**  元素人类可读名（label / display_name）；名称归一的输入之一。 */
+	display_name?: string,
+	/**  属性声明的 DataType（类为空）；类型兼容性打分的输入。 */
+	data_type?: string,
+	/**  已知同表线索（该元素所属类已映射到的物理表定位串；空 = 无线索）。 */
+	same_table_hint?: string,
+	/**  所属对象标识（属性所属 object_type / class；关系为源对象）；类为空。 */
+	owner_id?: string,
+	/**  所属对象中文描述（导出表用；空 = 未设置）。 */
+	owner_name?: string,
+	/**  关系目标对象标识；非关系为空。 */
+	target_id?: string,
+	/**  关系目标对象中文描述；非关系为空。 */
+	target_name?: string,
+	/**  关系源端属性标识（外键所在属性）；未声明或非关系为空。 */
+	endpoint_property?: string,
+	/**  关系目标端属性标识（通常为目标对象主键）；未声明或非关系为空。 */
+	target_property?: string,
+	/**  关系基数（ONE / MANY）；非关系为空。 */
+	cardinality?: string,
+	/**  元素自身中文描述（rdfs:comment / description）。 */
+	description?: string,
+};
+
+/**
+ *  一个物理位置（表或列）。`column` 为空表示"表级"定位（类映射）。
+ * 
+ *  三段式（catalog/schema/table）与 `BackingMapping` 一致，便于与 payload 契约互转；
+ *  空段不参与拼接，避免产出 `..db.t.x` 这种噪声定位串。
+ */
+export type MappingEndpoint = {
+	catalog?: string,
+	schema?: string,
+	table?: string,
+	column?: string,
+};
+
+/**  完整性报告中的一条问题。 */
+export type MappingIntegrityItem = {
+	mapping_id: string,
+	element_type: string,
+	element_id: string,
+	/**  物理位置定位串（便于用户直接找到那条绑定）。 */
+	locator?: string,
+	/**  人类可读说明（面向用户，不暴露内部实现）。 */
+	detail: string,
+};
+
+/**  映射完整性报告：三类问题，**均不自动删除、不阻断任何操作**。 */
+export type MappingIntegrityReport = {
+	standard: string,
+	ontology_key: string,
+	/**  元素在本体当前内容中已不存在（改名/删除的残留）。 */
+	orphans?: MappingIntegrityItem[],
+	/**  曾被核对，但来源物理结构其后发生变化（仅按结构差异判定，连接失败不算）。 */
+	stale?: MappingIntegrityItem[],
+	/**  从未核对成功（冷启动阶段正常，仅是提示）。 */
+	unverified?: MappingIntegrityItem[],
+};
+
+/**  一条候选建议（只读产物，不落库）。 */
+export type MappingSuggestion = {
+	element_type: string,
+	element_id: string,
+	/**  候选物理列。 */
+	candidate: MappingEndpoint,
+	/**  置信度（0.0–1.0，各维度权重之和，见 D6）。 */
+	score: number | null,
+	/**  命中依据（人类可读，如「名称归一相等」「类型兼容」「同表」）。 */
+	reasons?: string[],
+};
+
+/**  写入结果 DTO（`MappingWriteOutcome` 在 crate 内未实现 specta::Type）。 */
+export type MappingWriteResult = {
+	/**  写入（含更新）的行数。 */
+	written: number,
+	/**  整组替换时移除的旧行数。 */
+	removed: number,
+	/**  聚合提示（面向用户，一句话一条；不阻断保存）。 */
+	warnings?: string[],
+};
 
 /**  单个 MCP server 的连接配置。 */
 export type McpServerConfig = 
@@ -1287,8 +1484,8 @@ export type OntologyChangelog_Serialize = {
  *  与 changelog（变化点）分离：changelog 记每次变更随历史增长，charter 记业务
  *  本质说明不随历史变化。由独立命令 `set_ontology_charter` 写入，不进 import 流程。
  * 
- *  - `business_scenario`：业务场景（服务于什么业务目标、谁用、解决什么问题）
- *  - `business_essence`：业务本质（核心业务对象/状态/关系/动态行为的一句话本质概括）
+ *  - `business_scenario`：业务场景（定义本体建模的使用范围以及对象）
+ *  - `business_essence`：业务目标（定义本体建模的使用目标；字段名历史兼容）
  */
 export type OntologyCharter = {
 	business_scenario?: string,
@@ -1329,6 +1526,8 @@ export type PostArbitrationState = {
 	msg?: string,
 	/**  ok=成功 / err=失败 / ""=进行中 */
 	kind?: string,
+	/**  A 修订说明（run_a_revise 返回的 notes：改了哪些内容；成功后填充） */
+	revise_notes?: string,
 };
 
 /**  原则出处引用（ValidationIssue.principle）。 */
@@ -1337,6 +1536,16 @@ export type PrincipleRef = {
 	source?: string,
 	/**  出处定位（skill 章节 / charter 字段 / 输入文档段落 / W3C 标准条款） */
 	ref_?: string,
+};
+
+/**  元素修改（IRI 同但字段变了）。 */
+export type PropertyChange = {
+	/**  元素 IRI（原文形态，可能含双 #） */
+	iri: string,
+	/**  修改前视图 */
+	before: TtlPropertyEdit,
+	/**  修改后视图 */
+	after: TtlPropertyEdit,
 };
 
 /**
@@ -1579,6 +1788,31 @@ export type QueryResult_Serialize = {
  */
 export type ReasoningLevel = "off" | "low" | "medium" | "high";
 
+/**
+ *  轮次清单行（合并方案 v0.8）：该轮 issue 快照 + 统计，前端可按轮次查看
+ *  「每轮发现多少 / A 修改多少 / 异议多少 / 裁决结果」。
+ */
+export type ReviewRound = {
+	/**  rr-{uuid simple} */
+	id: string,
+	/**  归属评审 id */
+	review_id: string,
+	/**  轮次：1=首轮 B 评审，2/3=修订复核轮 */
+	round: number,
+	/**  该轮结束时 issue 清单快照 JSON：[{id,severity,rule,status,a_action}] */
+	snapshot_json: string,
+	/**  该轮累计发现数 */
+	found_count: number,
+	/**  A 接受（已修改）数 */
+	accepted_count: number,
+	/**  A 异议（待裁决）数 */
+	disputed_count: number,
+	/**  该轮后 review 状态：in_progress|resolved|escalated */
+	verdict: string | null,
+	created_at: number,
+	updated_at: number,
+};
+
 /**  评审环节耗时快照（unix ms，0=未完成）。 */
 export type ReviewStepMs = {
 	/**  B 评审（环节 1）耗时 */
@@ -1769,6 +2003,14 @@ export type StreamKind =
 /**  出错结束 */
 "error";
 
+/**  一条 rdfs:subClassOf 边（child ⊑ parent）。 */
+export type SubclassOfEdge = {
+	/**  子类 IRI（原文形态，可能含双 #） */
+	child: string,
+	/**  父类 IRI */
+	parent: string,
+};
+
 /**  表元信息。 */
 export type TableMeta = TableMeta_Serialize | TableMeta_Deserialize;
 
@@ -1882,19 +2124,44 @@ export type TtlChangelog_Serialize = {
  *  本体设计宪章（不变点，对齐 Palantir `OntologyCharter`）。
  * 
  *  字段语义与 Palantir `OntologyCharter` 完全一致，仅主键改为 `ontology_iri`。
- *  charter 记录业务本质说明（不随历史变化），与 changelog（变化点）分离。
+ *  charter 记录业务场景与业务目标（不随历史变化），与 changelog（变化点）分离。
  *  额外设计：charter 的四字段可同步以 W3C 原生词汇（`dcterms:` + `skos:note`）
  *  写入 .ttl 文本，本表是可查询的结构化索引。
  */
 export type TtlCharter = {
-	/**  业务场景（服务于什么业务目标、谁用、解决什么问题） */
+	/**  业务场景（定义本体建模的使用范围以及对象） */
 	business_scenario?: string,
-	/**  业务本质（核心业务对象/状态/关系/动态行为的一句话本质概括） */
+	/**  业务目标（定义本体建模的使用目标；字段名 business_essence 历史兼容） */
 	business_essence?: string,
 	/**  "agent" | "user" */
 	updated_by?: string,
 	/**  unix ms */
 	updated_at: number,
+};
+
+/**  类的编辑视图（概念图谱编辑用）：label/comment/subClassOf 受管，其余谓词原样保留。 */
+export type TtlClassEdit = {
+	/**  类 IRI 全形（原文，可能含双 #）。不可改（身份）。 */
+	iri: string,
+	/**  rdfs:label（纯文本；空 = 删除该谓词）。 */
+	label?: string,
+	/**  rdfs:comment（同上）。 */
+	comment?: string,
+	/**  父类 IRI 列表（rdfs:subClassOf，可多个；空 = 无父类）。 */
+	parents?: string[],
+};
+
+/**
+ *  类的读写视图（版本 diff 用：label/comment 修改检测，属性编辑不碰类块）。
+ *  与 `TtlPropertyEdit` 同字段语义（kind 恒为 "class"）。
+ */
+export type TtlClassMeta = {
+	/**  类 IRI 全形（原文，可能含双 #）。 */
+	iri: string,
+	/**  rdfs:label（去引号去语言标签后的纯文本；空 = 未设置）。 */
+	label?: string,
+	/**  rdfs:comment（同上）。 */
+	comment?: string,
 };
 
 /**  Turtle 导入结果（对应 Palantir `ImportResult`）。 */
@@ -1921,6 +2188,10 @@ export type TtlOntologySummary = {
 	triple_count: number,
 	/**  最后更新时间（unix ms） */
 	updated_at: number,
+	/**  生效发布版本（NULL=从未发布）；编辑不清空 */
+	active_revision?: number,
+	/**  工作区相对生效快照是否有未发布修改 */
+	workspace_dirty?: boolean,
 };
 
 /**  属性（字段/关系）的读写视图。IRI 为原文形态（可能含双 #）。 */
@@ -1968,6 +2239,50 @@ export type TtlValidation_Serialize = {
 	issues: ValidationIssue_Serialize[],
 	/**  L4.3 多轮评审状态（默认无；review_ontology 启动后填充） */
 	review?: ValidationReview | null,
+};
+
+/**  两版本结构化 diff（不逐行文本 diff）。 */
+export type TtlVersionDiff = {
+	/**  对比基准版本（0 = 当前工作区内容） */
+	rev_a: number,
+	/**  对比目标版本（0 = 当前工作区内容） */
+	rev_b: number,
+	/**  B 有 A 无的类 IRI */
+	added_classes: string[],
+	/**  A 有 B 无的类 IRI */
+	removed_classes: string[],
+	/**  IRI 同但 label/comment 变了 */
+	modified_classes: PropertyChange[],
+	/**  新增属性 */
+	added_properties: TtlPropertyEdit[],
+	/**  删除属性 */
+	removed_properties: TtlPropertyEdit[],
+	/**  IRI 同但 label/comment/domain/range（或 kind）变了 */
+	modified_properties: PropertyChange[],
+	/**  B 有 A 无的 subClassOf 边 */
+	added_subclass_of?: SubclassOfEdge[],
+	/**  A 有 B 无的 subClassOf 边 */
+	removed_subclass_of?: SubclassOfEdge[],
+	/**  本体头部元信息（本体自身 rdfs:label / rdfs:comment）有变化 */
+	ontology_meta_changed: boolean,
+};
+
+/**  版本摘要（列表项，不含全文）。 */
+export type TtlVersionSummary = {
+	/**  发布版本号（每本体从 1 递增） */
+	revision: number,
+	/**  版本标签（如 "v1.0"；空则发布时自动生成 v0.0.N） */
+	label: string,
+	/**  发布说明 */
+	description: string,
+	/**  发布时刻快照的 triple 数 */
+	triple_count: number,
+	/**  发布时刻 vs 上一版本的修改点（TtlVersionDiff 序列化 JSON；首版为空对象 {}） */
+	diff_summary?: string,
+	/**  发布时刻（unix ms） */
+	created_at: number,
+	/**  发布者（"agent" | "user"） */
+	author: string,
 };
 
 /**  证据引用（对应 evidence_sources 表；source_id 必须已登记）。 */
@@ -2097,7 +2412,34 @@ export type ValidationReview = {
 	created_at: number,
 	/**  unix ms */
 	updated_at: number,
+	/**
+	 *  结束归因：`verdict_capped` | `step_failed` | `interrupted` | `manual_escalation` |
+	 *  `write_back_conflict` | `unknown`（历史行不可追溯）。`in_progress` 期间为空串。
+	 *  界面文案 MUST 按此分支，MUST NOT 把所有 escalated 一律说成"复核未收敛"。
+	 */
+	outcome_reason?: string,
+	/**  失败时的实际错误文本：仅进日志与 tooltip，主界面不直接显示（不向用户堆实现细节）。 */
+	outcome_detail?: string,
 };
+
+/**  变更清单「逐条撤销」入参（相对生效快照对工作区做逆向补丁）。 */
+export type WorkspaceDiffRevokeItem = 
+/**  类增删改 */
+{ kind: "class"; 
+/**  add | remove | modify */
+op: string; iri: string } | 
+/**  属性/关系增删改 */
+{ kind: "property"; 
+/**  add | remove | modify */
+op: string; iri: string } | 
+/**  继承边增删 */
+{ kind: "subclass"; 
+/**  add | remove */
+op: string; child: string; parent: string } | 
+/**  本体头元信息修改（暂支持撤销为生效版 label/comment——若无生效版则拒绝） */
+{ kind: "meta"; 
+/**  恒为 modify */
+op: string };
 
 /* Tauri Specta runtime */
 async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {

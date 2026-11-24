@@ -9,6 +9,7 @@ pub mod error;
 pub mod federation;
 pub mod http;
 pub mod ingest;
+pub mod mapping;
 pub mod mcp;
 pub mod ontology;
 pub mod provider;
@@ -41,6 +42,7 @@ pub use ingest::{
 pub use http::{http_post_json, HttpPostResult};
 pub use mcp::{get_mcp_servers, list_mcp_tools, set_mcp_servers, McpServerStatus, McpToolDef};
 pub use ontology::{
+    edit_ontology_ttl_class, delete_ontology_ttl_class, list_ontology_ttl_class_metas,
     create_ontology_with_charter, create_ontology_ttl_with_charter,
     list_ontologies, export_ontology, preview_ontology_import, import_ontology,
     delete_ontology,
@@ -48,7 +50,9 @@ pub use ontology::{
     list_ontology_changelog,
     list_ontology_datasets, list_ontology_data_sources,
     get_ontology_charter, set_ontology_charter,
-    list_ontology_ttl, export_ontology_ttl, validate_ontology_ttl, import_ontology_ttl,
+    list_ontology_ttl, export_ontology_ttl, export_ontology_ttl_workspace,
+    get_ontology_workspace_dirty,
+    validate_ontology_ttl, import_ontology_ttl,
     delete_ontology_ttl, query_ontology_sparql,
     get_ontology_ttl_charter, set_ontology_ttl_charter,
     list_ontology_ttl_changelog, commit_ontology_ttl_change,
@@ -56,6 +60,18 @@ pub use ontology::{
     get_ontology_ttl_default_property_ns,
     edit_ontology_ttl_property, add_ontology_ttl_property,
     delete_ontology_ttl_property,
+    revoke_ontology_workspace_diff_item,
+    revoke_ontology_workspace_class_cascade,
+    publish_ontology_version, list_ontology_versions, get_ontology_version_ttl,
+    revert_ontology_version, get_ontology_active_revision, delete_ontology_version,
+    diff_ontology_versions,
+    get_version_limit, set_version_limit, version_limit_default,
+};
+pub use mapping::{
+    backfill_element_mappings, delete_element_mappings, export_element_mapping,
+    list_element_mappings, list_element_mappings_for, list_mapping_elements,
+    mapping_coverage, mapping_integrity, purge_orphan_mappings, save_element_mappings,
+    suggest_element_mappings, MappingWriteResult,
 };
 pub use provider::{get_context_window, get_provider, set_provider, get_verifier_provider, set_verifier_provider, restore_provider, restore_verifier_provider, SetProviderInput};
 pub use skill::{
@@ -63,11 +79,11 @@ pub use skill::{
     set_skill_conversation_enabled, set_skill_globally_disabled, SkillDto,
 };
 pub use validation::{
-    a_revise, b_recheck, coverage_matrix, dispute_and_judge, dispute_issue, escalate_review,
-    independence_tier, latest_validation_review, list_validation_issues,
-    persist_validation_issues, resolve_dispute, resolve_dispute_llm,
-    review_ontology, run_review_loop, run_auto_dispute, get_auto_dispute_result,
+    a_revise, b_recheck, coverage_matrix, escalate_review,
+    independence_tier, latest_validation_review, list_review_rounds, list_validation_issues,
+    persist_validation_issues, resolve_dispute,
+    review_ontology, run_review_loop,
     run_post_arbitration_revise, get_post_arbitration_state,
-    AutoDisputeItem, PostArbitrationState,
+    PostArbitrationState,
     save_b_report, run_a_revise_llm, run_b_recheck_llm, run_b_review_llm,
 };

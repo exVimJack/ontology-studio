@@ -11,6 +11,7 @@
 
 import type { ProviderConfig, TtlCharter } from "@/lib/domain";
 import { DEFAULT_BASE_URLS } from "@/lib/domain";
+import { CHARTER_FIELD_META } from "@/lib/charter-fields";
 import { ipc } from "@/lib/ipc/commands";
 
 /** 建议模式：起草（空字段起稿）/ 补全（只填空缺）/ 完善（润色既有文案）/ 查漏（找矛盾与缺口）。 */
@@ -34,29 +35,13 @@ export interface CharterSuggestion {
   questions: string[];
 }
 
-type CharterTextField = Exclude<keyof TtlCharter, "updated_by" | "updated_at">;
-
-const FIELD_META: { key: CharterTextField; label: string; semantic: string }[] =
-  [
-    {
-      key: "business_scenario",
-      label: "业务场景",
-      semantic: "服务于什么业务目标、谁用、解决什么问题",
-    },
-    {
-      key: "business_essence",
-      label: "业务本质",
-      semantic: "核心业务对象/状态/关系/动态行为的一句话本质概括",
-    },
-  ];
-
 function systemPrompt(): string {
-  const fieldDesc = FIELD_META.map(
-    (f) => `- ${f.key}（${f.label}）：${f.semantic}`,
+  const fieldDesc = CHARTER_FIELD_META.map(
+    (f) => `- ${f.key}（${f.label}）：${f.hint}`,
   ).join("\n");
   return [
     "你是本体建模助手，帮助建模者撰写「设计宪章」（ontology design charter）。",
-    "设计宪章记录本体的业务本质说明，是不变点，只能由用户确认后写入。",
+    "设计宪章记录本体的业务场景与业务目标，是不变点，只能由用户确认后写入。",
     "",
     "两个字段语义（设计意图/补充说明偏开发视角，不对业务呈现，无需产出）：",
     fieldDesc,
@@ -64,7 +49,7 @@ function systemPrompt(): string {
     "硬性规则：",
     "1. 你只能基于「用户草稿」和「本体结构上下文」整理与归纳；",
     "2. 严禁虚构业务事实——上下文和草稿不足以支撑的字段，输出 null，并在 questions 里提出具体问题让用户回答；",
-    "3. 不要把本体里的类名/属性名罗列当成业务场景——要概括业务目标与链路；",
+    "3. 不要把本体里的类名/属性名罗列当成业务场景——要概括使用范围、对象与业务目标；",
     "4. 输出严格 JSON，不要 markdown 代码块，格式：",
     '   {"business_scenario": string|null, "business_essence": string|null, "questions": string[]}',
   ].join("\n");
@@ -79,7 +64,7 @@ function modeInstruction(mode: CharterSuggestMode): string {
     case "refine":
       return "模式：完善。对已有文字做措辞与结构润色，保持原含义不变，不添加新业务事实；没有可完善的字段输出 null。";
     case "gap":
-      return "模式：查漏。检查草稿与本体结构之间的矛盾、缺口（如场景与本质不一致、本质未覆盖核心对象），并必须列出发现的问题。";
+      return "模式：查漏。检查草稿与本体结构之间的矛盾、缺口（如场景与业务目标不一致、目标未覆盖核心对象），并必须列出发现的问题。";
   }
 }
 
@@ -88,7 +73,7 @@ function userPrompt(
   draft: TtlCharter,
   entityContext: string,
 ): string {
-  const draftText = FIELD_META.map(
+  const draftText = CHARTER_FIELD_META.map(
     (f) => `${f.label}（${f.key}）：${draft[f.key]?.trim() || "（空）"}`,
   ).join("\n");
   return [

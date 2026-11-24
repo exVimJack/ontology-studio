@@ -2,7 +2,7 @@
 name: ontology-modeling
 description: >-
   面向本体平台的离线建模助手。当需要从业务材料（Word/PDF/PPT/Excel/TXT
-  文档、业务描述、结构化数据源 schema 等）抽象出符合业务本质的本体模型
+  文档、业务描述、结构化数据源 schema 等）抽象出符合业务目标的本体模型
   （ObjectType + LinkType + ActionType + Dataset + DataSource）时使用。产物是
   结构化的 OntologyPayload JSON，通过三个 agent 工具（export_ontology /
   preview_ontology_import / import_ontology）落库——支持冷启动建模和可持续增量更新。
@@ -29,7 +29,7 @@ metadata:
 - **业务描述**：用户口述 / 自然语言段落
 - **结构化数据源 schema**：数据库 DDL、表结构、API 报文、JSON Schema
 
-需要从中抽象出**符合业务本质**的本体模型。难点不在"建模"本身，而在**产物必须严格对齐输出格式的 schema 契约和命名规范**——api_name 大小写、主键约束、M:N 拆分、storage_type 取值、backing_mapping 字段结构……任一不对，导入目标平台就会失败。
+需要从中抽象出**符合业务目标**的本体模型。难点不在"建模"本身，而在**产物必须严格对齐输出格式的 schema 契约和命名规范**——api_name 大小写、主键约束、M:N 拆分、storage_type 取值、backing_mapping 字段结构……任一不对，导入目标平台就会失败。
 
 本 skill 提供这套**从材料到结构化本体定义**的完整方法论 + 精确 schema 契约 + 产物格式定义。
 
@@ -63,7 +63,7 @@ metadata:
 9. **敏感属性在 description 标注**——敏感属性（证件号/手机号/金额等）在 `description` 文本里显式标注"【敏感】"。
 10. **置信度标记产出质量**——每个产出的实体标注 `confirmed`/`high`/`tentative`；`tentative` 项必须在产物的 `open_questions` 里列出待确认问题。
 11. **字段集以 schema 契约为真相源，禁自创字段**——每个实体的合法字段集以 [references/gaia-schema-contract.md](references/gaia-schema-contract.md) 字段表为准，**不得自创字段**（如 LinkType 的 `cross_domain`、Dataset 的 `description`、DataSource 的 `connection` 等）。Gaia pydantic 默认 `extra='ignore'` 会静默丢弃多余字段（不会 500），但导入脚本不预期这些字段，且违反「产物即契约」原则。如需标注额外元信息（如跨域标记、领域分类），写进实体的 `description` 文本，不要新增字段。
-12. **本体设计宪章（charter）是不变点，禁随意修改**——charter（business_scenario/business_essence）记录业务本质说明，**不随实体增删改而变更**。**宪章先行（决策 24）**：`import_ontology` 对库内不存在的 api_name 一律拒绝，本体创建必须由用户在「新建本体」向导完成宪章；AI 在对话中给出宪章要点草稿并指引用户完成向导。增量更新时**只读不写**（用 `describe_ontology` 读作约束基线），**只有用户明确要求调整不变点时**才让用户在「设计宪章」面板修订。AI 没有任何写宪章的工具（用户主权，决策 22/23）。
+12. **本体设计宪章（charter）是不变点，禁随意修改**——charter（business_scenario/business_essence）记录业务目标说明，**不随实体增删改而变更**。**宪章先行（决策 24）**：`import_ontology` 对库内不存在的 api_name 一律拒绝，本体创建必须由用户在「新建本体」向导完成宪章；AI 在对话中给出宪章要点草稿并指引用户完成向导。增量更新时**只读不写**（用 `describe_ontology` 读作约束基线），**只有用户明确要求调整不变点时**才让用户在「设计宪章」面板修订。AI 没有任何写宪章的工具（用户主权，决策 22/23）。
 
 ## 标准产出流程
 
@@ -103,31 +103,42 @@ metadata:
 
 删除工具全部幂等（不存在返回 deleted=false），落库后自动触发 ontology-changed 事件刷新前端。
 
-**冷启动**：先给出宪章两字段（业务场景/业务本质）要点草稿（见下「本体设计宪章（不变点）」），指引用户在「新建本体」向导完成宪章创建本体；本体建立后 `preview_ontology_import(payload)` → `import_ontology(payload)`（AI 无写宪章工具，宪章由用户落库）。
+**映射组（决策 25：来源字段绑定，与 W3C 路线共用同一套）：**
+
+| 工具 | 作用 | 何时调 |
+| ------ | ------ | -------- |
+| `list_element_mappings(standard, ontology_key)` | 列某本体全部映射（含核对状态） | 交付前自查映射是否落齐 |
+| `suggest_element_mappings(standard, ontology_key, elements?)` | 按名称/类型/同表线索给候选（候选值必来自已登记的数据源结构，不落库） | 有表结构但不确定哪个属性对应哪列 |
+| `save_element_mappings(standard, ontology_key, items)` | 按元素整组替换（传空集合 = 删除该元素全部映射） | 用户确认某个对象类型/属性/关系来自哪张表哪列 |
+| `export_element_mapping(standard, ontology_key, scope)` | 导出扁平 CSV（`all` 全量 / `gap` 仅未映射与未核对） | 用户要一份可交给数据团队核对的清单 |
+
+Palantir 路线 `standard` 固定为 `palantir`，`ontology_key` 用本体 api_name；元素类型为 `object_type` / `property` / `link`，`element_id` 用 api_name。关系的两端物理位置都填（源端 = 当前 OT 侧，目标端 = 目标 OT 侧）；只填一端时导出会标为不完整，这是提示不是错误。核对状态由系统比对已登记的数据源结构得出，**不要向用户声称"已核对"**。
+
+**冷启动**：先给出宪章两字段（业务场景/业务目标）要点草稿（见下「本体设计宪章（不变点）」），指引用户在「新建本体」向导完成宪章创建本体；本体建立后 `preview_ontology_import(payload)` → `import_ontology(payload)`（AI 无写宪章工具，宪章由用户落库）。
 
 **增量更新**：`export_ontology(ont)` → **先调 `describe_ontology(ont)` 读 charter 作为本次变更的约束基线** → 改 payload 里需要变更的实体 → 把要覆写的 OT 列入 `overwrite_object_types` → `preview_ontology_import` → `import_ontology`。未列入 overwrite 的同名 OT 默认 skip，保护已有成果。**增量更新不触碰 charter**（charter 是不变点，不随实体变更而变；AI 无写宪章工具）。
 
 ## 本体设计宪章（不变点）
 
-> **本体始终扮演「向 AI 说明业务本质」的角色**——charter 是这个角色的载体。
-> 与 changelog（变化点）分离：changelog 记每次变更随历史增长，charter 记业务本质说明不随历史变化。
+> **本体始终扮演「向 AI 说明业务目标」的角色**——charter 是这个角色的载体。
+> 与 changelog（变化点）分离：changelog 记每次变更随历史增长，charter 记业务目标说明不随历史变化。
 
 ### 为什么需要 charter
 
-本体是「够用且可扩展」的——围绕**业务意图目标**建最小必要本体，保留可扩展性。但「意图」本身如果不显式记录下来，增量更新几轮后就会漂移：AI 可能为了当前需求添加与初衷冲突的实体、或偏离业务本质。charter 把**业务意图与业务本质**固化为不变点，让每一次增量更新都对照检查。
+本体是「够用且可扩展」的——围绕**业务意图目标**建最小必要本体，保留可扩展性。但「意图」本身如果不显式记录下来，增量更新几轮后就会漂移：AI 可能为了当前需求添加与初衷冲突的实体、或偏离业务目标。charter 把**业务意图与业务目标**固化为不变点，让每一次增量更新都对照检查。
 
 ### 字段语义
 
 | 字段 | 语义 | 示例 |
 | ------ | ------ | -------- |
-| `business_scenario` | 业务场景：服务于什么业务目标、谁用、解决什么问题 | 「供应链采购场景：采购员向供应商下达采购单并跟踪到货」 |
-| `business_essence` | 业务本质：核心业务对象/状态/关系/动态行为的一句话本质概括 | 「核心对象：供应商/零件/采购单；状态流转：草稿→已下单→已到货」 |
+| `business_scenario` | 业务场景：定义本体建模的使用范围以及对象 | 「供应链采购场景：采购员向供应商下达采购单并跟踪到货」 |
+| `business_essence` | 业务目标：定义本体建模的使用目标 | 「支撑采购下单与到货跟踪的最小必要对象与状态流转」 |
 
 ### 冷启动场景：先收集 charter，再详细建模
 
 **流程**：
 
-1. **从历史对话/材料中提取 charter 信息**——如果用户在对话里已描述过业务场景、业务对象、建模目标，应主动提取整理成两字段（业务场景/业务本质），**不要重复问用户已说过的内容**。
+1. **从历史对话/材料中提取 charter 信息**——如果用户在对话里已描述过业务场景、业务对象、建模目标，应主动提取整理成两字段（业务场景/业务目标），**不要重复问用户已说过的内容**。
 2. **信息不足时向用户确认**——如果历史对话/材料无法推断出 `business_scenario` 或 `business_essence`，向用户提问收集（「这个本体主要服务于什么业务？核心业务对象有哪些？」）。不要凭空臆测 charter。
 3. **charter 由用户落库**——宪章先行：用户在「新建本体」向导确认宪章后才存在本体；AI 全程只起草不写入。后续增量更新不触碰 charter。
 4. **然后开始详细实体建模**——charter 是建模的北极星，实体识别/命名/关系建模都应对照 charter 的 `business_essence`。
@@ -137,7 +148,7 @@ metadata:
 **流程**：
 
 1. **先调 `describe_ontology(ont)` 读取 charter**——拿到 `business_scenario`/`business_essence`，作为本次变更的约束基线。
-2. **对照 `business_essence` 自检本次变更**——新增/修改的实体是否与业务本质一致？（如 charter 说核心是「供应商/零件/采购单」，本次不应凭空引入无关实体。）软约束：偏离时在交付说明里提醒用户，不阻断落库。
+2. **对照 `business_essence` 自检本次变更**——新增/修改的实体是否与业务目标一致？（如 charter 说核心是「供应商/零件/采购单」，本次不应凭空引入无关实体。）软约束：偏离时在交付说明里提醒用户，不阻断落库。
 3. **不触碰 charter**——charter 是不变点，增量更新不触碰；AI 无写宪章工具。
 4. **除非用户明确要求调整不变点**——用户明说「更新业务场景说明」等时，指引用户在「设计宪章」面板修订对应字段。
 
@@ -187,7 +198,8 @@ metadata:
 ### Step 4：数据源绑定
 
 - 每个 MANAGED ObjectType 应产出对应的 Dataset 定义（放入 `datasets[]`），api_name 从 ObjectType 推导 snake_case（`PurchaseOrder` → `purchase_order`，`SupplierMaterialRel` → `supplier_material_rel`）。ObjectType 上的 `backing_dataset_api_name` 可填也可留空——填了便于导入脚本一键绑定，留空则导入后由管理员手动 `link_dataset`。仅当数据源完全未确认时，整个 Dataset 标记 `tentative` 并进 `open_questions`。
-- 属性级 `backing_mapping` 指向该 Dataset 的物理列（五个字段必填，值可为空串——但列名确认后应填上）。
+- 属性级 `backing_mapping` 指向该 Dataset 的物理列（五个字段必填，值可为空串——但列名确认后应填上）。**映射的真相源是独立绑定层**（`element_mapping` 表 + `save_element_mappings` 工具，决策 25）：payload 里的 `backing_mapping` 只是导出契约的兼容载体，落库时两者自动同步（一处双写）。所以：想改映射优先调映射工具，不要为了改一个列名去整包 import；`backing_mapping` 也不要为此新增字段。
+- **只写材料里明确的映射**。抽象概念（状态机、计算派生、纯设计概念）没有对应列就留空——空映射不是缺陷，不要为凑齐覆盖率臆造表名/列名（臆造列会被 `preview` 的物理结构校验挑出来，也会让联邦查询直接报 Catalog/column not found）。
 - VIRTUAL ObjectType 绑定外部数据源表（`storage_location` 三段式 `catalog.schema.table`，**只读**）。三段式第一段 `catalog` = 数据联邦层注册的顶层目录名（与 `backing_mapping.backing_catalog` 同源，**不是**引擎库名）；第二段 `schema` = 引擎层 schema/库名；第三段 `table` = 物理表名。三段必须与该 Dataset 下属性的 `backing_mapping.backing_catalog`/`backing_schema`/`backing_table` 完全一致——`storage_location` 与 `backing_mapping` 是同一物理表的两种引用方式，catalog 段不一致会导致联邦查询 Catalog not found。
 - DataSource 描述外部系统连接（`connector_type` + `connector_config`），凭据用占位符（`***`），不产出真实凭据。
 
